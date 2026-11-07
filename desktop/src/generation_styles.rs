@@ -23,9 +23,49 @@ const INK: Themed = Themed(0xFFFFFFFF, 0xFF222222);
 const DIM: Themed = Themed(0x99FFFFFF, 0x99000000);
 const WARN: u32 = 0xFFF2B440;
 
-/// The styles folder: `styles/` in the app's data folder.
+/// The folder chosen in the server view, when one was.
+static CHOSEN: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// The styles folder: the one chosen, else `styles/` in the app's data folder.
 pub fn styles_dir() -> PathBuf {
-    crate::files::app_dir().join("styles")
+    chosen_styles_dir().unwrap_or_else(|| crate::files::app_dir().join("styles"))
+}
+
+/// The folder chosen in the server view; none: the app's own.
+pub fn chosen_styles_dir() -> Option<PathBuf> {
+    match CHOSEN.lock() {
+        Ok(chosen) => chosen.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+/// Chooses the styles folder (none: the app's own).
+pub fn set_styles_dir(dir: Option<PathBuf>) {
+    match CHOSEN.lock() {
+        Ok(mut chosen) => *chosen = dir,
+        Err(poisoned) => *poisoned.into_inner() = dir,
+    }
+}
+
+/// Copies style file `from` (a `.toml` chosen to import) into the styles folder, after checking
+/// it reads as a style, with " 2" added to its name when one is already called that; its new
+/// name, or why it couldn't.
+pub fn import_style(generation: &procraft_core::Generation, from: &std::path::Path) -> Result<String, String> {
+    let too_big = std::fs::metadata(from).map_err(|e| e.to_string())?.len() > MOST_BYTES;
+    if too_big {
+        return Err("it's too big to be a style".to_owned());
+    }
+    let text = std::fs::read_to_string(from).map_err(|e| e.to_string())?;
+    if let Some(problem) = generation.style_file_problem(text.clone()) {
+        return Err(problem);
+    }
+    generation.set_style_files(read_style_files());
+    let stem = from.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = generation.style_file_name(stem, None);
+    let dir = styles_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join(&name), text).map_err(|e| e.to_string())?;
+    Ok(name)
 }
 
 /// The folder's style files, by name; the folder is made if it isn't there, so there's a place to

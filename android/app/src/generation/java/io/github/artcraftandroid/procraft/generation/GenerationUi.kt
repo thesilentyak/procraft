@@ -22,7 +22,9 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
@@ -594,13 +596,13 @@ object GenerationUi {
         }
     }
 
-    /** A style card's menu under it: Edit, Duplicate, Delete for the person's own, Duplicate for the rest; the + card's: New from the chosen style. */
+    /** A style card's menu under it: Edit, Duplicate, Export, Delete for the person's own, Duplicate for the rest. */
     @Composable
     private fun StyleMenu(g: Generation, s: io.github.artcraftandroid.procraft.core.StyleInfo) {
         val context = LocalContext.current
         val items = when {
             s.file != null && s.note == "Can't be read" -> listOf("Delete…")
-            s.file != null -> listOf("Edit", "Duplicate", "Delete…")
+            s.file != null -> listOf("Edit", "Duplicate", "Export…", "Delete…")
             else -> listOf("Duplicate")
         }
         val down = with(LocalDensity.current) { (76.dp + 6.dp).roundToPx() }
@@ -624,6 +626,7 @@ object GenerationUi {
                                     g.styleEdit(id)?.let { StyleStudio.start(g, it, file, old) }
                                 }
                                 "Delete…" -> styleDeleting = s
+                                "Export…" -> s.file?.let { f -> StylesFolder.export(context, f)?.let { error = "Couldn't export the style: $it" } }
                                 else -> g.duplicateStyle(id)?.let { StyleStudio.start(g, it, null, null) }
                             }
                         }.padding(horizontal = 16.dp, vertical = 13.dp),
@@ -692,10 +695,12 @@ object GenerationUi {
         }
     }
 
-    /** The server view's Styles folder row: where the styles are, and the picker to choose it. */
+    /** The server view's Styles folder row: where the styles are, Import to copy a style file in,
+     *  and the picker to choose the folder; under it, why the last Import didn't work. */
     @Composable
     private fun StylesFolderRow(context: Context, g: Generation) {
         var shown by remember { mutableStateOf(StylesFolder.shownName(context)) }
+        var problem by remember { mutableStateOf<String?>(null) }
         val pick = androidx.activity.compose.rememberLauncherForActivityResult(androidx.activity.result.contract.ActivityResultContracts.OpenDocumentTree()) { tree ->
             if (tree != null) {
                 StylesFolder.chosen(context, tree)
@@ -704,17 +709,33 @@ object GenerationUi {
                 stylesRead++
             }
         }
+        val import = androidx.activity.compose.rememberLauncherForActivityResult(androidx.activity.result.contract.ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri == null) return@rememberLauncherForActivityResult
+            val (fileName, text) = StylesFolder.imported(context, uri) ?: run { problem = "Couldn't import it: the file can't be read"; return@rememberLauncherForActivityResult }
+            g.styleFileProblem(text)?.let { problem = "Couldn't import it: $it"; return@rememberLauncherForActivityResult }
+            g.setStyleFiles(StylesFolder.read(context))
+            val name = g.styleFileName(fileName.substringBeforeLast('.'), null)
+            StylesFolder.write(context, name, text, null)?.let { problem = "Couldn't import it: $it"; return@rememberLauncherForActivityResult }
+            problem = null
+            g.setStyleFiles(StylesFolder.read(context))
+            stylesRead++
+            style = "user:$name"
+            view = View.FORM
+            // the first save without a folder given: ask for it
+            if (!StylesFolder.granted(context)) StyleStudio.asking = true
+        }
         Row(
-            Modifier.fillMaxWidth().height(56.dp).clip(RoundedCornerShape(14.dp)).background(RowFill)
-                .tap { pick.launch(StylesFolder.prepare(context)) }.padding(horizontal = 16.dp),
+            Modifier.fillMaxWidth().height(56.dp).clip(RoundedCornerShape(14.dp)).background(RowFill).padding(start = 16.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Column(Modifier.weight(1f)) {
                 Text("Styles folder", color = Ink, fontSize = 15.sp)
                 Text(shown ?: "Not chosen yet", color = Dim, fontSize = 12.sp, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
             }
-            Text(if (shown == null) "Choose" else "Change", color = Pc.Accent, fontSize = 15.sp, fontWeight = FontWeight.Medium)
+            Text("Import", color = Pc.Accent, fontSize = 15.sp, fontWeight = FontWeight.Medium, modifier = Modifier.fillMaxHeight().tap { import.launch(arrayOf("*/*")) }.wrapContentHeight().padding(horizontal = 10.dp))
+            Text(if (shown == null) "Choose" else "Change", color = Pc.Accent, fontSize = 15.sp, fontWeight = FontWeight.Medium, modifier = Modifier.fillMaxHeight().tap { pick.launch(StylesFolder.prepare(context)) }.wrapContentHeight().padding(start = 10.dp, end = 16.dp))
         }
+        problem?.let { Text(it, color = WARN, fontSize = 13.sp, modifier = Modifier.padding(start = 4.dp, top = 6.dp)) }
     }
 
     private fun run(vm: CanvasViewModel, g: Generation, run: RunSettings) {

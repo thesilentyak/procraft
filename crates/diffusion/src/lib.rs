@@ -31,7 +31,7 @@ pub use comfy::{Address, Comfy, ServerModels, SystemStats};
 pub use error::Error;
 pub use family::Family;
 pub use graph::{Graph, Node, Out};
-pub use loras::{LoraNote, LoraNotes};
+pub use loras::{LoraLook, LoraNote, LoraNotes};
 pub use picture::Picture;
 pub use plan::{ModelSize, Plan, Resolution, Size, largest_for_vram, plan, plan_at, plan_for};
 pub use request::{Control, ControlKind, ControlStep, Request, Selection, SelectionMode};

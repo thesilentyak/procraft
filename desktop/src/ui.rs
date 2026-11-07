@@ -2023,6 +2023,7 @@ impl Interface {
             self.prefs.generation_nsfw = self.generation.settings.nsfw;
             self.prefs.generation_resolution = self.generation.resolution_index();
             self.prefs.generation_largest = self.generation.largest_for_prefs();
+            (self.prefs.generation_styles_folder, self.prefs.generation_preview) = self.generation.kept_for_prefs();
             self.prefs.keep();
         }
     }

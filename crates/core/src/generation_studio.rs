@@ -85,6 +85,16 @@ pub(crate) struct StudioRun {
     error: Option<String>,
     pictures: u64,
     notes_error: Option<String>,
+    /// LoRAs' training notes looked up, by file: none while the server is asked.
+    looks: Vec<(String, Option<LoraSuggestion>)>,
+}
+
+/// What a LoRA's training notes suggest for its trigger words: the words to fill the field with
+/// (comma-separated, empty when the notes give none), and more of its tags to add with a tap.
+#[derive(Clone, Debug, Default, PartialEq, uniffi::Record)]
+pub struct LoraSuggestion {
+    pub filled: String,
+    pub more: Vec<String>,
 }
 
 impl From<StyleSettings> for StyleEdit {
@@ -206,6 +216,40 @@ impl Generation {
         });
     }
 
+    /// Asks the server for LoRA `file`'s training notes, on a thread of its own, to suggest its
+    /// trigger words; [`lora_suggestion`](Self::lora_suggestion) has them when they're in. Asked
+    /// once per file while the Studio is open.
+    pub fn look_up_lora(self: Arc<Self>, file: String) {
+        let Some(address) = self.worker.server().address.clone() else { return };
+        {
+            let mut studio = self.studio.lock();
+            if studio.looks.iter().any(|(f, _)| *f == file) {
+                return;
+            }
+            studio.looks.push((file.clone(), None));
+        }
+        let nsfw = self.settings.lock().nsfw;
+        std::thread::spawn(move || {
+            let found = match procraft_diffusion::Comfy::new(address).lora_metadata(&file) {
+                Ok(metadata) => procraft_diffusion::loras::look(&metadata, nsfw),
+                Err(e) => {
+                    log::warn!("{file}'s notes couldn't be read: {e}");
+                    procraft_diffusion::LoraLook::default()
+                }
+            };
+            let suggestion = LoraSuggestion { filled: found.filled.join(", "), more: found.more };
+            let mut studio = self.studio.lock();
+            if let Some((_, look)) = studio.looks.iter_mut().find(|(f, _)| *f == file) {
+                *look = Some(suggestion);
+            }
+        });
+    }
+
+    /// What LoRA `file`'s training notes suggest, once looked up; none before.
+    pub fn lora_suggestion(&self, file: String) -> Option<LoraSuggestion> {
+        self.studio.lock().looks.iter().find(|(f, _)| *f == file).and_then(|(_, look)| look.clone())
+    }
+
     /// The trigger words the server keeps for LoRA `file` (empty when none), for one just added.
     pub fn lora_trigger(&self, file: String) -> String {
         self.worker.server().lora_notes.get(&file).map(|n| n.trigger.clone()).unwrap_or_default()
@@ -234,6 +278,12 @@ impl Generation {
         let taken: Vec<String> =
             self.style_files.lock().iter().map(|f| f.name.clone()).filter(|f| Some(f) != except.as_ref()).collect();
         style_edit::file_name(&name, &taken)
+    }
+
+    /// Why `text` isn't a style file that can be read ("Line 3, column 9: …"); none when it is.
+    /// An Import checks the file with it before copying it into the folder.
+    pub fn style_file_problem(&self, text: String) -> Option<String> {
+        procraft_diffusion::styles::read(&text).err()
     }
 
     /// The checkpoint the server has for `models` (a file, or patterns best first); none if it has
@@ -373,6 +423,7 @@ impl Generation {
         let mut studio = self.studio.lock();
         studio.picture = None;
         studio.error = None;
+        studio.looks.clear();
     }
 }
 
@@ -394,6 +445,13 @@ mod tests {
         assert_eq!(g.style_edit(format!("user:{name}")), Some(copy));
         assert_eq!(g.style_file_name("Anima Turbo copy".into(), None), "Anima Turbo copy 2.toml");
         assert_eq!(g.style_file_name("Anima Turbo copy".into(), Some(name)), "Anima Turbo copy.toml");
+    }
+
+    #[test]
+    fn an_import_is_checked_first() {
+        let g = Generation::new(GenerationSettings::default());
+        assert_eq!(g.style_file_problem("name = \"Moonlit\"\nmodel = \"a.safetensors\"\n".into()), None);
+        assert!(g.style_file_problem("name = \"Moonlit\n".into()).unwrap().starts_with("Line 1"));
     }
 
     #[test]

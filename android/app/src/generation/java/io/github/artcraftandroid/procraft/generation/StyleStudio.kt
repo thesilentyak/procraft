@@ -13,6 +13,8 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -34,6 +36,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -57,6 +60,7 @@ import androidx.compose.ui.unit.sp
 import io.github.artcraftandroid.procraft.canvas.CanvasViewModel
 import io.github.artcraftandroid.procraft.core.Generation
 import io.github.artcraftandroid.procraft.core.LoraSetting
+import io.github.artcraftandroid.procraft.core.LoraSuggestion
 import io.github.artcraftandroid.procraft.core.ServerLists
 import io.github.artcraftandroid.procraft.core.StyleEdit
 import io.github.artcraftandroid.procraft.ui.Pc
@@ -83,8 +87,14 @@ internal object StyleStudio {
     // the tries, newest first: their number, picture and seed; and the one shown
     private val tries = mutableStateListOf<Triple<ULong, ImageBitmap, ULong>>()
     private var shown by mutableStateOf<ULong?>(null)
-    // the preview prompt, kept app-wide
-    private var prompt by mutableStateOf("a lighthouse on a cliff, scenery, no humans")
+    // the preview prompt, kept app-wide and across restarts (read when the Studio first opens)
+    private const val PREVIEW_PROMPT = "a lighthouse on a cliff, scenery, no humans"
+    private var prompt by mutableStateOf(PREVIEW_PROMPT)
+    private var promptRead = false
+    // the LoRAs whose training notes were asked for (none while asking), and the trigger words
+    // filled in from them, by file
+    private val looks = mutableStateMapOf<String, LoraSuggestion?>()
+    private val filled = mutableStateMapOf<String, String>()
     // the saved style's file, for the app to choose it; the question about the folder
     var asking by mutableStateOf(false)
 
@@ -120,6 +130,8 @@ internal object StyleStudio {
         error = null
         tries.clear()
         shown = null
+        looks.clear()
+        filled.clear()
     }
 
     val isOpen get() = open != null
@@ -133,6 +145,11 @@ internal object StyleStudio {
         val o = open ?: return
         val e = edit ?: return
         gen = g
+        val kept = context.getSharedPreferences("generation", Context.MODE_PRIVATE)
+        if (!promptRead) {
+            promptRead = true
+            kept.getString("preview", null)?.takeIf { it.isNotBlank() }?.let { prompt = it }
+        }
         val lists = remember(o) { g.serverLists() }
         var running by remember { mutableStateOf(false) }
         var progress by remember { mutableStateOf(0f) }
@@ -152,10 +169,12 @@ internal object StyleStudio {
                     }
                 }
                 s.error?.let { error = it }
+                lookUpLoras(g)
                 delay(100)
             }
         }
         fun close(saved: String?) {
+            kept.edit().putString("preview", if (prompt == PREVIEW_PROMPT) null else prompt).apply()
             g.closeStudio()
             open = null
             edit = null
@@ -202,6 +221,32 @@ internal object StyleStudio {
                 }
             }
         }
+    }
+
+    /** Asks for each LoRA's training notes once; one without trigger words on the server is filled
+     *  in from them when they come. */
+    private fun lookUpLoras(g: Generation) {
+        val e = edit ?: return
+        for (lora in e.loras) {
+            if (lora.file !in looks) {
+                looks[lora.file] = null
+                g.lookUpLora(lora.file)
+            }
+            if (looks[lora.file] != null) continue
+            val found = g.loraSuggestion(lora.file) ?: continue
+            looks[lora.file] = found
+            if (lora.trigger.isBlank() && found.filled.isNotEmpty()) {
+                filled[lora.file] = found.filled
+                val now = edit ?: return
+                edit = now.copy(loras = now.loras.map { if (it.file == lora.file && it.trigger.isBlank()) it.copy(trigger = found.filled) else it })
+            }
+        }
+    }
+
+    /** Whether the comma-separated `words` hold `word`, spaces and underscores alike. */
+    private fun hasWord(words: String, word: String): Boolean {
+        fun plain(w: String) = w.trim().replace('_', ' ').lowercase()
+        return words.split(',').any { plain(it) == plain(word) }
     }
 
     @Composable
@@ -284,8 +329,19 @@ internal object StyleStudio {
                 // its trigger words, kept on the server for every style that uses it
                 Column(Modifier.padding(start = 14.dp, end = 14.dp, bottom = 12.dp)) {
                     Text("Trigger words", color = Dim, fontSize = 13.sp, modifier = Modifier.padding(bottom = 6.dp))
-                    Field(lora.trigger, false) { words -> edit = e.copy(loras = e.loras.mapIndexed { j, l -> if (j == i) l.copy(trigger = words) else l }) }
-                    Text("Used by every style with this LoRA, added after your prompt.", color = Dim, fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp))
+                    fun setTrigger(words: String) { edit = e.copy(loras = e.loras.mapIndexed { j, l -> if (j == i) l.copy(trigger = words) else l }) }
+                    Field(lora.trigger, false) { setTrigger(it) }
+                    val asFilled = filled[lora.file] == lora.trigger
+                    Text(if (asFilled) "Filled in from the file: check them. Used by every style with this LoRA." else "Used by every style with this LoRA, added after your prompt.", color = Dim, fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp))
+                    // the file's other tags, and its own trigger words when taken out, to add with a tap
+                    val found = looks[lora.file]
+                    if (found != null) {
+                        val words = (found.filled.split(',').map { it.trim() }.filter { it.isNotEmpty() } + found.more).filter { !hasWord(lora.trigger, it) }
+                        Chips(words) { word ->
+                            val kept = lora.trigger.trim().trimEnd(',').trimEnd()
+                            setTrigger(if (kept.isEmpty()) word else "$kept, $word")
+                        }
+                    }
                 }
             }
         }
@@ -421,6 +477,19 @@ internal object StyleStudio {
     @Composable
     private fun Heading(words: String) {
         Text(words, color = Header, fontSize = 21.sp, fontWeight = FontWeight.Bold, maxLines = 1, modifier = Modifier.padding(start = 8.dp, bottom = 8.dp))
+    }
+
+    @OptIn(ExperimentalLayoutApi::class)
+    @Composable
+    private fun Chips(words: List<String>, onTap: (String) -> Unit) {
+        if (words.isEmpty()) return
+        FlowRow(Modifier.padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            words.forEach { word ->
+                Box(Modifier.height(30.dp).clip(RoundedCornerShape(15.dp)).background(PreviewFill).tap { onTap(word) }.padding(horizontal = 11.dp), contentAlignment = Alignment.Center) {
+                    Text(word, color = Label, fontSize = 12.5.sp, fontWeight = FontWeight.Medium, maxLines = 1)
+                }
+            }
+        }
     }
 
     @Composable

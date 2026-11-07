@@ -189,6 +189,12 @@ impl Comfy {
         Ok(Some(text))
     }
 
+    /// LoRA `file`'s metadata as the server reads it from the file's header (`view_metadata`):
+    /// kohya's training notes, as strings. Null when the file has none.
+    pub fn lora_metadata(&self, file: &str) -> Result<Value, Error> {
+        self.get(&format!("/view_metadata/loras?filename={}", encode_path(file)))
+    }
+
     /// Writes `text` as `path` in ComfyUI's user folder (`userdata`), over what's there.
     pub fn put_user_file(&self, path: &str, text: &str) -> Result<(), Error> {
         let url = self.address.http(&format!("/userdata/{}?overwrite=true", encode_path(path)));

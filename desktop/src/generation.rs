@@ -174,6 +174,8 @@ pub struct GenerationUi {
     /// The Style Studio, while open, and its preview prompt (kept while the app runs).
     studio: Option<crate::generation_studio::StyleStudio>,
     preview_prompt: String,
+    /// Why the last Import didn't work, shown under the Styles folder row.
+    styles_problem: Option<String>,
     /// Why the trigger words couldn't be saved on the server, shown until the next run.
     notes_error: Option<String>,
 }
@@ -195,9 +197,27 @@ impl GenerationUi {
             },
             resolution,
         );
+        let mut ui = ui;
         ui.generation.set_recent_prompts(prefs.generation_recent.clone());
         crate::prefs::set_generation_recent(prefs.generation_recent.clone());
+        let folder = prefs.generation_styles_folder.trim();
+        crate::generation_styles::set_styles_dir((!folder.is_empty()).then(|| folder.into()));
+        if !prefs.generation_preview.trim().is_empty() {
+            ui.preview_prompt = prefs.generation_preview.clone();
+        }
         ui
+    }
+
+    /// The styles folder chosen (empty: the app's own) and the preview prompt (empty: the safe
+    /// scene it starts at), as the preferences keep them.
+    pub fn kept_for_prefs(&self) -> (String, String) {
+        let folder = crate::generation_styles::chosen_styles_dir().map(|d| d.display().to_string()).unwrap_or_default();
+        let preview = if self.preview_prompt == crate::generation_studio::PREVIEW_PROMPT {
+            String::new()
+        } else {
+            self.preview_prompt.clone()
+        };
+        (folder, preview)
     }
 
     pub fn new(settings: GenerationSettings, resolution: GenerationResolution) -> GenerationUi {
@@ -242,6 +262,7 @@ impl GenerationUi {
             delete_alert: crate::alert::Alert::default(),
             studio: None,
             preview_prompt: crate::generation_studio::PREVIEW_PROMPT.to_owned(),
+            styles_problem: None,
             notes_error: None,
         }
     }
@@ -425,7 +446,8 @@ impl GenerationUi {
 
     fn server_height(&self) -> f32 {
         let missing: usize = self.server.features.iter().map(|f| f.missing.len().max(1)).sum();
-        56.0 + 100.0 + 44.0 * 3.0 + 22.0 * missing as f32 + 30.0 + 56.0 + 52.0 + 70.0 + PAD
+        let problem = if self.styles_problem.is_some() { 22.0 } else { 0.0 };
+        56.0 + 100.0 + 44.0 * 3.0 + 22.0 * missing as f32 + 30.0 + 56.0 + 52.0 + 70.0 + 68.0 + problem + PAD
     }
 
     /// The title and, on its right, the connection: a dot and the server; tapped, the server view.
@@ -873,8 +895,8 @@ impl GenerationUi {
         }
     }
 
-    /// A style card's menu under it: Edit, Duplicate, Delete for the person's own, Duplicate for
-    /// the rest; the + card's, New from the chosen style.
+    /// A style card's menu under it: Edit, Duplicate, Export, Delete for the person's own,
+    /// Duplicate for the rest.
     fn style_menu_show(
         &mut self,
         ctx: &egui::Context,
@@ -885,7 +907,9 @@ impl GenerationUi {
         let style = target.as_ref().and_then(|id| styles.iter().find(|s| &s.id == id));
         let items: Vec<String> = match (target.is_some(), style) {
             (true, Some(s)) if s.file.is_some() && s.note.as_deref() == Some("Can't be read") => vec!["Delete…".into()],
-            (true, Some(s)) if s.file.is_some() => vec!["Edit".into(), "Duplicate".into(), "Delete…".into()],
+            (true, Some(s)) if s.file.is_some() => {
+                vec!["Edit".into(), "Duplicate".into(), "Export…".into(), "Delete…".into()]
+            }
             (true, _) => vec!["Duplicate".into()],
             (false, _) => vec!["New style".into()],
         };
@@ -936,6 +960,14 @@ impl GenerationUi {
                         Some(crate::generation_studio::StyleStudio::new(self.generation.clone(), edit, file, old));
                 }
             }
+            "Export…" => {
+                if let Some(file) = style.and_then(|s| s.file.clone()) {
+                    // shown under Generate, where the menu was
+                    if let Err(e) = export_style(&file) {
+                        self.notes_error = Some(e);
+                    }
+                }
+            }
             "Delete…" => {
                 if let Some(s) = style
                     && let Some(file) = &s.file
@@ -966,6 +998,8 @@ impl GenerationUi {
         let Some(studio) = self.studio.as_mut() else { return };
         let Some(closed) = studio.show(ctx, look, &mut self.preview_prompt, (info.width, info.height)) else { return };
         self.studio = None;
+        // the preview prompt is kept for next time
+        self.settings_changed = true;
         if let crate::generation_studio::Closed::Saved(file) = closed {
             self.style = format!("user:{file}");
         }
@@ -1197,6 +1231,7 @@ impl GenerationUi {
             self.settings_changed = true;
         }
         y += 56.0;
+        y = self.styles_folder_row(ui, left, right, y);
         let mut notes = vec!["Pictures and prompts go to this server and nowhere else.".to_owned()];
         if !self.server.licence.is_empty() {
             notes.push(format!("Anima: {}", self.server.licence));
@@ -1210,6 +1245,90 @@ impl GenerationUi {
             });
             y += 34.0;
         }
+    }
+
+    /// The Styles folder row: where the styles are kept, Import to copy one in, Change to choose
+    /// another folder and Open to see it in the file manager; under it, why the last Import
+    /// didn't work. Where the next row goes.
+    fn styles_folder_row(&mut self, ui: &mut Ui, left: f32, right: f32, y: f32) -> f32 {
+        let row = Rect::from_min_max(pos2(left, y), pos2(right, y + 56.0));
+        ui.painter().rect_filled(row, 14.0, argb(ROW));
+        text(
+            ui.painter(),
+            pos2(left + 16.0, y + 18.0),
+            Align2::LEFT_CENTER,
+            "Styles folder",
+            15.0,
+            Weight::Regular,
+            argb(INK),
+        );
+        let mut x = right - 16.0;
+        let mut tapped = None;
+        for action in ["Open", "Change", "Import"] {
+            let width = text_width(ui.painter(), action, 14.0, Weight::Medium);
+            let hit = Rect::from_min_max(pos2(x - width - 8.0, row.top()), pos2(x + 8.0, row.bottom()));
+            text(
+                ui.painter(),
+                pos2(x, row.center().y),
+                Align2::RIGHT_CENTER,
+                action,
+                14.0,
+                Weight::Medium,
+                argb(pc::ACCENT),
+            );
+            if ui.interact(hit, ui.scope_id().with(("styles folder", action)), Sense::click()).clicked() {
+                tapped = Some(action);
+            }
+            x -= width + 18.0;
+        }
+        let shown = shorten(&crate::generation_styles::styles_dir().display().to_string(), 34);
+        text(ui.painter(), pos2(left + 16.0, y + 38.0), Align2::LEFT_CENTER, &shown, 12.0, Weight::Regular, argb(DIM));
+        match tapped {
+            Some("Open") => crate::generation_styles::open_styles_folder(),
+            Some("Change") => {
+                let chosen = rfd::FileDialog::new()
+                    .set_title("Styles folder")
+                    .set_directory(crate::generation_styles::styles_dir())
+                    .pick_folder();
+                if let Some(dir) = chosen {
+                    crate::generation_styles::set_styles_dir(Some(dir));
+                    self.styles_folder = Default::default();
+                    self.styles_folder.refresh(&self.generation);
+                    self.settings_changed = true;
+                }
+            }
+            Some("Import") => {
+                let chosen =
+                    rfd::FileDialog::new().set_title("Import a style").add_filter("Styles", &["toml"]).pick_file();
+                if let Some(from) = chosen {
+                    match crate::generation_styles::import_style(&self.generation, &from) {
+                        Ok(name) => {
+                            self.styles_problem = None;
+                            self.styles_folder = Default::default();
+                            self.styles_folder.refresh(&self.generation);
+                            self.style = format!("user:{name}");
+                            self.view = View::Form;
+                        }
+                        Err(e) => self.styles_problem = Some(format!("Couldn't import it: {e}")),
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut y = y + 68.0;
+        if let Some(problem) = &self.styles_problem {
+            text(
+                ui.painter(),
+                pos2(left + 4.0, y + 4.0),
+                Align2::LEFT_CENTER,
+                &shorten(problem, 60),
+                12.5,
+                Weight::Regular,
+                argb(WARN),
+            );
+            y += 22.0;
+        }
+        y
     }
 
     /// The server's status as lines: a name, a mark and its colour, and lines under it.
@@ -1684,6 +1803,20 @@ pub(crate) fn texture(ctx: &egui::Context, name: &str, image: &ThumbnailImage) -
 }
 
 /// "line art" or "scribble", for what an extraction is making.
+/// Saves a copy of style file `file` where the person chooses, through a save dialog.
+fn export_style(file: &str) -> Result<(), String> {
+    let from = crate::generation_styles::styles_dir().join(file);
+    let Some(to) = rfd::FileDialog::new()
+        .set_title("Export the style")
+        .set_file_name(file)
+        .add_filter("Styles", &["toml"])
+        .save_file()
+    else {
+        return Ok(());
+    };
+    std::fs::copy(&from, &to).map(|_| ()).map_err(|e| format!("Couldn't export it: {e}"))
+}
+
 fn extract_name(kind: Option<LayerControl>) -> &'static str {
     match kind {
         Some(LayerControl::Scribble) => "scribble",

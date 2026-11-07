@@ -9,6 +9,7 @@
 //! strength = 0.8
 //! ```
 
+use serde_json::Value;
 use toml_edit::{DocumentMut, Item, Table, value};
 
 /// The file's path under ComfyUI's user folder, as `userdata` takes it.
@@ -105,6 +106,76 @@ pub fn write_notes(old: Option<&str>, changes: &[(String, String)]) -> Option<St
     Some(doc.to_string())
 }
 
+/// How often a tag must be on the training pictures to be taken for a trigger word.
+const TRIGGER_SHARE: f64 = 0.95;
+/// How many more of the most used tags are offered beside them.
+const MORE: usize = 8;
+
+/// What a LoRA's own training notes suggest for its trigger words.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LoraLook {
+    /// The tags on nearly every training picture (95 %) that aren't ordinary Danbooru tags: its
+    /// trigger words, most used first.
+    pub filled: Vec<String>,
+    /// The next most used tags, any kind, to add by hand.
+    pub more: Vec<String>,
+}
+
+/// The trigger words LoRA metadata (`metadata`, as the server's `view_metadata` gives it)
+/// suggests, from kohya's tag counts (`ss_tag_frequency`) and number of pictures
+/// (`ss_dataset_dirs`). `dark_art_style` on 99 of 99 pictures is one; `1girl` on every picture
+/// of a character isn't, being an ordinary tag; a known character's name is. Nothing when the
+/// file has no such notes. NSFW tags are only among the others when `nsfw` (they're offered as
+/// suggestions, as autocomplete's are).
+pub fn look(metadata: &Value, nsfw: bool) -> LoraLook {
+    let notes = |key: &str| -> Option<Value> {
+        let value = metadata.get(key)?;
+        match value.as_str() {
+            Some(text) => serde_json::from_str(text).ok(),
+            None => Some(value.clone()),
+        }
+    };
+    // the tags of every folder trained on, counted together
+    let mut counts: Vec<(String, u64)> = Vec::new();
+    let mut most_in_a_folder = 0;
+    if let Some(Value::Object(folders)) = notes("ss_tag_frequency") {
+        for tags in folders.values().filter_map(Value::as_object) {
+            let mut most = 0;
+            for (tag, n) in tags {
+                let (tag, n) = (tag.trim(), n.as_u64().unwrap_or(0));
+                if tag.is_empty() || n == 0 {
+                    continue;
+                }
+                most = most.max(n);
+                match counts.iter_mut().find(|(t, _)| t == tag) {
+                    Some((_, c)) => *c += n,
+                    None => counts.push((tag.to_owned(), n)),
+                }
+            }
+            most_in_a_folder += most;
+        }
+    }
+    if counts.is_empty() {
+        return LoraLook::default();
+    }
+    // the pictures, as the folders count them, else as many as the most used tag is on
+    let pictures = match notes("ss_dataset_dirs") {
+        Some(Value::Object(folders)) => {
+            folders.values().filter_map(|f| f.get("img_count").and_then(Value::as_u64)).sum::<u64>()
+        }
+        _ => 0,
+    };
+    let pictures = if pictures == 0 { most_in_a_folder } else { pictures };
+    counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let (filled, rest): (Vec<_>, Vec<_>) = counts
+        .into_iter()
+        .partition(|(tag, n)| *n as f64 >= pictures as f64 * TRIGGER_SHARE && !crate::tags::is_general(tag));
+    LoraLook {
+        filled: filled.into_iter().map(|(t, _)| t).collect(),
+        more: rest.into_iter().filter(|(t, _)| nsfw || !crate::tags::is_nsfw(t)).take(MORE).map(|(t, _)| t).collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +211,27 @@ mod tests {
         let fresh = write_notes(None, &changes[2..]).unwrap();
         assert!(fresh.starts_with("# Trigger words"), "{fresh}");
         assert!(write_notes(Some("[\"a\"\n"), &changes).is_none(), "a broken file is left alone");
+    }
+
+    #[test]
+    fn trigger_words_come_from_the_training_notes() {
+        // made up: a character LoRA, `1girl` on every picture, its trigger word and the character
+        let frequency = serde_json::json!({
+            "10_pics": {"zz_teal_style": 40, "1girl": 40, "hatsune miku": 39, "solo": 30, "long hair": 20},
+            "2_more": {"zz_teal_style": 10, "1girl": 10, "hatsune miku": 10, "smile": 4}
+        });
+        let metadata = serde_json::json!({
+            "ss_tag_frequency": frequency.to_string(),
+            "ss_dataset_dirs": serde_json::json!({"10_pics": {"n_repeats": 10, "img_count": 40},
+                                                   "2_more": {"n_repeats": 2, "img_count": 10}}).to_string(),
+        });
+        let found = look(&metadata, true);
+        assert_eq!(found.filled, ["zz_teal_style", "hatsune miku"]);
+        assert_eq!(found.more, ["1girl", "solo", "long hair", "smile"]);
+        // without the folders' picture counts, the most used tag stands for them
+        let found = look(&serde_json::json!({ "ss_tag_frequency": frequency.to_string() }), true);
+        assert_eq!(found.filled, ["zz_teal_style", "hatsune miku"]);
+        assert_eq!(look(&Value::Null, false), LoraLook::default());
     }
 
     #[test]

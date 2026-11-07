@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use egui::{Align2, Color32, Rect, Sense, TextureHandle, Ui, UiBuilder, pos2, vec2};
-use procraft_core::{Generation, LoraSetting, ServerLists, StyleEdit};
+use procraft_core::{Generation, LoraSetting, LoraSuggestion, ServerLists, StyleEdit};
 
 use crate::look::{Look, Themed, Weight, argb, pc, text, text_width};
 
@@ -74,6 +74,10 @@ pub struct StyleStudio {
     /// The name is being typed in its heading, and its field has had the focus.
     renaming: bool,
     focused: bool,
+    /// The LoRAs whose training notes were asked for, and what they suggest once in; and the
+    /// trigger words filled in from them, by file, while they're as filled.
+    looks: Vec<(String, Option<LoraSuggestion>)>,
+    filled: Vec<(String, String)>,
 }
 
 impl StyleStudio {
@@ -100,6 +104,8 @@ impl StyleStudio {
             error: None,
             renaming: false,
             focused: false,
+            looks: Vec::new(),
+            filled: Vec::new(),
         }
     }
 
@@ -160,6 +166,36 @@ impl StyleStudio {
         }
         if state.error.is_some() {
             self.error = state.error;
+        }
+        self.look_up_loras(ctx);
+    }
+
+    /// Asks for the training notes of each LoRA, once; one without trigger words on the server is
+    /// filled in from them when they come.
+    fn look_up_loras(&mut self, ctx: &egui::Context) {
+        for lora in &mut self.edit.loras {
+            let at = match self.looks.iter().position(|(f, _)| *f == lora.file) {
+                Some(at) => at,
+                None => {
+                    self.generation.clone().look_up_lora(lora.file.clone());
+                    self.looks.push((lora.file.clone(), None));
+                    self.looks.len() - 1
+                }
+            };
+            let Some((_, look)) = self.looks.get_mut(at) else { continue };
+            if look.is_some() {
+                continue;
+            }
+            match self.generation.lora_suggestion(lora.file.clone()) {
+                Some(found) => {
+                    if lora.trigger.trim().is_empty() && !found.filled.is_empty() {
+                        lora.trigger = found.filled.clone();
+                        self.filled.push((lora.file.clone(), found.filled.clone()));
+                    }
+                    *look = Some(found);
+                }
+                None => ctx.request_repaint_after(Duration::from_millis(100)),
+            }
         }
     }
 
@@ -362,7 +398,29 @@ impl StyleStudio {
                 argb(DIM),
             );
             field(ui, &mut lora.trigger, false, &format!("lora trigger {i}"));
-            note(ui, "Used by every style with this LoRA, added after your prompt.");
+            let as_filled = self.filled.iter().any(|(f, t)| *f == lora.file && *t == lora.trigger);
+            if as_filled {
+                note(ui, "Filled in from the file: check them. Used by every style with this LoRA.");
+            } else {
+                note(ui, "Used by every style with this LoRA, added after your prompt.");
+            }
+            // the file's other tags, and its own trigger words when taken out, to add with a tap
+            let found = self.looks.iter().find(|(f, _)| *f == lora.file).and_then(|(_, l)| l.as_ref());
+            if let Some(found) = found {
+                let words: Vec<String> = found
+                    .filled
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|w| !w.is_empty())
+                    .map(ToOwned::to_owned)
+                    .chain(found.more.iter().cloned())
+                    .filter(|w| !has_word(&lora.trigger, w))
+                    .collect();
+                if let Some(word) = chips(ui, &words, &format!("lora chips {i}")) {
+                    let kept = lora.trigger.trim().trim_end_matches(',').trim_end();
+                    lora.trigger = if kept.is_empty() { word } else { format!("{kept}, {word}") };
+                }
+            }
             ui.add_space(12.0);
         }
         if let Some(i) = remove {
@@ -733,6 +791,37 @@ fn heading(ui: &mut Ui, words: &str) {
         argb(HEADER),
     );
     ui.add_space(6.0);
+}
+
+/// Whether the comma-separated `words` hold `word`, spaces and underscores alike, case ignored.
+fn has_word(words: &str, word: &str) -> bool {
+    let plain = |w: &str| w.trim().replace('_', " ").to_lowercase();
+    words.split(',').any(|w| plain(w) == plain(word))
+}
+
+/// Small tags to tap, wrapped over as many rows as they need; the one tapped.
+fn chips(ui: &mut Ui, words: &[String], id: &str) -> Option<String> {
+    if words.is_empty() {
+        return None;
+    }
+    let mut picked = None;
+    ui.add_space(2.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+        for word in words {
+            let width = text_width(ui.painter(), word, 12.5, Weight::Medium) + 22.0;
+            let (chip, response) = ui.allocate_exact_size(vec2(width, 28.0), Sense::click());
+            let fill = if response.hovered() { argb(BUTTON_EDGE) } else { argb(FIELD) };
+            ui.painter().rect_filled(chip, 14.0, fill);
+            text(ui.painter(), chip.center(), Align2::CENTER_CENTER, word, 12.5, Weight::Medium, argb(LABEL));
+            if response.clicked() {
+                picked = Some(word.clone());
+            }
+        }
+        let _ = id;
+    });
+    ui.add_space(4.0);
+    picked
 }
 
 /// A small note under a setting.

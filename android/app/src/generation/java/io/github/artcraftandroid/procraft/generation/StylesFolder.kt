@@ -156,6 +156,35 @@ internal object StylesFolder {
         }.getOrElse { it.message ?: it.toString() }
     }
 
+    /** Hands style file `name` to another app (or saves it on the device) through the share sheet;
+     *  the reason it couldn't, if it couldn't. */
+    fun export(context: Context, name: String): String? {
+        val text = read(context).firstOrNull { it.name == name }?.text ?: return "its file isn't in the folder"
+        return runCatching {
+            val dir = File(context.cacheDir, "exports").apply { mkdirs() }
+            val file = File(dir, name).apply { writeText(text) }
+            io.github.artcraftandroid.procraft.ui.shareFile(context, file, "text/plain")
+            null
+        }.getOrElse { it.message ?: it.toString() }
+    }
+
+    /** The name and text of `uri`, a file chosen to import; none if it can't be read or is too big
+     *  to be a style. */
+    fun imported(context: Context, uri: Uri): Pair<String, String>? = runCatching {
+        val resolver = context.contentResolver
+        var name = "Style.toml"
+        var size = 0L
+        resolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME, android.provider.OpenableColumns.SIZE), null, null, null)?.use { c ->
+            if (c.moveToFirst()) {
+                c.getString(0)?.let { name = it }
+                size = c.getLong(1)
+            }
+        }
+        if (size > MOST_BYTES) return null
+        val text = resolver.openInputStream(uri)?.use { String(it.readBytes()) } ?: return null
+        name to text
+    }.getOrNull()
+
     /** Removes the style file `name`; the reason it couldn't, if it couldn't. */
     fun delete(context: Context, name: String): String? {
         val uri = list(context).firstOrNull { it.first == name }?.second ?: return null

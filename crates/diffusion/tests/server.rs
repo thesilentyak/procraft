@@ -7,7 +7,7 @@
 use std::time::{Duration, Instant};
 
 use procraft_diffusion::{
-    Address, Connection, Error, Family, Feature, Request, Resolution, RunState, ServerState, Worker, plan_for,
+    Address, Comfy, Connection, Error, Family, Feature, Request, Resolution, RunState, ServerState, Worker, plan_for,
 };
 
 fn address() -> Address {
@@ -122,4 +122,22 @@ fn a_wrong_address_says_so() {
             _ => std::thread::sleep(Duration::from_millis(50)),
         }
     }
+}
+
+#[test]
+#[ignore = "needs a ComfyUI server"]
+fn lora_trigger_words_come_from_their_metadata() {
+    // the server's own LoRAs, read now and not kept: a kohya-trained one gives its trigger
+    // words, one without notes gives none
+    let worker = Worker::new();
+    worker.set_address(Some(address()));
+    let server = connected(&worker);
+    let api = Comfy::new(address());
+    let mut filled = 0;
+    for file in &server.models.as_ref().unwrap().loras {
+        let look = procraft_diffusion::loras::look(&api.lora_metadata(file).unwrap(), false);
+        println!("{file}: {:?} then {:?}", look.filled, look.more);
+        filled += usize::from(!look.filled.is_empty());
+    }
+    assert!(filled > 0, "no LoRA on the server has trigger words in its notes");
 }

@@ -56,8 +56,12 @@ when something gets a name, and change it here first when a name changes.
 | **Preview prompt** | The prompt the Studio's Try it uses, typed by the user. | — |
 | **Try it** | The Studio's button that makes one small preview picture with the style as it is. | "Try it" |
 | **Tries** | The Studio's last four Try it pictures, as thumbnails under the big one, to compare a change with the one before. Kept until the Studio closes. | — |
+| **Filled in from the file** | Trigger words the app read from a LoRA's own training notes, for a LoRA without any kept on the server; the user checks them. | "Filled in from the file: check them" |
+| **Tag chips** | The LoRA's other most used training tags under its Trigger words field, added with a tap. | — |
+| **Export** | Hands one of the user's style files to another app or a folder (share sheet, save dialog). | "Export…" |
+| **Import** | Copies a style file from elsewhere into the styles folder, after checking it reads. | "Import" |
 | **Plus card** | The "+" card at the end of the style strip: a new style, opened in the Studio. | "+", "New style" |
-| **Styles folder** | The folder a person can open where styles are kept as `.toml` files: Documents › ProCraft Diffusion › Styles on Android, the app's data folder on the desktop. Changed in a setting. | "Styles folder", "Open styles folder" |
+| **Styles folder** | The folder a person can open where styles are kept as `.toml` files: Documents › ProCraft Diffusion › Styles on Android, the app's data folder on the desktop. Changed in the server view's Styles folder row. | "Styles folder", "Open styles folder" |
 
 ## Settings and set-up
 

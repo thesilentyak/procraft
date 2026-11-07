@@ -126,7 +126,7 @@ pub use generation::{
     SelectionInfo, ServerConnection, ServerStatus, SizeInfo, generation_address,
 };
 #[cfg(feature = "generation")]
-pub use generation_studio::{LoraSetting, ServerLists, StudioPicture, StudioState, StyleEdit};
+pub use generation_studio::{LoraSetting, LoraSuggestion, ServerLists, StudioPicture, StudioState, StyleEdit};
 #[cfg(feature = "generation")]
 pub use generation_styles::{StyleFileText, StyleInfo, StyleKind};
 #[cfg(feature = "generation")]

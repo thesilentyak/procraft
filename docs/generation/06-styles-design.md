@@ -162,6 +162,11 @@ popover closes behind it. **Done** saves and brings you back with the edited sty
     `long_hair`).
   - A LoRA without that metadata gets an empty field.
 - **Kept on the server**, when Done is tapped, in `loras.toml` (B5). Cancel keeps nothing.
+- **What's typed wins**: the file is read only for a LoRA with no trigger words on the server, so
+  words a person wrote are never replaced. Emptying the field and tapping Done takes them off the
+  server, so the file's suggestion comes back the next time.
+- **When**: on adding the LoRA, and on opening the Studio for each LoRA that has none (a style
+  made before M8 gets them too).
 
 ## A6. The styles folder
 
@@ -192,8 +197,9 @@ popover closes behind it. **Done** saves and brings you back with the edited sty
   editor or synced from the other device shows up without a restart.
 - **Export** (hold menu) shares the style's file: Android's share sheet, a save dialog on the
   desktop.
-- **Import** (the + card) takes a `.toml` file: Android's file picker, an open dialog on the
-  desktop. It's copied into the folder, with " 2" added to its name if one is already called that.
+- **Import** (the server view's Styles folder row, beside Change) takes a `.toml` file: Android's
+  file picker, an open dialog on the desktop. A file that doesn't read as a style is refused with
+  its line and column. It's copied into the folder, with " 2" added to its name if one is already called that.
 
 ## A7. States and errors
 
@@ -482,6 +488,37 @@ trigger = "@dragonball"
 |---|---|
 | **M6 Styles as files, with LoRAs** | `styles.rs` on TOML (built-ins moved); `loras.rs` reading `loras.toml`; LoRAs, rescale CFG, VAE and text encoder in the Anima graph; trigger words in the prompt; best size in the planner; core's `set_style_files` and the new `StyleInfo`; both apps reading the folder, the card order, badges and missing notes; Android's first save, question and picker (tested with a style written by hand); `diffusion-cli --style <file>` |
 | **M7 The Style Studio** | The hold menu (Edit, Duplicate, Delete) and the + card (New style); the Studio on both apps, with its five pages and the server's lists; `style_text` saving with comments kept; Try it with its seed, dice and tries; the states of A7 |
+*M8 as built (2026-11-06):*
+- **`crates/diffusion`**:
+  - `loras::look(metadata, nsfw)`: the tags of every training folder counted together, the
+    pictures from `ss_dataset_dirs` (else the most used tag stands for them); filled with the
+    tags on 95 % that `tags::is_general` doesn't know as an ordinary Danbooru tag, then the next
+    eight as chips, NSFW ones only when NSFW tags are shown (as autocomplete).
+  - `Comfy::lora_metadata` (`/view_metadata/loras`).
+  - An `#[ignore]` server test reads the server's own LoRAs and prints what they give: on the dev
+    server `dark_art_style`, `@dragonball` and, for the one without notes, nothing.
+- **Core**: `look_up_lora` (a thread per LoRA, once while the Studio is open),
+  `lora_suggestion`, and `style_file_problem` for Import.
+- **Both apps**:
+  - the field filled with the note "Filled in from the file: check them" while it's as filled;
+  - the chips: the file's trigger words when taken out, then its other tags, each added with a
+    comma;
+  - Export on the hold menu of the person's styles: Android's share sheet (with Save to device),
+    a save dialog on the desktop;
+  - Import in the Styles folder row; the imported style is chosen and the popover goes back to
+    the form;
+  - the preview prompt kept across restarts.
+- **Desktop**: the server view's **Styles folder** row: where they are, Import, Change (a folder
+  dialog, kept in the preferences) and Open.
+- **Checked on the tablet**: Dragon Ball added to a style filled `@dragonball` with eight chips,
+  a chip tapped added `, bulma` and the note went back; Export's share sheet with `Anima
+  copy.toml`; Import refusing a `.txt` with its line and column, then taking a `.toml` from
+  Download and choosing it.
+- **Checked on the desktop** (2026-11-07): the trigger words and chips, Export, and the Styles
+  folder row's Import, Change and Open.
+- **Left over**: typed values on the sliders; the LoRA list grouped by family with badges (A3);
+  a long name on a style card breaks inside a word beside its badge ("Importe/d test").
+
 | **M8 Trigger words and sharing** | `look_up_lora` with the metadata and the tag list, the pre-fill and chips; `save_lora_notes`; Export and Import; Open styles folder; the Styles folder setting on both apps |
 
 ---

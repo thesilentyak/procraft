@@ -152,6 +152,36 @@ pub fn complete(text: &str, _caret: usize, suggestion: &Suggestion) -> (String, 
     (new, caret)
 }
 
+/// Whether `tag` is one of Danbooru's ordinary general tags (`solo`, `1girl`, `long hair`):
+/// spaces and underscores alike, case ignored. Characters, copyrights and artists aren't, nor is a
+/// tag the list hasn't got.
+pub fn is_general(tag: &str) -> bool {
+    let index = index();
+    let key = normalise(tag);
+    let from = index.keys.partition_point(|k| k.key < key);
+    index.keys.get(from..).unwrap_or_default().iter().take_while(|k| k.key == key).any(|k| {
+        !k.alias
+            && index
+                .tags
+                .get(k.tag as usize)
+                .is_some_and(|t| t.source == Source::Danbooru && t.kind == TagKind::General)
+    })
+}
+
+/// Whether `tag` is on one of the NSFW lists, so it's only offered when NSFW suggestions are on.
+pub fn is_nsfw(tag: &str) -> bool {
+    let index = index();
+    let key = normalise(tag);
+    let from = index.keys.partition_point(|k| k.key < key);
+    index
+        .keys
+        .get(from..)
+        .unwrap_or_default()
+        .iter()
+        .take_while(|k| k.key == key)
+        .any(|k| !k.alias && index.tags.get(k.tag as usize).is_some_and(|t| t.nsfw))
+}
+
 /// The tag list built once, on first use, whichever thread asks first.
 fn index() -> &'static Index {
     INDEX.get_or_init(|| {
@@ -551,6 +581,12 @@ mod tests {
         assert_eq!(count_label(12_000), "12k");
         assert_eq!(count_label(1_200_000), "1.2M");
         assert_eq!(count_label(5_596_576), "5.6M");
+    }
+
+    #[test]
+    fn general_tags_are_told_from_names() {
+        assert!(is_general("1girl") && is_general("long_hair") && is_general("Long Hair"));
+        assert!(!is_general("hatsune miku") && !is_general("dark_art_style") && !is_general("@dragonball"));
     }
 
     #[test]

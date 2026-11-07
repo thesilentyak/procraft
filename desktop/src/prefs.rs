@@ -163,6 +163,10 @@ pub struct Prefs {
     pub generation_largest: f32,
     /// The recent prompts the Generate popover offers when its field is empty, newest first.
     pub generation_recent: Vec<String>,
+    /// The styles folder chosen in Generate's server view (empty: the app's own) and the Style
+    /// Studio's preview prompt (empty: its safe scene).
+    pub generation_styles_folder: String,
+    pub generation_preview: String,
 }
 
 impl Default for Prefs {
@@ -205,6 +209,8 @@ impl Default for Prefs {
             generation_resolution: 2,
             generation_largest: 0.0,
             generation_recent: Vec::new(),
+            generation_styles_folder: String::new(),
+            generation_preview: String::new(),
         }
     }
 }
@@ -274,6 +280,8 @@ impl Prefs {
                 "generation_largest" => {
                     p.generation_largest = number.map_or(0.0, |v| if v <= 0.0 { 0.0 } else { v.clamp(1.0, 16.0) });
                 }
+                "generation_styles_folder" => p.generation_styles_folder = value.trim().to_owned(),
+                "generation_preview" => p.generation_preview = unescape(value).trim().to_owned(),
                 "generation_recent" => {
                     let prompt = unescape(value);
                     let prompt = prompt.trim();
@@ -340,6 +348,8 @@ impl Prefs {
             format!("generation_nsfw {}", self.generation_nsfw),
             format!("generation_resolution {}", self.generation_resolution),
             format!("generation_largest {}", self.generation_largest),
+            format!("generation_styles_folder {}", self.generation_styles_folder),
+            format!("generation_preview {}", escape(&self.generation_preview)),
         ];
         let mut text = lines.into_iter().chain(self.plugins.kept_lines()).collect::<Vec<String>>().join("\n");
         #[cfg(feature = "generation")]
