@@ -41,16 +41,22 @@ ProCraft's own design language. It goes upstream later.
 - **Branches**: `main-diffusion` is ours and the default (named `feat/generation` until
   2026-11-05). `main` is a copy of ProCraft's: on GitHub, "Sync fork" is safe there, never on
   `main-diffusion` (its "Discard commits" would throw our work away).
-- **Following upstream**: merge ProCraft's `main` (remote `upstream`) into `main-diffusion` often,
-  so conflicts stay small. `.github/workflows/upstream-sync.yml` tries it daily at 08:00 London
-  time on GitHub and **only checks**: it can't push, because GitHub refuses pushes carrying
-  workflow files from a workflow's own token, and the user chose not to keep a personal token as
-  a secret. Don't bring back a push or a `sync/upstream` branch. `gh` needs
-  `-R Hekel1989/procraft` (it otherwise picks ProCraft's repository).
+- **Following upstream**: we follow ProCraft's **releases** (decided 2026-11-07), not its `main`:
+  ProCraft releases every few days, and a release is a tested point, while its `main` moves too
+  fast to merge each day. `.github/workflows/upstream-sync.yml` runs daily at 08:00 London time on
+  GitHub (a release in ProCraft's repository can't start a run here): it asks for ProCraft's
+  latest release (`gh api repos/artcraft-android/procraft/releases/latest`), passes at once if
+  `main-diffusion` already has it, and otherwise merges and checks it. It **only checks**: it
+  can't push, because GitHub refuses pushes carrying workflow files from a workflow's own token,
+  and the user chose not to keep a personal token as a secret. Don't bring back a push or a
+  `sync/upstream` branch. `gh` needs `-R Hekel1989/procraft` (it otherwise picks ProCraft's
+  repository).
 - **Taking in ProCraft's changes** (when the user asks, e.g. after a passing run):
-  1. `git status` clean, on `main-diffusion`; `git fetch upstream`;
-     `git rev-list --count HEAD..upstream/main` gives the number of new commits.
-  2. `git merge --no-ff --no-edit -m "chore: merge ProCraft's main (N commits)" upstream/main`.
+  1. On `main-diffusion` with `git status` clean (if another session has work in the checkout,
+     merge in a throwaway worktree and fast-forward afterwards). `TAG=$(gh api
+     repos/artcraft-android/procraft/releases/latest --jq .tag_name)`; `git fetch upstream tag
+     $TAG`; `git rev-list --count HEAD..$TAG` gives the number of new commits.
+  2. `git merge --no-ff --no-edit -m "chore: merge ProCraft's $TAG (N commits)" $TAG`.
      On a conflict, keep both sides' behaviour; keep our hooks thin (see below). Fix and commit.
   3. All of "Building and checking", plus `cargo clippy --workspace --all-targets -- -D warnings`
      and `cargo test -p procraft-gpu -p procraft-desktop` (ProCraft's own checks).

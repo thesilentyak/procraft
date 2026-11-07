@@ -12,31 +12,39 @@ know, and the few things you might need to do.
 
 ## What happens by itself
 
+We follow ProCraft's **releases** (the versions it publishes every few days, like v0.0.4-beta),
+not every change it makes in between: a release is a tested point, while ProCraft's day-to-day
+work moves too fast to keep up with.
+
 Every morning at **08:00 (UK time)**, a GitHub robot (GitHub is busy then, so it often starts
 an hour or so late, and very occasionally skips a day):
 
-1. takes our app,
-2. mixes in everything new from ProCraft,
+1. looks for ProCraft's latest release; if we already have it, it stops there, all fine,
+2. otherwise takes our app and mixes that release in,
 3. checks it: Rust tests, lint, and an Android build.
+
+(It has to look every day: GitHub can't wake it up when ProCraft publishes a release.)
 
 It **only checks**. It never changes our app. You find out the result like this:
 
 | What you see | What it means | What to do |
 |---|---|---|
-| Nothing (no email) | All fine: either nothing new, or new things that fit | Nothing, or ask the agent to bring them in when you like |
-| An email from GitHub saying the run failed | ProCraft changed something that clashes with ours, or a check broke | Ask the agent: "the upstream sync failed, have a look" |
+| Nothing (no email) | All fine: either no new release, or a new one that fits | Nothing, or ask the agent to bring it in when you like |
+| An email from GitHub saying the run failed | ProCraft's new release clashes with ours, or a check broke | Ask the agent: "the upstream sync failed, have a look" |
 
 To see the results yourself: GitHub, your repository, **Actions** tab, **Upstream sync**. Click
-a run to read its summary, e.g. "Ready: 12 ProCraft commits merge cleanly and pass".
+a run to read its summary, e.g. "Ready: ProCraft's v0.0.5-beta (26 commits) merges cleanly and
+passes".
 
 ## Bringing in ProCraft's new things
 
 Nothing comes in until you ask. When you want to catch up, tell the agent:
 
-> Bring in ProCraft's latest changes.
+> Bring in ProCraft's latest release.
 
-The agent mixes them in on your computer, runs all the checks, tries the app if needed, and
-pushes when you say so. Catching up every week or two keeps the clashes small and easy.
+The agent mixes it in on your computer, runs all the checks, tries the app if needed, and
+pushes when you say so. Bringing in each release soon after it comes out keeps the clashes small
+and easy.
 
 ## Things not to do
 
