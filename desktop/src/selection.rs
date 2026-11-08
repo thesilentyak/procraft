@@ -53,6 +53,9 @@ pub struct Selection {
     popup: Popup,
     saved: u32,
     pictures: HashMap<u32, TextureHandle>,
+    /// Generate was tapped, for the Generate popover to open (`take_generate`).
+    #[cfg(feature = "generation")]
+    generate_tapped: bool,
 }
 
 impl Selection {
@@ -82,6 +85,8 @@ impl Default for Selection {
             popup: Popup::None,
             saved: 0,
             pictures: HashMap::new(),
+            #[cfg(feature = "generation")]
+            generate_tapped: false,
         }
     }
 }
@@ -166,12 +171,20 @@ impl Selection {
         self.look(session);
     }
 
-    /// Draws what shows while selecting and the toolbar with its popover; does what was asked.
-    /// Returns whether Generate was tapped (to open the Generate popover).
-    pub fn show(&mut self, ctx: &egui::Context, look: &mut Look, session: &CanvasSession, bar_top: f32) -> bool {
+    /// Draws what shows while selecting and the toolbar with its popover (on a `model`, with
+    /// X-Ray); does what was asked. Returns X-Ray as it is when it was turned on or off.
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        look: &mut Look,
+        session: &CanvasSession,
+        bar_top: f32,
+        model: bool,
+    ) -> Option<bool> {
         if !self.on {
-            return false;
+            return None;
         }
+        let mut x_ray_set = None;
         self.overlay(ctx, session, bar_top);
         let drawing = !session.freehand_path().is_empty();
         let (has, joins) = (self.has, self.kind != SelectKind::Automatic);
@@ -198,18 +211,18 @@ impl Selection {
                 .enabled(has || drawing),
             Button::new(&icons::COLOR_FILL, "Color Fill", 37.0).active(self.color_fill),
         ];
+        // on a model: a selection reaches every surface under it
+        if model {
+            buttons.push(Button::new(&icons::X_RAY, "X-Ray", 44.0).active(session.selection_x_ray()));
+        }
+        // image generation's button, after ProCraft's own so their places stay as they are
         #[cfg(feature = "generation")]
-        let generate = {
-            let index = buttons.len();
-            buttons.push(Button::new(&crate::generation::GENERATE, "Generate", 44.0).enabled(has));
-            Some(index)
-        };
-        #[cfg(not(feature = "generation"))]
-        let generate = None;
+        let generate = buttons.len();
+        #[cfg(feature = "generation")]
+        buttons.push(Button::new(&crate::generation::GENERATE, "Generate", 44.0).enabled(has));
         buttons.push(Button::new(&icons::CLEAR_SELECTION, "Clear", 44.0).enabled(has || drawing));
         let tapped =
             floating_toolbar(ctx, look, "selection toolbar", (BUTTON_ROOMY, BUTTON_NARROW), &segments, &buttons, 41.0);
-        let mut generate_tapped = false;
         match tapped {
             Some(Tapped::Background) => self.set_popup(session, Popup::None),
             Some(Tapped::Segment(k)) => {
@@ -247,7 +260,13 @@ impl Selection {
                     session.fill_selection();
                 }
             }
-            Some(Tapped::Button(index)) if generate == Some(index) => generate_tapped = true,
+            #[cfg(feature = "generation")]
+            Some(Tapped::Button(index)) if index == generate => self.generate_tapped = true,
+            Some(Tapped::Button(7)) if model => {
+                let on = !session.selection_x_ray();
+                session.set_selection_x_ray(on);
+                x_ray_set = Some(on);
+            }
             Some(Tapped::Button(_)) => {
                 session.set_touch_selecting(None);
                 self.touches(session);
@@ -262,7 +281,13 @@ impl Selection {
             self.set_popup(session, Popup::None);
         }
         self.popover(ctx, look, session);
-        generate_tapped
+        x_ray_set
+    }
+
+    /// Whether Generate was tapped since this was last asked (to open the Generate popover).
+    #[cfg(feature = "generation")]
+    pub fn take_generate(&mut self) -> bool {
+        std::mem::take(&mut self.generate_tapped)
     }
 
     fn open_popup(&mut self, ctx: &egui::Context, session: &CanvasSession, p: Popup) {
