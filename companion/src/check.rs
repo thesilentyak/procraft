@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use procraft_diffusion::requirements::{Feature, Readiness, add_on, all_nodes};
-use procraft_diffusion::{Address, Comfy, Family, ServerModels, styles_for};
+use procraft_diffusion::{Address, Comfy, Family, LoraNotes, ServerModels, styles_for};
 
 use crate::download;
 use crate::installed;
@@ -52,7 +52,8 @@ fn check_server(address: Address) -> Result<bool, String> {
         }
     }
     println!("styles:");
-    for style in styles_for(&models) {
+    // the built-in styles: the person's own style files live with the app, not here
+    for style in styles_for(&models, &[], &LoraNotes::default()) {
         println!("  {:<40} {} ({} steps, CFG {})", style.id, style.name, style.steps, style.cfg);
     }
     Ok(ready)
@@ -118,7 +119,7 @@ fn check_models(dir: &Path, verify: bool) -> ServerModels {
         text_encoders: check_model_folder(&root, "text_encoders", verify),
         vaes: check_model_folder(&root, "vae", verify),
         controls: check_model_folder(&root, "controlnet", verify),
-        nodes: Vec::new(),
+        ..ServerModels::default()
     };
     models.nodes =
         all_nodes().into_iter().filter(|node| add_on_present(dir, add_on(node))).map(str::to_owned).collect();
@@ -315,7 +316,7 @@ mod tests {
                 "anima-lllite-inpainting-v2.safetensors".to_owned(),
                 "anima-lllite-any-test-like-v2.safetensors".to_owned(),
             ],
-            nodes: Vec::new(),
+            ..ServerModels::default()
         };
         let checkpoints = ANIMA_KINDS.first().map(|kind| kind.files(&models)).unwrap_or_default();
         assert_eq!(
