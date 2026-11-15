@@ -189,8 +189,10 @@ Package `io.github.hekel1989.procraftdiffusion.debug` (the old ProCraft debug ap
   newest 24; thumbnails in memory, full pictures on disk, read when shown or applied). Holding a
   thumbnail gives a Delete. The server shows as a button in the popover's title. The results tray
   scrolls.
-- **Open:** the popover's prompt, style and count aren't remembered across app restarts. The
-  user has seen a few more small bugs on both platforms that aren't listed yet.
+- **Since M9:** the popover's prompt, style and count are kept across restarts (Android's
+  SharedPreferences "generation", the desktop's prefs; a kept style waits until the styles folder
+  is read); the + card's menu has New style and Import…; Studio slider values can be typed.
+- **Open:** the user has seen a few more small bugs on both platforms that aren't listed yet.
 
 ## Working with DeepSeek (optional)
 

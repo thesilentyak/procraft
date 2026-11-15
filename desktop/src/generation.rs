@@ -126,6 +126,10 @@ pub struct GenerationUi {
     prompt: String,
     /// The prompt's caret as a byte offset, as the field last reported it.
     prompt_caret: usize,
+    /// The prompt field has the keyboard (its text is kept once it hasn't).
+    prompt_focused: bool,
+    /// The style chosen last time, until it's among the styles (then it's chosen) or another is.
+    kept_style: Option<String>,
     style: String,
     strength: f32,
     /// The seed kept for the next run (none: a random one each time), and as typed.
@@ -205,7 +209,27 @@ impl GenerationUi {
         if !prefs.generation_preview.trim().is_empty() {
             ui.preview_prompt = prefs.generation_preview.clone();
         }
+        // the form as it was left
+        ui.prompt = prefs.generation_prompt.clone();
+        ui.prompt_caret = ui.prompt.len();
+        ui.style = prefs.generation_style.clone();
+        ui.kept_style = (!prefs.generation_style.is_empty()).then(|| prefs.generation_style.clone());
+        ui.count = prefs.generation_count.clamp(1, 4);
         ui
+    }
+
+    /// The popover isn't shown: its prompt field no longer has the keyboard.
+    pub fn popover_closed(&mut self) {
+        self.prompt_focused = false;
+    }
+
+    /// The form's prompt, style and count to keep, when they've changed since `kept` and the
+    /// prompt isn't being typed in (so the preferences aren't written at every key).
+    pub fn form_to_keep(&self, kept: (&str, &str, u32)) -> Option<(String, String, u32)> {
+        // while the kept style waits to be found, it stays the one kept
+        let style = self.kept_style.as_ref().unwrap_or(&self.style);
+        let now = (self.prompt.as_str(), style.as_str(), self.count);
+        (now != kept && !self.prompt_focused).then(|| (self.prompt.clone(), style.clone(), self.count))
     }
 
     /// The styles folder chosen (empty: the app's own) and the preview prompt (empty: the safe
@@ -231,6 +255,8 @@ impl GenerationUi {
             view: View::Form,
             prompt: String::new(),
             prompt_caret: 0,
+            prompt_focused: false,
+            kept_style: None,
             style: String::new(),
             strength: 1.0,
             seed: None,
@@ -495,6 +521,14 @@ impl GenerationUi {
         label(ui, pos2(left + 2.0, y), "STYLE");
         y += 22.0;
         let styles = self.generation.styles();
+        // the style kept from last time, once it's among the styles (the styles folder may be read
+        // after the first look)
+        if let Some(kept) = &self.kept_style
+            && styles.iter().any(|s| &s.id == kept)
+        {
+            self.style = kept.clone();
+            self.kept_style = None;
+        }
         if !styles.iter().any(|s| s.id == self.style)
             && let Some(first) = styles.iter().find(|s| s.reason.is_none()).or(styles.first())
         {
@@ -502,17 +536,12 @@ impl GenerationUi {
         }
         match crate::generation_styles::strip(ui, pos2(left, y), right - left, &styles, &self.style) {
             Some(crate::generation_styles::StripAction::Pick(id)) => {
+                self.kept_style = None;
                 self.style = id;
                 self.style_menu = None;
             }
             Some(crate::generation_styles::StripAction::Hold(id, card)) => self.style_menu = Some((Some(id), card)),
-            Some(crate::generation_styles::StripAction::Plus) => {
-                self.style_menu = None;
-                if let Some(edit) = self.generation.new_style() {
-                    self.studio =
-                        Some(crate::generation_studio::StyleStudio::new(self.generation.clone(), edit, None, None));
-                }
-            }
+            Some(crate::generation_styles::StripAction::Plus(card)) => self.style_menu = Some((None, card)),
             None => {}
         }
         if let Some((target, card)) = self.style_menu.clone() {
@@ -563,6 +592,7 @@ impl GenerationUi {
         let output = edit.show(&mut ui.new_child(UiBuilder::new().max_rect(inner)));
         ui.ctx().options_mut(|o| o.input_options.surrender_focus_on = surrender);
         let focused = output.response.has_focus();
+        self.prompt_focused = focused;
         if let Some(range) = output.cursor_range {
             self.prompt_caret = crate::generation_tags::char_to_byte(&self.prompt, range.primary.index.0);
         }
@@ -919,7 +949,7 @@ impl GenerationUi {
                 vec!["Edit".into(), "Duplicate".into(), "Export…".into(), "Delete…".into()]
             }
             (true, _) => vec!["Duplicate".into()],
-            (false, _) => vec!["New style".into()],
+            (false, _) => vec!["New style".into(), "Import…".into()],
         };
         let menu = Rect::from_min_size(pos2(card.left(), card.bottom() + 6.0), vec2(220.0, 44.0 * items.len() as f32));
         let mut picked = None;
@@ -958,6 +988,14 @@ impl GenerationUi {
         self.style_menu = None;
         let id = target.unwrap_or_else(|| self.style.clone());
         match item.as_str() {
+            "New style" => {
+                if let Some(edit) = self.generation.new_style() {
+                    self.studio =
+                        Some(crate::generation_studio::StyleStudio::new(self.generation.clone(), edit, None, None));
+                }
+            }
+            // why it couldn't is shown under Generate, where the menu was
+            "Import…" => self.notes_error = self.import_picked().err(),
             "Edit" => {
                 let file = style.and_then(|s| s.file.clone());
                 let old = file
@@ -994,6 +1032,22 @@ impl GenerationUi {
         }
     }
 
+    /// Asks for a style file and copies it into the styles folder, choosing it and going back to
+    /// the form; why it couldn't, if it couldn't (nothing picked is no error).
+    fn import_picked(&mut self) -> Result<(), String> {
+        let chosen = rfd::FileDialog::new().set_title("Import a style").add_filter("Styles", &["toml"]).pick_file();
+        let Some(from) = chosen else { return Ok(()) };
+        let name = crate::generation_styles::import_style(&self.generation, &from)
+            .map_err(|e| format!("Couldn't import it: {e}"))?;
+        self.styles_problem = None;
+        self.styles_folder = Default::default();
+        self.styles_folder.refresh(&self.generation);
+        self.kept_style = None;
+        self.style = format!("user:{name}");
+        self.view = View::Form;
+        Ok(())
+    }
+
     /// The Style Studio is open (it covers the window).
     pub fn studio_open(&self) -> bool {
         self.studio.is_some()
@@ -1009,6 +1063,7 @@ impl GenerationUi {
         // the preview prompt is kept for next time
         self.settings_changed = true;
         if let crate::generation_studio::Closed::Saved(file) = closed {
+            self.kept_style = None;
             self.style = format!("user:{file}");
         }
         self.styles_folder = Default::default();
@@ -1305,22 +1360,7 @@ impl GenerationUi {
                     self.settings_changed = true;
                 }
             }
-            Some("Import") => {
-                let chosen =
-                    rfd::FileDialog::new().set_title("Import a style").add_filter("Styles", &["toml"]).pick_file();
-                if let Some(from) = chosen {
-                    match crate::generation_styles::import_style(&self.generation, &from) {
-                        Ok(name) => {
-                            self.styles_problem = None;
-                            self.styles_folder = Default::default();
-                            self.styles_folder.refresh(&self.generation);
-                            self.style = format!("user:{name}");
-                            self.view = View::Form;
-                        }
-                        Err(e) => self.styles_problem = Some(format!("Couldn't import it: {e}")),
-                    }
-                }
-            }
+            Some("Import") => self.styles_problem = self.import_picked().err(),
             _ => {}
         }
         let mut y = y + 68.0;

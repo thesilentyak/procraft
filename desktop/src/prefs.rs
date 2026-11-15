@@ -169,6 +169,10 @@ pub struct Prefs {
     /// Studio's preview prompt (empty: its safe scene).
     pub generation_styles_folder: String,
     pub generation_preview: String,
+    /// The Generate popover as it was left: its prompt, style and how many pictures.
+    pub generation_prompt: String,
+    pub generation_style: String,
+    pub generation_count: u32,
 }
 
 impl Default for Prefs {
@@ -214,6 +218,9 @@ impl Default for Prefs {
             generation_recent: Vec::new(),
             generation_styles_folder: String::new(),
             generation_preview: String::new(),
+            generation_prompt: String::new(),
+            generation_style: String::new(),
+            generation_count: 1,
         }
     }
 }
@@ -286,6 +293,9 @@ impl Prefs {
                 }
                 "generation_styles_folder" => p.generation_styles_folder = value.trim().to_owned(),
                 "generation_preview" => p.generation_preview = unescape(value).trim().to_owned(),
+                "generation_prompt" => p.generation_prompt = unescape(value),
+                "generation_style" => p.generation_style = value.trim().to_owned(),
+                "generation_count" => p.generation_count = value.trim().parse::<u32>().map_or(1, |c| c.clamp(1, 4)),
                 "generation_recent" => {
                     let prompt = unescape(value);
                     let prompt = prompt.trim();
@@ -355,6 +365,9 @@ impl Prefs {
             format!("generation_largest {}", self.generation_largest),
             format!("generation_styles_folder {}", self.generation_styles_folder),
             format!("generation_preview {}", escape(&self.generation_preview)),
+            format!("generation_prompt {}", escape(&self.generation_prompt)),
+            format!("generation_style {}", self.generation_style),
+            format!("generation_count {}", self.generation_count),
         ];
         let mut text = lines.into_iter().chain(self.plugins.kept_lines()).collect::<Vec<String>>().join("\n");
         #[cfg(feature = "generation")]

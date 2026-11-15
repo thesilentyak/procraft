@@ -839,6 +839,12 @@ impl Interface {
         if self.open != Some(Popover::Layers) {
             self.end_background_pick(session);
         }
+        // the Generate form's prompt is kept, however its popover closed
+        #[cfg(feature = "generation")]
+        if self.open != Some(Popover::Generate) {
+            self.generation.popover_closed();
+            self.keep_generation_settings();
+        }
         // the colour panel dragged out by its grabber: a window over the canvas until closed, its
         // Classic as the plugins on now draw it
         if self.colours.floating.is_some() {
@@ -2265,6 +2271,13 @@ impl Interface {
     /// Image generation's server or NSFW changed: kept with the preferences.
     #[cfg(feature = "generation")]
     fn keep_generation_settings(&mut self) {
+        let kept =
+            (self.prefs.generation_prompt.as_str(), self.prefs.generation_style.as_str(), self.prefs.generation_count);
+        if let Some((prompt, style, count)) = self.generation.form_to_keep(kept) {
+            (self.prefs.generation_prompt, self.prefs.generation_style, self.prefs.generation_count) =
+                (prompt, style, count);
+            self.prefs.keep();
+        }
         if std::mem::take(&mut self.generation.settings_changed) {
             self.prefs.generation_address = self.generation.settings.address.clone();
             self.prefs.generation_nsfw = self.generation.settings.nsfw;

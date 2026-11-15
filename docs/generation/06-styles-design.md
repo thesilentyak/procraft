@@ -516,8 +516,11 @@ trigger = "@dragonball"
   Download and choosing it.
 - **Checked on the desktop** (2026-11-07): the trigger words and chips, Export, and the Styles
   folder row's Import, Change and Open.
-- **Left over**: typed values on the sliders; the LoRA list grouped by family with badges (A3);
-  a long name on a style card breaks inside a word beside its badge ("Importe/d test").
+- **Left over**: the LoRA list grouped by family with badges (A3).
+- **Fixed after M9 (2026-11-15)**: a tap on a Studio slider's value types it (the value selected,
+  Done or Enter keeps it, Esc cancels; LoRA strength −200 to 200 %, steps 1 to 100, CFG 0 to 30,
+  rescale 0 to 1, best size 256 to 2048); a style name whose word won't fit beside its badge is
+  drawn smaller rather than broken inside the word; the + card offers New style and Import….
 
 | **M8 Trigger words and sharing** | `look_up_lora` with the metadata and the tag list, the pre-fill and chips; `save_lora_notes`; Export and Import; Open styles folder; the Styles folder setting on both apps |
 

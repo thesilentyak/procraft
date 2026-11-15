@@ -165,6 +165,8 @@ object GenerationUi {
         set(value) { promptField = androidx.compose.ui.text.input.TextFieldValue(value, androidx.compose.ui.text.TextRange(value.length)) }
     private var promptFocused by mutableStateOf(false)
     private var style by mutableStateOf("")
+    // the style chosen last time, until it's among the styles (then it's chosen) or another is
+    private var keptStyle: String? = null
     private var strength by mutableStateOf(1f)
     private var seed by mutableStateOf<ULong?>(null)
     private var count by mutableStateOf(1)
@@ -210,6 +212,11 @@ object GenerationUi {
         settings = GenerationSettings(p.getString("address", "") ?: "", p.getBoolean("nsfw", false), largest)
         resolution = GenerationResolution.entries.firstOrNull { it.name == p.getString("resolution", null) } ?: GenerationResolution.QUALITY
         address = settings.address
+        // the form as it was left: the prompt, the style and how many pictures
+        prompt = p.getString("prompt", "") ?: ""
+        style = p.getString("style", "") ?: ""
+        keptStyle = style.ifEmpty { null }
+        count = p.getInt("count", 1).coerceIn(1, 4)
         Generation(settings).also { g ->
             generation = g
             g.setRecentPrompts(p.getString("recent", "")?.split('\n')?.filter { it.isNotBlank() } ?: emptyList())
@@ -391,11 +398,24 @@ object GenerationUi {
     @Composable
     private fun ColumnScope.Form(vm: CanvasViewModel, g: Generation) {
         val focus = LocalFocusManager.current
+        // the prompt, style and count kept across restarts, a moment after they settle
+        val formContext = LocalContext.current
+        LaunchedEffect(prompt, style, count) {
+            delay(500)
+            // while the kept style waits to be found, it stays the one kept
+            prefs(formContext).edit().putString("prompt", prompt).putString("style", keptStyle ?: style).putInt("count", count).apply()
+        }
+        val importInForm = androidx.activity.compose.rememberLauncherForActivityResult(androidx.activity.result.contract.ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri != null) error = importStyle(formContext, g, uri)
+        }
         Title()
         val styles = remember(server, stylesRead) { g.styles() }
         Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())) {
             // the styles: cards in a row, the chosen one ringed
             Label("STYLE")
+            // the style kept from last time, once it's among the styles (the styles folder may be read
+            // after the first look)
+            keptStyle?.let { k -> if (styles.any { it.id == k }) { style = k; keptStyle = null } }
             if (styles.none { it.id == style }) (styles.firstOrNull { it.reason == null } ?: styles.firstOrNull())?.let { style = it.id }
             Row(Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 for (s in styles) {
@@ -404,11 +424,20 @@ object GenerationUi {
                     Column(
                         Modifier.width(116.dp).height(76.dp).clip(shape).background(Card)
                             .then(if (s.id == style) Modifier.border(2.dp, Pc.Accent, shape) else Modifier)
-                            .combinedClickable(remember { MutableInteractionSource() }, indication = null, onLongClick = { styleMenu = s.id }, onClick = { style = s.id })
+                            .combinedClickable(remember { MutableInteractionSource() }, indication = null, onLongClick = { styleMenu = s.id }, onClick = { keptStyle = null; style = s.id })
                             .padding(10.dp),
                     ) {
                         Row(Modifier.weight(1f)) {
-                            Text(s.name, color = Ink, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                            // a word too long for the room beside the badge makes the name smaller,
+                            // rather than broken inside the word ("Importe" / "d test")
+                            androidx.compose.foundation.layout.BoxWithConstraints(Modifier.weight(1f)) {
+                                val measurer = androidx.compose.ui.text.rememberTextMeasurer()
+                                val fits = remember(s.name, constraints.maxWidth) {
+                                    val style14 = androidx.compose.ui.text.TextStyle(fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                                    s.name.split(' ').filter { it.isNotEmpty() }.all { measurer.measure(it, style14).size.width <= constraints.maxWidth }
+                                }
+                                Text(s.name, color = Ink, fontSize = if (fits) 14.sp else 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                            }
                             FamilyBadge(s.family)
                         }
                         val note = s.note
@@ -418,11 +447,12 @@ object GenerationUi {
                     if (styleMenu == s.id) StyleMenu(g, s)
                     }
                 }
-                // the + card: a new style from the chosen one
+                // the + card: New style (from the chosen one) or Import… (a style file)
                 Box {
-                    Box(Modifier.width(56.dp).height(76.dp).clip(RoundedCornerShape(12.dp)).background(Card).tap { g.newStyle()?.let { StyleStudio.start(g, it, null, null) } }, contentAlignment = Alignment.Center) {
+                    Box(Modifier.width(56.dp).height(76.dp).clip(RoundedCornerShape(12.dp)).background(Card).tap { styleMenu = "+" }, contentAlignment = Alignment.Center) {
                         Text("+", color = Dim, fontSize = 26.sp)
                     }
+                    if (styleMenu == "+") PlusMenu(g) { importInForm.launch(arrayOf("*/*")) }
                 }
                 if (styles.isEmpty()) Text("No Anima model on the server", color = Dim, fontSize = 14.sp, modifier = Modifier.padding(vertical = 26.dp))
             }
@@ -646,6 +676,30 @@ object GenerationUi {
         }
     }
 
+    /** The + card's menu under it: New style, Import…. */
+    @Composable
+    private fun PlusMenu(g: Generation, import: () -> Unit) {
+        val down = with(LocalDensity.current) { (76.dp + 6.dp).roundToPx() }
+        androidx.compose.ui.window.Popup(
+            offset = androidx.compose.ui.unit.IntOffset(0, down),
+            onDismissRequest = { styleMenu = null },
+            properties = androidx.compose.ui.window.PopupProperties(focusable = true),
+        ) {
+            Column(Modifier.width(220.dp).clip(RoundedCornerShape(14.dp)).background(if (Pc.light) Color(0xF7FAFAFA) else Color(0xF7313135))) {
+                listOf("New style", "Import…").forEachIndexed { i, item ->
+                    if (i > 0) Box(Modifier.fillMaxWidth().height(1.dp).background(if (Pc.light) Color(0x1F000000) else Color(0x1FFFFFFF)))
+                    Text(
+                        item, color = Ink, fontSize = 15.sp,
+                        modifier = Modifier.fillMaxWidth().tap {
+                            styleMenu = null
+                            if (item == "New style") g.newStyle()?.let { StyleStudio.start(g, it, null, null) } else import()
+                        }.padding(horizontal = 16.dp, vertical = 13.dp),
+                    )
+                }
+            }
+        }
+    }
+
     /** The Style Studio over everything while it's open; after the first save without a folder, the question about it. */
     @Composable
     fun StyleStudio(vm: CanvasViewModel) {
@@ -687,7 +741,7 @@ object GenerationUi {
             exit = androidx.compose.animation.slideOutVertically { it },
         ) {
             StyleStudio.Screen(vm, g) { saved ->
-                if (saved != null) style = "user:$saved"
+                if (saved != null) { keptStyle = null; style = "user:$saved" }
                 reread()
             }
         }
@@ -720,19 +774,7 @@ object GenerationUi {
             }
         }
         val import = androidx.activity.compose.rememberLauncherForActivityResult(androidx.activity.result.contract.ActivityResultContracts.OpenDocument()) { uri ->
-            if (uri == null) return@rememberLauncherForActivityResult
-            val (fileName, text) = StylesFolder.imported(context, uri) ?: run { problem = "Couldn't import it: the file can't be read"; return@rememberLauncherForActivityResult }
-            g.styleFileProblem(text)?.let { problem = "Couldn't import it: $it"; return@rememberLauncherForActivityResult }
-            g.setStyleFiles(StylesFolder.read(context))
-            val name = g.styleFileName(fileName.substringBeforeLast('.'), null)
-            StylesFolder.write(context, name, text, null)?.let { problem = "Couldn't import it: $it"; return@rememberLauncherForActivityResult }
-            problem = null
-            g.setStyleFiles(StylesFolder.read(context))
-            stylesRead++
-            style = "user:$name"
-            view = View.FORM
-            // the first save without a folder given: ask for it
-            if (!StylesFolder.granted(context)) StyleStudio.asking = true
+            if (uri != null) problem = importStyle(context, g, uri)
         }
         Row(
             Modifier.fillMaxWidth().height(56.dp).clip(RoundedCornerShape(14.dp)).background(RowFill).padding(start = 16.dp),
@@ -746,6 +788,24 @@ object GenerationUi {
             Text(if (shown == null) "Choose" else "Change", color = Pc.Accent, fontSize = 15.sp, fontWeight = FontWeight.Medium, modifier = Modifier.fillMaxHeight().tap { pick.launch(StylesFolder.prepare(context)) }.wrapContentHeight().padding(start = 10.dp, end = 16.dp))
         }
         problem?.let { Text(it, color = WARN, fontSize = 13.sp, modifier = Modifier.padding(start = 4.dp, top = 6.dp)) }
+    }
+
+    /** Copies a picked style file into the styles folder, chooses it and goes back to the form; why
+     *  it couldn't, or null. */
+    private fun importStyle(context: Context, g: Generation, uri: android.net.Uri): String? {
+        val (fileName, text) = StylesFolder.imported(context, uri) ?: return "Couldn't import it: the file can't be read"
+        g.styleFileProblem(text)?.let { return "Couldn't import it: $it" }
+        g.setStyleFiles(StylesFolder.read(context))
+        val name = g.styleFileName(fileName.substringBeforeLast('.'), null)
+        StylesFolder.write(context, name, text, null)?.let { return "Couldn't import it: $it" }
+        g.setStyleFiles(StylesFolder.read(context))
+        stylesRead++
+        keptStyle = null
+        style = "user:$name"
+        view = View.FORM
+        // the first save without a folder given: ask for it
+        if (!StylesFolder.granted(context)) StyleStudio.asking = true
+        return null
     }
 
     private fun run(vm: CanvasViewModel, g: Generation, run: RunSettings) {

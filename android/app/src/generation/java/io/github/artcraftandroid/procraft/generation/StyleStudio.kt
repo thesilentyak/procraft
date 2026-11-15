@@ -322,7 +322,11 @@ internal object StyleStudio {
                     }
                     Text("×", color = Dim, fontSize = 22.sp, modifier = Modifier.tap { edit = e.copy(loras = e.loras.filterIndexed { j, _ -> j != i }) }.padding(horizontal = 14.dp))
                 }
-                SliderRow("Strength", lora.strength / 2f, "${Math.round(lora.strength * 100)} %") { t ->
+                val percent = Math.round(lora.strength * 100)
+                TypedSlider("Strength", lora.strength / 2f, "$percent %", "$percent", { n ->
+                    val strength = Math.round(n.coerceIn(-200f, 200f)) / 100f
+                    edit = e.copy(loras = e.loras.mapIndexed { j, l -> if (j == i) l.copy(strength = strength) else l })
+                }) { t ->
                     val strength = Math.round(t * 40) / 20f
                     edit = e.copy(loras = e.loras.mapIndexed { j, l -> if (j == i) l.copy(strength = strength) else l })
                 }
@@ -363,8 +367,9 @@ internal object StyleStudio {
         Heading("Sampling")
         ValueRow("Sampler", e.sampler) { picker = Picker.SAMPLER }
         Spacer(Modifier.height(10.dp))
-        SliderRow("Steps", (e.steps.toFloat() - 1f) / 99f, "${e.steps}") { t -> edit = e.copy(steps = (1 + Math.round(t * 99)).toUInt()) }
-        SliderRow("CFG", (e.cfg - 1f) / 14f, "%.1f".format(e.cfg)) { t -> edit = e.copy(cfg = Math.round((1f + t * 14f) * 10f) / 10f) }
+        TypedSlider("Steps", (e.steps.toFloat() - 1f) / 99f, "${e.steps}", "${e.steps}", { n -> edit = e.copy(steps = Math.round(n.coerceIn(1f, 100f)).toUInt()) }) { t -> edit = e.copy(steps = (1 + Math.round(t * 99)).toUInt()) }
+        val cfg = "%.1f".format(java.util.Locale.ROOT, e.cfg)
+        TypedSlider("CFG", (e.cfg - 1f) / 14f, cfg, cfg, { n -> edit = e.copy(cfg = Math.round(n.coerceIn(0f, 30f) * 10f) / 10f) }) { t -> edit = e.copy(cfg = Math.round((1f + t * 14f) * 10f) / 10f) }
     }
 
     @Composable
@@ -373,7 +378,10 @@ internal object StyleStudio {
         ValueRow("Scheduler", e.scheduler) { picker = Picker.SCHEDULER }
         Spacer(Modifier.height(10.dp))
         SwitchRow("Rescale CFG", e.rescaleCfg != null) { edit = e.copy(rescaleCfg = if (e.rescaleCfg != null) null else 0.7f) }
-        e.rescaleCfg?.let { r -> SliderRow("Multiplier", r, "%.2f".format(r)) { t -> edit = e.copy(rescaleCfg = Math.round(t * 100) / 100f) } }
+        e.rescaleCfg?.let { r ->
+            val shown = "%.2f".format(java.util.Locale.ROOT, r)
+            TypedSlider("Multiplier", r, shown, shown, { n -> edit = e.copy(rescaleCfg = Math.round(n.coerceIn(0f, 1f) * 100) / 100f) }) { t -> edit = e.copy(rescaleCfg = Math.round(t * 100) / 100f) }
+        }
         Spacer(Modifier.height(10.dp))
         ValueRow("VAE", e.vae ?: "The model's own") { picker = Picker.VAE }
         Spacer(Modifier.height(10.dp))
@@ -381,8 +389,46 @@ internal object StyleStudio {
         Spacer(Modifier.height(10.dp))
         SwitchRow("Best size", e.bestSize != null) { edit = e.copy(bestSize = if (e.bestSize != null) null else 1024u) }
         e.bestSize?.let { size ->
-            SliderRow("One side", (size.toFloat() - 256f) / (2048f - 256f), "$size px") { t -> edit = e.copy(bestSize = (Math.round((256f + t * (2048f - 256f)) / 8f) * 8).toUInt()) }
+            TypedSlider("One side", (size.toFloat() - 256f) / (2048f - 256f), "$size px", "$size", { n -> edit = e.copy(bestSize = (Math.round(n.coerceIn(256f, 2048f) / 8f) * 8).toUInt()) }) { t -> edit = e.copy(bestSize = (Math.round((256f + t * (2048f - 256f)) / 8f) * 8).toUInt()) }
             Note("Pictures are made at about this size squared, then scaled. For models trained at an unusual size.")
+        }
+    }
+
+    /** A slider whose value a tap turns into a field to type a number in (starting from [typed],
+     *  the number keyboard up); Done, or leaving the field, gives the number to [typedIn]. Something
+     *  that isn't a number leaves the value as it was. */
+    @Composable
+    private fun TypedSlider(label: String, value: Float, shown: String, typed: String, typedIn: (Float) -> Unit, onChange: (Float) -> Unit) {
+        // what's typed so far, the value as it was selected at first so a number replaces it
+        var typing by remember { mutableStateOf<androidx.compose.ui.text.input.TextFieldValue?>(null) }
+        Box {
+            SliderRow(label, value, if (typing != null) "" else shown, onChange)
+            val text = typing
+            if (text == null) {
+                Box(Modifier.align(Alignment.TopEnd).width(110.dp).height(36.dp).tap {
+                    typing = androidx.compose.ui.text.input.TextFieldValue(typed, androidx.compose.ui.text.TextRange(0, typed.length))
+                })
+            } else {
+                val focus = remember { FocusRequester() }
+                var focused by remember { mutableStateOf(false) }
+                val finish = {
+                    typing?.text?.trim()?.replace(',', '.')?.toFloatOrNull()?.takeIf { it.isFinite() }?.let(typedIn)
+                    typing = null
+                }
+                BasicTextField(
+                    text,
+                    onValueChange = { typing = it },
+                    singleLine = true,
+                    textStyle = androidx.compose.ui.text.TextStyle(color = Label, fontSize = 15.sp, textAlign = androidx.compose.ui.text.style.TextAlign.End),
+                    cursorBrush = androidx.compose.ui.graphics.SolidColor(Pc.Accent),
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Decimal, imeAction = androidx.compose.ui.text.input.ImeAction.Done),
+                    keyboardActions = androidx.compose.foundation.text.KeyboardActions(onDone = { finish() }),
+                    modifier = Modifier.align(Alignment.TopEnd).padding(top = 5.dp, end = 10.dp).width(90.dp)
+                        .clip(RoundedCornerShape(8.dp)).background(Pc.Accent.copy(alpha = 0.18f)).padding(horizontal = 8.dp, vertical = 4.dp)
+                        .focusRequester(focus).onFocusChanged { f -> if (focused && !f.isFocused) finish(); focused = f.isFocused },
+                )
+                LaunchedEffect(Unit) { focus.requestFocus() }
+            }
         }
     }
 

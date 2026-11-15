@@ -130,8 +130,8 @@ pub enum StripAction {
     Pick(String),
     /// A card was held or right-clicked: its menu, under it.
     Hold(String, Rect),
-    /// The + card was tapped: a new style.
-    Plus,
+    /// The + card was tapped: its menu (New style, Import…), under it.
+    Plus(Rect),
 }
 
 /// How long a card is held, in seconds, before its menu shows.
@@ -180,8 +180,8 @@ pub fn strip(ui: &mut Ui, at: egui::Pos2, width: f32, styles: &[StyleInfo], chos
             let (plus, response) = ui.allocate_exact_size(vec2(PLUS_WIDTH, CARD_HEIGHT), Sense::click());
             ui.painter().rect_filled(plus, 12.0, argb(CARD));
             text(ui.painter(), plus.center(), Align2::CENTER_CENTER, "+", 26.0, Weight::Regular, argb(DIM));
-            if response.on_hover_text("New style").clicked() {
-                clicked = Some(StripAction::Plus);
+            if response.on_hover_text("New style or Import").clicked() {
+                clicked = Some(StripAction::Plus(plus));
             }
         });
     clicked
@@ -202,10 +202,15 @@ fn card_at(ui: &Ui, card: Rect, s: &StyleInfo, on: bool) {
     text(painter, badge.center(), Align2::CENTER_CENTER, &s.family, 10.0, Weight::SemiBold, argb(ink));
     // the name, two lines at most, drawn rather than added as a widget: a widget would move the
     // row's cursor, and the next card would start over this one
+    // a word too long for the room beside the badge makes the name smaller, rather than broken inside
+    // the word ("Importe" / "d test")
+    let room = badge.left() - 4.0 - (card.left() + 10.0);
+    let longest = s.name.split_whitespace().map(|w| text_width(painter, w, 14.0, Weight::SemiBold)).fold(0.0, f32::max);
+    let size = if longest > room { 12.0 } else { 14.0 };
     let mut job = egui::text::LayoutJob::default();
-    let format = egui::TextFormat { font_id: Weight::SemiBold.font(14.0), color: argb(INK), ..Default::default() };
+    let format = egui::TextFormat { font_id: Weight::SemiBold.font(size), color: argb(INK), ..Default::default() };
     job.append(&s.name, 0.0, format);
-    job.wrap.max_width = badge.left() - 4.0 - (card.left() + 10.0);
+    job.wrap.max_width = room;
     job.wrap.max_rows = 2;
     job.wrap.overflow_character = Some('…');
     let name = painter.layout_job(job);

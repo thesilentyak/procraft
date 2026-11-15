@@ -376,6 +376,17 @@ impl StyleStudio {
                 Weight::Regular,
                 argb(DIM),
             );
+            // its value, typed on a click: −200 to 200 %
+            let percent = (lora.strength * 100.0).round();
+            let value = Rect::from_min_max(
+                pos2(block.right() - 110.0, block.bottom() - 46.0),
+                pos2(block.right() - 8.0, block.bottom() - 22.0),
+            );
+            if let Some(n) =
+                typed_value(ui, value, &format!("{percent} %"), &format!("{percent}"), &format!("lora {i}"))
+            {
+                lora.strength = (n.clamp(-200.0, 200.0)).round() / 100.0;
+            }
             let track = Rect::from_min_max(
                 pos2(block.left() + 14.0, block.bottom() - 16.0),
                 pos2(block.right() - 14.0, block.bottom() - 12.0),
@@ -452,15 +463,17 @@ impl StyleStudio {
         }
         ui.add_space(10.0);
         let steps = self.edit.steps as f32;
-        if let Some(v) =
-            labelled_slider(ui, look, "Steps", &format!("{}", self.edit.steps), (steps - 1.0) / 99.0, "steps")
-        {
-            self.edit.steps = (1.0 + v * 99.0).round() as u32;
+        let shown = format!("{}", self.edit.steps);
+        match labelled_slider(ui, look, "Steps", &shown, &shown, (steps - 1.0) / 99.0, "steps") {
+            Some(Slid::Moved(v)) => self.edit.steps = (1.0 + v * 99.0).round() as u32,
+            Some(Slid::Typed(n)) => self.edit.steps = n.round().clamp(1.0, 100.0) as u32,
+            None => {}
         }
-        if let Some(v) =
-            labelled_slider(ui, look, "CFG", &format!("{:.1}", self.edit.cfg), (self.edit.cfg - 1.0) / 14.0, "cfg")
-        {
-            self.edit.cfg = ((1.0 + v * 14.0) * 10.0).round() / 10.0;
+        let shown = format!("{:.1}", self.edit.cfg);
+        match labelled_slider(ui, look, "CFG", &shown, &shown, (self.edit.cfg - 1.0) / 14.0, "cfg") {
+            Some(Slid::Moved(v)) => self.edit.cfg = ((1.0 + v * 14.0) * 10.0).round() / 10.0,
+            Some(Slid::Typed(n)) => self.edit.cfg = (n.clamp(0.0, 30.0) * 10.0).round() / 10.0,
+            None => {}
         }
     }
 
@@ -475,10 +488,13 @@ impl StyleStudio {
         if switch_row(ui, "Rescale CFG", on, "rescale") {
             self.edit.rescale_cfg = if on { None } else { Some(0.7) };
         }
-        if let Some(r) = self.edit.rescale_cfg
-            && let Some(v) = labelled_slider(ui, look, "Multiplier", &format!("{r:.2}"), r, "rescale value")
-        {
-            self.edit.rescale_cfg = Some((v * 100.0).round() / 100.0);
+        if let Some(r) = self.edit.rescale_cfg {
+            let shown = format!("{r:.2}");
+            match labelled_slider(ui, look, "Multiplier", &shown, &shown, r, "rescale value") {
+                Some(Slid::Moved(v)) => self.edit.rescale_cfg = Some((v * 100.0).round() / 100.0),
+                Some(Slid::Typed(n)) => self.edit.rescale_cfg = Some((n.clamp(0.0, 1.0) * 100.0).round() / 100.0),
+                None => {}
+            }
         }
         ui.add_space(10.0);
         let vae = self.edit.vae.clone().unwrap_or_else(|| "The model's own".to_owned());
@@ -498,8 +514,20 @@ impl StyleStudio {
         }
         if let Some(size) = self.edit.best_size {
             let at = (size as f32 - 256.0) / (2048.0 - 256.0);
-            if let Some(v) = labelled_slider(ui, look, "One side", &format!("{size} px"), at, "best size value") {
-                self.edit.best_size = Some(((256.0 + v * (2048.0 - 256.0)) / 8.0).round() as u32 * 8);
+            match labelled_slider(
+                ui,
+                look,
+                "One side",
+                &format!("{size} px"),
+                &format!("{size}"),
+                at,
+                "best size value",
+            ) {
+                Some(Slid::Moved(v)) => {
+                    self.edit.best_size = Some(((256.0 + v * (2048.0 - 256.0)) / 8.0).round() as u32 * 8);
+                }
+                Some(Slid::Typed(n)) => self.edit.best_size = Some((n.clamp(256.0, 2048.0) / 8.0).round() as u32 * 8),
+                None => {}
             }
             note(
                 ui,
@@ -926,8 +954,88 @@ fn button_row(ui: &mut Ui, words: &str, id: &str) -> bool {
     response.clicked()
 }
 
-/// A slider with its name and value above it; where it was moved to (0..1), if it was.
-fn labelled_slider(ui: &mut Ui, look: &mut Look, name: &str, value: &str, at: f32, id: &str) -> Option<f32> {
+/// What a slider was given: moved to a place along it (0..1), or a number typed.
+enum Slid {
+    Moved(f32),
+    Typed(f32),
+}
+
+/// A value shown at the right of `rect` that a click turns into a field to type a number in
+/// (starting from `typed`); the number, once Enter is pressed or the field is left. Esc, or
+/// something that isn't a number, leaves the value as it was.
+fn typed_value(ui: &mut Ui, rect: Rect, shown: &str, typed: &str, id: &str) -> Option<f32> {
+    let key = ui.scope_id().with(("typed value", id));
+    let typing: Option<String> = ui.data(|d| d.get_temp(key));
+    let Some(mut text_now) = typing else {
+        text(
+            ui.painter(),
+            pos2(rect.right(), rect.center().y),
+            Align2::RIGHT_CENTER,
+            shown,
+            14.0,
+            Weight::Regular,
+            argb(DIM),
+        );
+        let width = text_width(ui.painter(), shown, 14.0, Weight::Regular);
+        let hit = Rect::from_min_max(pos2(rect.right() - width - 8.0, rect.top()), rect.max);
+        let response = ui.interact(hit, key.with("click"), Sense::click()).on_hover_cursor(egui::CursorIcon::Text);
+        if response.clicked() {
+            ui.data_mut(|d| d.insert_temp(key, typed.to_owned()));
+        }
+        return None;
+    };
+    let field = Rect::from_min_max(pos2(rect.right() - 80.0, rect.top()), rect.max);
+    let edit = egui::TextEdit::singleline(&mut text_now)
+        .id(key.with("field"))
+        .align(Align2::RIGHT_CENTER)
+        .font(egui::FontId::proportional(14.0));
+    let response = ui.put(field, edit);
+    if !response.has_focus() && !response.lost_focus() {
+        response.request_focus();
+    }
+    // just opened: the value selected, so a number typed replaces it (once the field has a state)
+    let fresh = key.with("fresh");
+    if ui.data(|d| d.get_temp::<bool>(fresh)).unwrap_or(true)
+        && let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), response.id)
+    {
+        let all = egui::text::CCursorRange::two(
+            egui::text::CCursor::new(0),
+            egui::text::CCursor::new(text_now.chars().count()),
+        );
+        state.cursor.set_char_range(Some(all));
+        state.store(ui.ctx(), response.id);
+        ui.data_mut(|d| d.insert_temp(fresh, false));
+    }
+    let cancelled = ui.input(|i| i.key_pressed(egui::Key::Escape));
+    if cancelled {
+        ui.data_mut(|d| {
+            d.remove::<String>(key);
+            d.remove::<bool>(fresh);
+        });
+        return None;
+    }
+    if response.lost_focus() {
+        ui.data_mut(|d| {
+            d.remove::<String>(key);
+            d.remove::<bool>(fresh);
+        });
+        return text_now.trim().replace(',', ".").parse::<f32>().ok().filter(|n| n.is_finite());
+    }
+    ui.data_mut(|d| d.insert_temp(key, text_now));
+    None
+}
+
+/// A slider with its name and value above it (a click on the value types it, starting from
+/// `typed`); where it was moved to, or the number typed, if either.
+fn labelled_slider(
+    ui: &mut Ui,
+    look: &mut Look,
+    name: &str,
+    value: &str,
+    typed: &str,
+    at: f32,
+    id: &str,
+) -> Option<Slid> {
     let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 56.0), Sense::hover());
     text(
         ui.painter(),
@@ -938,17 +1046,13 @@ fn labelled_slider(ui: &mut Ui, look: &mut Look, name: &str, value: &str, at: f3
         Weight::Regular,
         argb(LABEL),
     );
-    text(
-        ui.painter(),
-        pos2(row.right() - 8.0, row.top() + 10.0),
-        Align2::RIGHT_CENTER,
-        value,
-        14.0,
-        Weight::Regular,
-        argb(DIM),
-    );
+    let value_rect =
+        Rect::from_min_max(pos2(row.right() - 120.0, row.top()), pos2(row.right() - 8.0, row.top() + 22.0));
+    if let Some(n) = typed_value(ui, value_rect, value, typed, id) {
+        return Some(Slid::Typed(n));
+    }
     let track = Rect::from_min_max(pos2(row.left() + 8.0, row.top() + 36.0), pos2(row.right() - 8.0, row.top() + 40.0));
-    crate::generation::slider(ui, look, track, at.clamp(0.0, 1.0), id)
+    crate::generation::slider(ui, look, track, at.clamp(0.0, 1.0), id).map(Slid::Moved)
 }
 
 /// Rows to choose one of, the chosen one ticked, each with the family's badge; the row tapped.

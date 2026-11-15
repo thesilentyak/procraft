@@ -7,8 +7,8 @@
 use std::time::{Duration, Instant};
 
 use procraft_diffusion::{
-    Address, Comfy, Connection, Control, ControlKind, ControlStep, Error, Extraction, Family, Feature, Picture, Request,
-    Resolution, RunState, ServerState, Worker, plan_for,
+    Address, Comfy, Connection, Control, ControlKind, ControlStep, Error, Extraction, Family, Feature, Picture,
+    Request, Resolution, RunState, ServerState, Worker, plan_for,
 };
 
 fn address() -> Address {
