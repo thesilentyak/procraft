@@ -1,7 +1,7 @@
 //! Drawing a frame into a window's image: by the render thread on Android and iPadOS, and by the
 //! desktop app's own loop; and setting up the window's surface for it.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use procraft_engine::geom::Vec2;
 use procraft_engine::profile::Profile;
@@ -67,6 +67,13 @@ impl State {
         }
     }
 
+    /// When the selection's bands next show moved: when they have drifted a pixel (at 10 points a
+    /// second, 30 frames a second on a 3x screen rather than every frame a 120 Hz screen makes).
+    fn stripes_due(&self) -> Instant {
+        let pixel = 1.0 / (STRIPE_SPEED_PT * self.display_scale.max(0.5));
+        Instant::now() + Duration::from_secs_f32(pixel.clamp(1.0 / 240.0, 0.1))
+    }
+
     /// Draws a frame into `view` (`format`, `size` window pixels, its colours shown in `screen`):
     /// the model open to paint on, the drawing pad as a sphere, or the canvas with its surround,
     /// grid, selection and frosted panels. `started` is when drawing began, for the bands' drift.
@@ -80,11 +87,19 @@ impl State {
         started: Instant,
     ) {
         self.needs_frame = false;
+        self.frame_due = None;
         // the view settling into place keeps drawing until it is there
         if self.step_view_motion() {
             self.needs_frame = true;
         }
         let to_screen = self.view.map(|v| v.to_screen());
+        // plugins' layers drawn sharp over the canvas, zoomed in and settled
+        if let Some(to_screen) = to_screen
+            && !self.scene_shown()
+            && self.sphere.is_none()
+        {
+            self.keep_sharp(size, to_screen);
+        }
         let grid = self.surround_grid(Vec2::ZERO);
         let surround = self.surround();
         let selection_shown = self.selection_shown(started, screen);
@@ -93,9 +108,9 @@ impl State {
             let convert = colours_to(self.doc.profile, screen);
             let selected = self.selection.is_some();
             let look = selected.then_some(selection_shown);
-            // the bands drift, so they keep drawing
+            // the bands drift, so they keep drawing, a frame each time they have moved a pixel
             if matches!(look, Some(SelectionLook::Stripes(_))) {
-                self.needs_frame = true;
+                self.frame_due = Some(self.stripes_due());
             }
             self.scene_selection_look(look);
             self.render_scene(view, format, size, convert);
@@ -125,6 +140,18 @@ impl State {
                 windows: &self.backdrop_windows,
                 sigma: BACKDROP_SIGMA_PT * s,
             });
+            // a dropped colour's fill spreading in: the canvas as it was over it, but for a hole
+            match self.reveal.as_ref().map(|r| r.hole_at(Instant::now())) {
+                Some(Some(hole)) => {
+                    canvas.veil_hole(&hole);
+                    self.needs_frame = true;
+                }
+                Some(None) => {
+                    self.reveal = None;
+                    canvas.veil_end();
+                }
+                None => {}
+            }
             canvas.render(
                 gpu,
                 &mut self.doc,
@@ -145,8 +172,10 @@ impl State {
             );
             // caches still being remade: another frame soon, and the artwork isn't shown yet
             let busy = canvas.busy();
-            if animating || canvas.wants_render() {
+            if canvas.wants_render() {
                 self.needs_frame = true;
+            } else if animating {
+                self.frame_due = Some(self.stripes_due());
             }
             // counted only when the canvas was drawn, so a first frame means the artwork shows
             if !busy {
@@ -178,7 +207,14 @@ pub fn configure(
     wide: bool,
 ) -> Option<wgpu::SurfaceConfiguration> {
     let caps = surface.get_capabilities(&gpu.adapter);
-    let format = caps.formats.iter().copied().find(|f| !f.is_srgb()).or_else(|| caps.formats.first().copied())?;
+    // an 8-bit one first: a float surface (Rgba16Float, offered first on some Linux drivers) is
+    // read by the compositor as linear, so the sRGB-encoded colours drawn on it show washed out
+    let eight_bit = [wgpu::TextureFormat::Bgra8Unorm, wgpu::TextureFormat::Rgba8Unorm];
+    let format = eight_bit
+        .into_iter()
+        .find(|f| caps.formats.contains(f))
+        .or_else(|| caps.formats.iter().copied().find(|f| !f.is_srgb()))
+        .or_else(|| caps.formats.first().copied())?;
 
     let mut config = surface.get_default_config(&gpu.adapter, size.0.max(1), size.1.max(1))?;
     config.format = format;

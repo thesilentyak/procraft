@@ -15,6 +15,7 @@ use procraft_engine::library::{BrushSet, SHELF};
 use crate::{CanvasSession, State};
 
 /// A set in the library as it is now: the shipped sets as edited, and the user's own.
+#[derive(Clone)]
 pub(crate) struct LibrarySet {
     pub(crate) name: String,
     pub(crate) brushes: Vec<Brush>,
@@ -37,33 +38,40 @@ pub(crate) const IMPORTED_ICON: u32 = BRUSH_ICON;
 /// again (their shipped icon, else the brush).
 const ICON_NUMBERING: u32 = 2;
 
+/// The icons shipped sets start with, by name: the six first sets' own, then later sets' glyphs
+/// from the shared choice.
+const SHIPPED_ICONS: [(&str, u32); 21] = [
+    ("Sketching", 42),
+    ("Inking", 43),
+    ("Painting", 44),
+    ("Airbrushing", 45),
+    ("Charcoals", 46),
+    ("Textures", 47),
+    ("Drawing", 1),
+    ("Watercolour", 13),
+    ("Calligraphy", 27),
+    ("Spray Paint", 35),
+    ("Nature", 38),
+    ("Effects", 32),
+    ("Pixel", 9),
+    ("Elements", 18),
+    ("Industrial", 21),
+    ("Organic", 16),
+    ("Abstract", 11),
+    ("Touchups", 40),
+    ("Retro", 15),
+    ("Vintage", 37),
+    ("Luminance", 34),
+];
+
 /// The icon a shipped set starts with, by its name (the brush icon for the rest).
-fn shipped_icon(name: &str) -> u32 {
-    match name {
-        "Sketching" => 42,
-        "Inking" => 43,
-        "Painting" => 44,
-        "Airbrushing" => 45,
-        "Charcoals" => 46,
-        "Textures" => 47,
-        // later sets show glyphs from the shared choice
-        "Drawing" => 1,
-        "Watercolour" => 13,
-        "Calligraphy" => 27,
-        "Spray Paint" => 35,
-        "Nature" => 38,
-        "Effects" => 32,
-        "Pixel" => 9,
-        "Elements" => 18,
-        "Industrial" => 21,
-        "Organic" => 16,
-        "Abstract" => 11,
-        "Touchups" => 40,
-        "Retro" => 15,
-        "Vintage" => 37,
-        "Luminance" => 34,
-        _ => BRUSH_ICON,
-    }
+pub(crate) fn shipped_icon(name: &str) -> u32 {
+    SHIPPED_ICONS.iter().find(|(n, _)| *n == name).map_or(BRUSH_ICON, |&(_, icon)| icon)
+}
+
+/// The shipped set whose icon `icon` is, if it is one's.
+pub(crate) fn shipped_icon_name(icon: u32) -> Option<&'static str> {
+    SHIPPED_ICONS.iter().find(|&&(_, i)| i == icon).map(|&(name, _)| name)
 }
 
 impl LibrarySet {
@@ -232,6 +240,46 @@ impl SavedNotches {
     }
 }
 
+/// How a kept brush's images are put: whole (as base64); only by what tells each apart from any
+/// other, to see whether the library changed without writing them out; or by the name of a file of
+/// its own beside the library, the picture noted in the list to be kept there.
+#[derive(Clone, Copy)]
+enum Images<'a> {
+    Whole,
+    Told,
+    Filed(&'a std::cell::RefCell<Vec<(String, crate::brush_pictures::Held)>>),
+}
+
+impl Images<'_> {
+    /// Bytes kept with a brush (a preview, a picture).
+    fn bytes(self, bytes: &std::sync::Arc<[u8]>) -> String {
+        match self {
+            Images::Whole => procraft_engine::base64::encode(bytes),
+            Images::Told => format!("{:016x}:{}", crate::project::pixels_hash(bytes), bytes.len()),
+            Images::Filed(list) => {
+                let name = crate::brush_pictures::bytes_name(bytes);
+                let held = crate::brush_pictures::Held::Bytes(std::sync::Arc::clone(bytes));
+                list.borrow_mut().push((name.clone(), held));
+                format!("{}{name}", crate::brush_pictures::MARK)
+            }
+        }
+    }
+
+    /// A shape, grain or material image of the brush's own.
+    fn source(self, source: &Source) -> String {
+        match self {
+            Images::Whole => source.to_text(),
+            Images::Told => format!("{:016x}", source.id),
+            Images::Filed(list) => {
+                let name = crate::brush_pictures::pixels_name(source.id);
+                let held = crate::brush_pictures::Held::Pixels(std::sync::Arc::clone(&source.pixels));
+                list.borrow_mut().push((name.clone(), held));
+                format!("{}{name}", crate::brush_pictures::MARK)
+            }
+        }
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SavedSet {
     name: String,
@@ -297,7 +345,7 @@ impl SavedSet {
 }
 
 /// The brushes in use, as kept between sessions (by place in the library).
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Default)]
 struct SavedChoices {
     /// The paint, erase and smudge tools' brushes.
     tools: [(usize, usize); 3],
@@ -332,8 +380,108 @@ const TOOLS: [crate::ToolKind; 3] = [crate::ToolKind::Paint, crate::ToolKind::Er
 const FIRST_SHIPPED: [u32; 6] = [3, 3, 3, 2, 2, 2];
 /// The files a library is kept in, in the app's folder for it: the library, the brushes' choices
 /// and sliders, and how many brushes of each shipped set it has seen.
-const LIBRARY_FILE: &str = "library.json";
-const CHOICES_FILE: &str = "choices.json";
+pub(crate) const LIBRARY_FILE: &str = "library.json";
+
+/// Held while a library or its choices are read out and written, and while another library is
+/// brought into use, so that writes from two threads (a window's, one keeping it in the background)
+/// land in the order they read it, and none lands in a library's files once it was left.
+static LIBRARY_WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(crate) fn library_writes() -> std::sync::MutexGuard<'static, ()> {
+    LIBRARY_WRITES.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The library as last kept or read whole in this run: the next artwork takes it from here while
+/// its file is as it was then, not read again (tens of megabytes with many brushes brought in, which
+/// took seconds to read on a tablet). One for the app: the library in use.
+static LAST_LIBRARY: std::sync::Mutex<Option<LastLibrary>> = std::sync::Mutex::new(None);
+
+struct LastLibrary {
+    path: std::path::PathBuf,
+    /// The file's size and time once kept or read: anything else writing it changes them.
+    stamp: (u64, std::time::SystemTime),
+    /// What it held (see [`Images::Told`]).
+    told: u64,
+    library: Vec<LibrarySet>,
+}
+
+/// Reads the library in use kept in folder `dir` ahead of the first artwork (while the gallery
+/// shows), so that it opens without reading it (see [`CanvasSession::open_brushes`]); nothing if it
+/// is held already or there is none. Slow with many brushes brought in: call it off the main thread.
+#[uniffi::export]
+pub fn prepare_brushes(dir: String) {
+    let (library, first) = crate::brush_libraries::file_in_use(std::path::Path::new(&dir));
+    if holds(&LAST_LIBRARY, &library) || !library.is_file() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    if CanvasSession::new(1, 1).load_library_file(&library, !first) {
+        log::info!("the brushes read ahead in {} ms", started.elapsed().as_millis());
+    }
+}
+
+/// The sets of the library kept in `json` (see [`CanvasSession::load_brush_library`]), the pictures
+/// it names in files read from `folder` (beside it) first, not while the canvas waits; none if it
+/// can't be read, or holds no set and `empty` doesn't allow that (a new library holds none).
+pub(crate) fn read_library(
+    session: &CanvasSession,
+    json: &str,
+    folder: Option<&std::path::Path>,
+    empty: bool,
+) -> Option<Vec<LibrarySet>> {
+    let saved = read_saved_sets(json)?;
+    if saved.is_empty() && !empty {
+        return None;
+    }
+    let pictures = folder.map(|folder| crate::brush_pictures::read(folder, json)).unwrap_or_default();
+    let st = session.shared.lock();
+    let library = saved
+        .into_iter()
+        .map(|set| {
+            let icon = set.icon_now();
+            let origins = set.brushes.iter().map(|b| b.from).collect();
+            let brushes = set.brushes.into_iter().map(|b| st.restored_with(b, &pictures)).collect();
+            LibrarySet { name: set.name, brushes, origins, icon }
+        })
+        .collect();
+    Some(library)
+}
+
+/// Puts back the library kept in `json` (see [`read_library`]).
+fn load_library(session: &CanvasSession, json: &str, folder: Option<&std::path::Path>) -> bool {
+    let Some(library) = read_library(session, json, folder, false) else { return false };
+    session.shared.lock().put_library(library);
+    true
+}
+
+/// Whether `slot` holds the library of the file at `path` as the file is now.
+fn holds(slot: &std::sync::Mutex<Option<LastLibrary>>, path: &std::path::Path) -> bool {
+    let held = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    held.as_ref().is_some_and(|last| last.path == path && stamp(path) == Some(last.stamp))
+}
+
+/// `file`'s size and time, if it is there.
+fn stamp(file: &std::path::Path) -> Option<(u64, std::time::SystemTime)> {
+    let meta = std::fs::metadata(file).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
+}
+
+/// Holds `library` in `slot` as the file at `path` holds it now.
+fn remember(slot: &std::sync::Mutex<Option<LastLibrary>>, path: &std::path::Path, told: u64, library: Vec<LibrarySet>) {
+    let held = stamp(path).map(|stamp| LastLibrary { path: path.to_path_buf(), stamp, told, library });
+    *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = held;
+}
+
+/// The library held in `slot` for the file at `path`, and what it holds, while the file is as it
+/// was when it was held.
+fn remembered(slot: &std::sync::Mutex<Option<LastLibrary>>, path: &std::path::Path) -> Option<(Vec<LibrarySet>, u64)> {
+    if !holds(slot, path) {
+        return None;
+    }
+    let held = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    held.as_ref().filter(|last| last.path == path).map(|last| (last.library.clone(), last.told))
+}
+pub(crate) const CHOICES_FILE: &str = "choices.json";
 const SEEN_FILE: &str = "seen.txt";
 
 /// Puts what an earlier version kept elsewhere into folder `dir` for [`CanvasSession::open_brushes`]:
@@ -384,18 +532,91 @@ impl State {
 
     /// Brush `i` of `set` as kept: its origin and its changes from there.
     fn saved(&self, set: &LibrarySet, i: usize) -> Option<SavedBrush> {
-        let brush = set.brushes.get(i)?;
-        Some(self.saved_brush(brush, set.origins.get(i).copied().flatten()))
+        self.saved_as(set, i, Images::Whole)
     }
 
-    /// `brush` as kept, as changed from what it started as (`from`).
-    fn saved_brush(&self, brush: &Brush, from: Option<(usize, usize)>) -> SavedBrush {
+    /// [`Self::saved`] with its images put as `images` says.
+    fn saved_as(&self, set: &LibrarySet, i: usize, images: Images<'_>) -> Option<SavedBrush> {
+        let brush = set.brushes.get(i)?;
+        Some(self.saved_brush(brush, set.origins.get(i).copied().flatten(), images))
+    }
+
+    /// The library's sets as kept, their images put as `images` says.
+    fn saved_sets(&self, images: Images<'_>) -> Vec<SavedSet> {
+        self.sets_saved(&self.library, images)
+    }
+
+    /// `sets` as kept, their images put as `images` says.
+    fn sets_saved(&self, sets: &[LibrarySet], images: Images<'_>) -> Vec<SavedSet> {
+        sets.iter()
+            .map(|set| SavedSet {
+                name: set.name.clone(),
+                brushes: (0..set.brushes.len()).filter_map(|i| self.saved_as(set, i, images)).collect(),
+                icon: Some(set.icon),
+                icons: ICON_NUMBERING,
+            })
+            .collect()
+    }
+
+    /// What the library holds, told apart from any other: the library as kept, with each image
+    /// by what tells it apart in place of the image (quick, where the whole library written out
+    /// is tens of megabytes with many brushes brought in).
+    fn library_told(&self) -> u64 {
+        self.told_of(&self.library)
+    }
+
+    /// What `sets` hold, told apart from any other (see [`Self::library_told`]).
+    fn told_of(&self, sets: &[LibrarySet]) -> u64 {
+        crate::project::pixels_hash(&serde_json::to_vec(&self.sets_saved(sets, Images::Told)).unwrap_or_default())
+    }
+
+    /// `library` in use in place of the one there was: the brushes' sliders go, and every place
+    /// that names a brush stays where it can.
+    pub(crate) fn put_library(&mut self, library: Vec<LibrarySet>) {
+        self.library = library;
+        self.sliders.clear();
+        self.move_brush_refs(Some);
+    }
+
+    /// The tools on the first brush, and no set's choice, brush's sliders, Recent brush or QuickMenu
+    /// brush: for a library brought into use, before its own choices (places in another library).
+    pub(crate) fn reset_brush_choices(&mut self) {
+        self.set_choices.clear();
+        self.sliders.clear();
+        self.recent_brushes.clear();
+        self.pinned_brushes.clear();
+        self.quick_brushes.clear();
+        (self.paint_brush, self.erase_brush, self.smudge_brush) = ((0, 0), (0, 0), (0, 0));
+    }
+
+    /// The tools' brushes, the sets' last choices and each brush's sliders, as kept between
+    /// sessions (JSON; see [`CanvasSession::saved_brush_choices`]).
+    pub(crate) fn choices_saved(&self) -> String {
+        let tool_index = |tool| TOOLS.iter().position(|&t| t == tool).unwrap_or(0) as u8;
+        let mut sliders: Vec<_> =
+            self.sliders.iter().map(|(&(tool, s, i), v)| (tool_index(tool), s, i, v.size, v.opacity)).collect();
+        sliders.sort_by_key(|&(t, s, i, ..)| (t, s, i));
+        let choices = SavedChoices {
+            tools: TOOLS.map(|tool| self.brush_ref(tool)),
+            sets: self.set_choices.clone(),
+            sliders,
+            recents: self.recent_brushes.clone(),
+            pinned: self.pinned_brushes.clone(),
+            quick: self.quick_brushes.iter().map(|&(key, (s, i))| (key, s, i)).collect(),
+        };
+        serde_json::to_string(&choices).unwrap_or_default()
+    }
+
+    /// `brush` as kept, as changed from what it started as (`from`), its images put as `images`
+    /// says.
+    fn saved_brush(&self, brush: &Brush, from: Option<(usize, usize)>, images: Images<'_>) -> SavedBrush {
         let base = self.origin_brush(from);
         let kept = |c: &Curve, b: &Curve| -> Vec<[f32; 2]> {
             if c == b { Vec::new() } else { c.points().iter().map(|p| [p.x, p.y]).collect() }
         };
         let image = |mine: Option<u32>, theirs: Option<u32>| (mine != theirs).then(|| mine.map_or(-1, i64::from));
-        let text = |png: &Option<std::sync::Arc<[u8]>>| png.as_deref().map(procraft_engine::base64::encode);
+        let text = |png: &Option<std::sync::Arc<[u8]>>| png.as_ref().map(|bytes| images.bytes(bytes));
+        let source = |s: &Source| images.source(s);
         SavedBrush {
             from,
             name: brush.name.clone(),
@@ -412,16 +633,16 @@ impl State {
                     .collect()
             }),
             // a stock shape's is made again from its name when the brush comes back
-            shape_source: brush.shape.source.as_ref().filter(|_| brush.stock.shape.is_none()).map(Source::to_text),
+            shape_source: brush.shape.source.as_ref().filter(|_| brush.stock.shape.is_none()).map(source),
             // a stock grain's is made again from its name when the brush comes back
-            grain_source: brush.grain.source.as_ref().filter(|_| brush.stock.grain.is_none()).map(Source::to_text),
+            grain_source: brush.grain.source.as_ref().filter(|_| brush.stock.grain.is_none()).map(source),
             grain_file: brush
                 .grain_file_now()
                 .map(|f| SavedGrainFile { width: f.width, full: f.full.as_ref().map(|g| (g.id, g.side)) }),
             shape_full: brush.shape_file_now().map(|f| (f.full.id, f.full.side)),
             shape_image: image(brush.shape.image, base.shape.image),
             grain_image: image(brush.grain.image, base.grain.image),
-            thumbnail: brush.thumbnail.as_deref().map(procraft_engine::base64::encode),
+            thumbnail: brush.thumbnail.as_ref().map(|bytes| images.bytes(bytes)),
             notches: SavedNotches::of(&brush.notches),
             sliders: if brush.sliders.iter().any(Option::is_some) { brush.sliders.to_vec() } else { Vec::new() },
             author: brush.author.as_ref().map(|a| SavedAuthor {
@@ -432,22 +653,62 @@ impl State {
             reset: brush
                 .reset_point
                 .as_ref()
-                .map(|r| SavedReset { made: r.made, brush: Box::new(self.saved_brush(&r.brush, from)) }),
+                .map(|r| SavedReset { made: r.made, brush: Box::new(self.saved_brush(&r.brush, from, images)) }),
             shape_stock: brush.stock.shape.as_ref().map(|s| (s.name.clone(), s.inverted)),
             grain_stock: brush.stock.grain.as_ref().map(|s| (s.name.clone(), s.inverted)),
-            metallic_source: brush.metallic.source.as_ref().map(Source::to_text),
-            roughness_source: brush.roughness.source.as_ref().map(Source::to_text),
+            metallic_source: brush.metallic.source.as_ref().map(source),
+            roughness_source: brush.roughness.source.as_ref().map(source),
             metallic_image: image(brush.metallic.image, base.metallic.image),
             roughness_image: image(brush.roughness.image, base.roughness.image),
             metallic_stock: brush.stock.metallic.as_ref().map(|s| (s.name.clone(), s.inverted)),
             roughness_stock: brush.stock.roughness.as_ref().map(|s| (s.name.clone(), s.inverted)),
-            secondary: brush.secondary.as_ref().map(|s| Box::new(self.saved_brush(s, None))),
+            secondary: brush.secondary.as_ref().map(|s| Box::new(self.saved_brush(s, None, images))),
         }
+    }
+
+    /// The brush `tool` uses, whole, as an item on a plugin's layer keeps it (see
+    /// `plugin_layers.rs`): as the library keeps it, the brush it came from among those the app comes
+    /// with and every setting changed from there, its own pictures in it, with only what drawing
+    /// takes (no preview, maker, notches, slider places or reset point).
+    pub(crate) fn brush_snapshot(&self, tool: crate::ToolKind) -> Vec<u8> {
+        let (set, index) = self.brush_ref(tool);
+        let origin = self.library.get(set).and_then(|s| s.origins.get(index)).copied().flatten();
+        let brush = self.brush(tool);
+        let bare = |b: &Brush| Brush {
+            thumbnail: None,
+            author: None,
+            reset_point: None,
+            notches: Notches::default(),
+            sliders: [None; 3],
+            secondary: None,
+            ..b.clone()
+        };
+        let mut drawn = bare(brush);
+        drawn.secondary = brush.secondary.as_deref().map(|s| Box::new(bare(s)));
+        serde_json::to_vec(&self.saved_brush(&drawn, origin, Images::Whole)).unwrap_or_default()
+    }
+
+    /// The brush a [`State::brush_snapshot`] holds, if it holds one.
+    pub(crate) fn brush_from_snapshot(&self, bytes: &[u8]) -> Option<Brush> {
+        serde_json::from_slice(bytes).ok().map(|saved| self.restored(saved))
     }
 
     /// A kept brush made again.
     fn restored(&self, b: SavedBrush) -> Brush {
+        self.restored_with(b, &std::collections::HashMap::new())
+    }
+
+    /// A kept brush made again, the pictures it names in files taken from `pictures` (see
+    /// [`crate::brush_pictures::read`]).
+    fn restored_with(
+        &self,
+        b: SavedBrush,
+        pictures: &std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>,
+    ) -> Brush {
+        let picture = |text: &str| crate::brush_pictures::bytes_of(text, pictures);
         let mut brush = self.origin_brush(b.from);
+        // where its origin's size controls sit (a size kept there isn't written down)
+        let origin_sizes = [("max_size", brush.setting("max_size")), ("min_size", brush.setting("min_size"))];
         if !b.name.trim().is_empty() {
             brush.name = b.name.chars().take(256).collect();
         }
@@ -463,10 +724,10 @@ impl State {
             }
         }
         if let Some(text) = &b.shape_source {
-            brush.shape.source = Source::from_text(text);
+            brush.shape.source = crate::brush_pictures::source_of(text, pictures);
         }
         if let Some(text) = &b.grain_source {
-            brush.grain.source = Source::from_text(text);
+            brush.grain.source = crate::brush_pictures::source_of(text, pictures);
         }
         brush.grain_file = b.grain_file.as_ref().zip(brush.grain.source.as_ref()).map(|(f, source)| GrainFile {
             source: source.id,
@@ -480,7 +741,7 @@ impl State {
         for (text, material) in [(&b.metallic_source, &mut brush.metallic), (&b.roughness_source, &mut brush.roughness)]
         {
             if let Some(text) = text {
-                material.source = Source::from_text(text);
+                material.source = crate::brush_pictures::source_of(text, pictures);
             }
         }
         // the stock images its file named, stood in for by our nearest as they are now
@@ -493,7 +754,7 @@ impl State {
             metallic: stock(&b.metallic_stock),
             roughness: stock(&b.roughness_stock),
         };
-        let png = |text: &Option<String>| text.as_deref().and_then(procraft_engine::base64::decode).map(Into::into);
+        let png = |text: &Option<String>| text.as_deref().and_then(picture).map(Into::into);
         brush.thumbnail = png(&b.thumbnail);
         if let Some(s) = &brush.stock.shape {
             let texture = Texture::Stock { name: s.name.clone(), inverted: s.inverted };
@@ -513,6 +774,13 @@ impl State {
             }
         }
         brush.set_settings(b.settings.iter().map(|(k, v)| (k.as_str(), *v)));
+        // a size left out sits where its origin's did: with a shape of its own (another unit) or
+        // another spacing (another most), that place is other pixels than its origin's
+        for (key, place) in origin_sizes {
+            if !b.settings.contains_key(key) {
+                brush.set_setting(key, place);
+            }
+        }
         for (points, curve) in [
             (&b.curve, &mut brush.pressure_curve),
             (&b.size_curve, &mut brush.size_curve),
@@ -543,8 +811,8 @@ impl State {
             picture: png(&a.picture),
             signature: png(&a.signature),
         });
-        brush.reset_point = b.reset.map(|r| ResetPoint::of(&self.restored(*r.brush), r.made));
-        brush.secondary = b.secondary.map(|s| Box::new(self.restored(*s)));
+        brush.reset_point = b.reset.map(|r| ResetPoint::of(&self.restored_with(*r.brush, pictures), r.made));
+        brush.secondary = b.secondary.map(|s| Box::new(self.restored_with(*s, pictures)));
         brush
     }
 
@@ -703,7 +971,11 @@ impl CanvasSession {
         if let Some(&(key, _)) = st.quick_brushes.iter().find(|q| q.1 == place) {
             return key;
         }
-        let key = st.quick_brushes.iter().map(|q| q.0).max().unwrap_or(0) + 1;
+        // counted on among the library's own keys (a copy's are another's): a button set to one
+        // library's brush picks none in another
+        let first = st.libraries.first_quick_key();
+        let own = |key: u64| key >> 32 == first >> 32;
+        let key = st.quick_brushes.iter().map(|q| q.0).filter(|&k| own(k)).max().unwrap_or(first).max(first) + 1;
         if st.quick_brushes.len() >= QUICK_BRUSHES {
             st.quick_brushes.remove(0);
         }
@@ -951,87 +1223,54 @@ impl CanvasSession {
 
     /// The library as kept between sessions (JSON).
     pub fn saved_brush_library(&self) -> String {
-        let st = self.shared.lock();
-        let sets: Vec<SavedSet> = st
-            .library
-            .iter()
-            .map(|set| SavedSet {
-                name: set.name.clone(),
-                brushes: (0..set.brushes.len()).filter_map(|i| st.saved(set, i)).collect(),
-                icon: Some(set.icon),
-                icons: ICON_NUMBERING,
-            })
-            .collect();
-        serde_json::to_string(&sets).unwrap_or_default()
+        serde_json::to_string(&self.shared.lock().saved_sets(Images::Whole)).unwrap_or_default()
     }
 
-    /// Keeps the library in the file at `path` (its folder made if missing), replaced whole: it
-    /// can be large, with the images of brushes brought in. False if it couldn't be written.
+    /// Keeps the library in the file at `path` (its folder made if missing), replaced whole, the
+    /// pictures of its brushes in files of their own beside it (see [`crate::brush_pictures`]), so
+    /// that it stays small. Not written again while it holds what was last kept there (or read
+    /// from there): a brush chosen, or a slider moved, changes only the choices kept beside it.
+    /// False if it couldn't be written.
     pub fn save_brush_library_file(&self, path: String) -> bool {
-        let json = self.saved_brush_library();
-        let path = std::path::Path::new(&path);
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-            self.shared.lock().grain_store.use_folder(dir);
-        }
-        let written = crate::project::write_atomically(path, |p| {
-            std::fs::write(p, json.as_bytes()).map_err(|e| crate::project::file_error("keeping the brushes", e))
-        });
-        if let Err(e) = &written {
-            log::error!("{e}");
-        }
-        written.is_ok()
+        let _writing = library_writes();
+        self.save_library_at(std::path::Path::new(&path)).is_some()
     }
 
     /// Puts back a library kept with [`Self::save_brush_library_file`]; false, changing nothing,
     /// if there is none or it can't be read.
     pub fn load_brush_library_file(&self, path: String) -> bool {
-        if let Some(dir) = std::path::Path::new(&path).parent() {
-            self.shared.lock().grain_store.use_folder(dir);
-        }
-        std::fs::read_to_string(&path).is_ok_and(|json| self.load_brush_library(json))
+        self.load_library_file(std::path::Path::new(&path), false)
     }
 
     /// Puts back a library kept with [`Self::saved_brush_library`]; false, changing nothing, if it
     /// can't be read.
     pub fn load_brush_library(&self, json: String) -> bool {
-        let Some(saved) = read_saved_sets(&json) else { return false };
-        if saved.is_empty() {
-            return false;
-        }
-        let mut st = self.shared.lock();
-        let library: Vec<LibrarySet> = saved
-            .into_iter()
-            .map(|set| {
-                let icon = set.icon_now();
-                let origins = set.brushes.iter().map(|b| b.from).collect();
-                let brushes = set.brushes.into_iter().map(|b| st.restored(b)).collect();
-                LibrarySet { name: set.name, brushes, origins, icon }
-            })
-            .collect();
-        st.library = library;
-        st.sliders.clear();
-        st.move_brush_refs(Some);
-        true
+        load_library(self, &json, None)
     }
 
-    /// The library as the app kept it in folder `dir` (see [`Self::keep_brushes`]), what shipped
-    /// since joining it once, with the tools' brushes, the sets' choices and the brushes' sliders
-    /// as they were left; with none kept, the library as it ships. True if a kept one was put back.
+    /// The library in use as the app kept it in folder `dir` (see [`Self::keep_brushes`]), what
+    /// shipped since joining it once (if it is the one they join), with the tools' brushes, the
+    /// sets' choices and the brushes' sliders as they were left; with none kept, the library as it
+    /// ships. The other libraries are found there too. True if a kept one was put back.
     pub fn open_brushes(&self, dir: String) -> bool {
         let dir = std::path::PathBuf::from(dir);
-        let library = dir.join(LIBRARY_FILE).to_string_lossy().into_owned();
-        let loaded = self.load_brush_library_file(library.clone());
+        let (library, choices, loaded) = self.open_library_in_use(&dir);
         let seen_file = dir.join(SEEN_FILE);
         let kept_seen = std::fs::read_to_string(&seen_file).ok();
         let seen: Vec<u32> = kept_seen
             .as_deref()
             .map_or_else(|| FIRST_SHIPPED.to_vec(), |t| t.split(',').filter_map(|v| v.trim().parse().ok()).collect());
-        let shipped = if loaded { self.add_shipped_brushes(seen.clone()) } else { self.shipped_brush_counts() };
+        // shipped brushes join only the library they join (not in use: at a later start)
+        let stock = self.shared.lock().libraries.stock();
+        let shipped = match (loaded, stock) {
+            (true, true) => self.add_shipped_brushes(seen.clone()),
+            (true, false) => seen.clone(),
+            (false, _) => self.shipped_brush_counts(),
+        };
         if shipped != seen || kept_seen.is_none() {
             // kept with them, or the next start would put the library back without them
             if loaded {
-                self.save_brush_library_file(library);
+                self.save_brush_library_file(library.to_string_lossy().into_owned());
             }
             let text = shipped.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
             let _ = std::fs::create_dir_all(&dir);
@@ -1043,33 +1282,113 @@ impl CanvasSession {
                 log::error!("{e}");
             }
         }
-        if loaded && let Ok(choices) = std::fs::read_to_string(dir.join(CHOICES_FILE)) {
+        if loaded && let Ok(choices) = std::fs::read_to_string(choices) {
             self.load_brush_choices(choices);
         }
         if loaded {
-            // only with the library back can it be told which grains' files nothing uses any more
+            // only with the library back can it be told which grains' and pictures' files nothing
+            // uses any more: those none of the libraries' files names (under their lock: one being
+            // kept meanwhile names its pictures first)
+            let _writing = library_writes();
+            let libraries = self.library_files(&dir);
             let st = self.shared.lock();
-            st.grain_store.forget_all_but(&st.grains_held(), &dir.join(LIBRARY_FILE));
+            st.grain_store.forget_all_but(&st.grains_held(), &libraries);
+            drop(st);
+            crate::brush_pictures::forget_unnamed(&dir.join(crate::brush_pictures::FOLDER), &libraries);
         }
         loaded
     }
+}
 
-    /// Keeps the library, the tools' brushes, the sets' choices and the brushes' sliders in folder
-    /// `dir`, for [`Self::open_brushes`]. False if they couldn't all be written.
-    pub fn keep_brushes(&self, dir: String) -> bool {
-        let library =
-            self.save_brush_library_file(std::path::Path::new(&dir).join(LIBRARY_FILE).to_string_lossy().into_owned());
-        self.keep_brush_choices(dir) && library
+impl CanvasSession {
+    /// [`Self::save_brush_library_file`], holding [`library_writes`]: what the file holds now (see
+    /// [`Images::Told`]), or none if it couldn't be written.
+    pub(crate) fn save_library_at(&self, path: &std::path::Path) -> Option<u64> {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+            self.shared.lock().grain_store.use_folder(dir);
+        }
+        let pictures = std::cell::RefCell::new(Vec::new());
+        let (told, json, library) = {
+            let st = self.shared.lock();
+            let told = st.library_told();
+            if path.is_file() && st.library_kept.as_ref().is_some_and(|(at, was)| at == path && *was == told) {
+                return Some(told);
+            }
+            let json = serde_json::to_string(&st.saved_sets(Images::Filed(&pictures))).unwrap_or_default();
+            (told, json, st.library.clone())
+        };
+        if !keep_library_text(path, &json, &pictures.into_inner()) {
+            return None;
+        }
+        remember(&LAST_LIBRARY, path, told, library);
+        self.shared.lock().library_kept = Some((path.to_path_buf(), told));
+        Some(told)
     }
 
-    /// Keeps only the tools' brushes, the sets' choices and the brushes' sliders in folder `dir`
-    /// (as [`Self::keep_brushes`] does with the library): for a brush chosen, the library as it
-    /// was. False if they couldn't be written.
-    pub fn keep_brush_choices(&self, dir: String) -> bool {
-        let dir = std::path::PathBuf::from(dir);
-        let choices = self.saved_brush_choices();
-        let _ = std::fs::create_dir_all(&dir);
-        let written = crate::project::write_atomically(&dir.join(CHOICES_FILE), |p| {
+    /// `sets` (not the library in use) kept as a library's file at `path`, as
+    /// [`Self::save_library_at`] keeps that; false if it couldn't be written.
+    pub(crate) fn write_library_file(&self, path: &std::path::Path, sets: &[LibrarySet]) -> bool {
+        let pictures = std::cell::RefCell::new(Vec::new());
+        let json =
+            serde_json::to_string(&self.shared.lock().sets_saved(sets, Images::Filed(&pictures))).unwrap_or_default();
+        keep_library_text(path, &json, &pictures.into_inner())
+    }
+
+    /// Puts back the library kept in the file at `path` (see [`Self::library_at`]); false, changing
+    /// nothing, if it can't be.
+    pub(crate) fn load_library_file(&self, path: &std::path::Path, empty: bool) -> bool {
+        let Some((library, told)) = self.library_at(path, empty) else { return false };
+        let mut st = self.shared.lock();
+        st.put_library(library);
+        st.library_kept = Some((path.to_path_buf(), told));
+        true
+    }
+
+    /// The library kept in the file at `path`, and what it holds (see [`Images::Told`]): as last
+    /// kept or read in this run while the file is as it was then, else read from it (the pictures
+    /// it names from beside it) and held for next time. None if it can't be read, or holds no set
+    /// and `empty` doesn't allow that.
+    pub(crate) fn library_at(&self, path: &std::path::Path, empty: bool) -> Option<(Vec<LibrarySet>, u64)> {
+        if let Some(dir) = path.parent() {
+            self.shared.lock().grain_store.use_folder(dir);
+        }
+        if let Some((library, told)) = remembered(&LAST_LIBRARY, path) {
+            return (empty || !library.is_empty()).then_some((library, told));
+        }
+        let json = std::fs::read_to_string(path).ok()?;
+        let folder = path.parent().map(|dir| dir.join(crate::brush_pictures::FOLDER));
+        let library = read_library(self, &json, folder.as_deref(), empty)?;
+        // the file holds this (or more, of what couldn't be read back): kept again once it changes
+        let told = self.shared.lock().told_of(&library);
+        remember(&LAST_LIBRARY, path, told, library.clone());
+        Some((library, told))
+    }
+
+    /// Holds `library`, as the file at `path` holds it (`told`), for the next artwork to take.
+    pub(crate) fn remember_library(path: &std::path::Path, told: u64, library: Vec<LibrarySet>) {
+        remember(&LAST_LIBRARY, path, told, library);
+    }
+
+    /// Whether the library in use holds `told` and its choices are `choices` (as
+    /// [`Self::saved_brush_choices`] gives them): nothing changed since they were kept.
+    pub(crate) fn library_is(st: &State, told: u64, choices: &str) -> bool {
+        st.library_told() == told && st.choices_saved() == choices
+    }
+
+    /// A library's choices as kept, its tools' brushes (paint, erase, smudge) at `tools` and nothing
+    /// else chosen yet (JSON).
+    pub(crate) fn library_choices(tools: [(usize, usize); 3]) -> String {
+        serde_json::to_string(&SavedChoices { tools, ..SavedChoices::default() }).unwrap_or_default()
+    }
+
+    /// `choices` (as [`Self::saved_brush_choices`] gives them) kept in the file at `path`, replaced
+    /// whole; false if they couldn't be written.
+    pub(crate) fn write_choices(path: &std::path::Path, choices: &str) -> bool {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let written = crate::project::write_atomically(path, |p| {
             std::fs::write(p, choices.as_bytes()).map_err(|e| crate::project::file_error("keeping the brushes", e))
         });
         if let Err(e) = &written {
@@ -1077,24 +1396,48 @@ impl CanvasSession {
         }
         written.is_ok()
     }
+}
+
+/// A library's text `json` kept in the file at `path`, replaced whole, after the `pictures` it names
+/// in files of their own beside it (see [`crate::brush_pictures`]); false if it couldn't be.
+fn keep_library_text(path: &std::path::Path, json: &str, pictures: &[(String, crate::brush_pictures::Held)]) -> bool {
+    // the pictures first: the library names none that isn't kept
+    let folder = path.parent().unwrap_or(std::path::Path::new(".")).join(crate::brush_pictures::FOLDER);
+    if !crate::brush_pictures::keep(&folder, pictures) {
+        return false;
+    }
+    let written = crate::project::write_atomically(path, |p| {
+        std::fs::write(p, json.as_bytes()).map_err(|e| crate::project::file_error("keeping the brushes", e))
+    });
+    if let Err(e) = &written {
+        log::error!("{e}");
+    }
+    written.is_ok()
+}
+
+#[uniffi::export]
+impl CanvasSession {
+    /// Keeps the library in use, the tools' brushes, the sets' choices and the brushes' sliders in
+    /// folder `dir`, in that library's own files, for [`Self::open_brushes`]. False if they couldn't
+    /// all be written.
+    pub fn keep_brushes(&self, dir: String) -> bool {
+        let _writing = library_writes();
+        self.keep_library_in_use(std::path::Path::new(&dir))
+    }
+
+    /// Keeps only the tools' brushes, the sets' choices and the brushes' sliders in folder `dir`
+    /// (as [`Self::keep_brushes`] does with the library): for a brush chosen, the library as it
+    /// was. False if they couldn't be written.
+    pub fn keep_brush_choices(&self, dir: String) -> bool {
+        let _writing = library_writes();
+        let file = self.files_in_use(std::path::Path::new(&dir)).1;
+        Self::write_choices(&file, &self.saved_brush_choices())
+    }
 
     /// The tools' brushes, the sets' last choices and each brush's sliders, as kept between
     /// sessions (JSON); kept with the library as it is now.
     pub fn saved_brush_choices(&self) -> String {
-        let st = self.shared.lock();
-        let tool_index = |tool| TOOLS.iter().position(|&t| t == tool).unwrap_or(0) as u8;
-        let mut sliders: Vec<_> =
-            st.sliders.iter().map(|(&(tool, s, i), v)| (tool_index(tool), s, i, v.size, v.opacity)).collect();
-        sliders.sort_by_key(|&(t, s, i, ..)| (t, s, i));
-        let choices = SavedChoices {
-            tools: TOOLS.map(|tool| st.brush_ref(tool)),
-            sets: st.set_choices.clone(),
-            sliders,
-            recents: st.recent_brushes.clone(),
-            pinned: st.pinned_brushes.clone(),
-            quick: st.quick_brushes.iter().map(|&(key, (s, i))| (key, s, i)).collect(),
-        };
-        serde_json::to_string(&choices).unwrap_or_default()
+        self.shared.lock().choices_saved()
     }
 
     /// Puts back what [`Self::saved_brush_choices`] kept, after the library it was kept with;
@@ -1196,6 +1539,51 @@ impl CanvasSession {
         Self::shipped_counts(&st.shipped)
     }
 
+    /// The brushes the app comes with that were deleted, back: each into the set its fellows are
+    /// in (the one of the shipped set's name first), where it ships among them; a set whose
+    /// brushes are all gone comes back whole at the end. Brushes changed, moved or kept are left as
+    /// they are. How many came back.
+    pub fn restore_shipped_brushes(&self) -> u32 {
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        let mut back = 0u32;
+        for set in LibrarySet::shipped(&st.shipped) {
+            let Some(s) = set.origins.first().copied().flatten().map(|(s, _)| s) else { continue };
+            let fellows = |l: &LibrarySet| l.origins.iter().flatten().any(|&(from, _)| from == s);
+            let home = st
+                .library
+                .iter()
+                .position(|l| l.name == set.name && fellows(l))
+                .or_else(|| st.library.iter().position(fellows));
+            let Some(home) = home else {
+                back += set.brushes.len() as u32;
+                st.library.push(set);
+                continue;
+            };
+            for (brush, origin) in set.brushes.into_iter().zip(set.origins) {
+                let Some(origin) = origin else { continue };
+                if st.library.iter().any(|l| l.origins.contains(&Some(origin))) {
+                    continue;
+                }
+                let Some(entry) = st.library.get_mut(home) else { break };
+                // after the last of its fellows that ships before it
+                let at = entry
+                    .origins
+                    .iter()
+                    .rposition(|o| o.is_some_and(|(from, i)| from == s && i < origin.1))
+                    .map_or(0, |p| p + 1)
+                    .min(entry.brushes.len());
+                entry.brushes.insert(at, brush);
+                if at <= entry.origins.len() {
+                    entry.origins.insert(at, Some(origin));
+                }
+                back += 1;
+                st.move_brush_refs(|(rs, ri)| Some(if rs == home && ri >= at { (rs, ri + 1) } else { (rs, ri) }));
+            }
+        }
+        back
+    }
+
     /// How many brushes each set ships with.
     pub fn shipped_brush_counts(&self) -> Vec<u32> {
         Self::shipped_counts(&self.shared.lock().shipped)
@@ -1275,6 +1663,212 @@ mod keeping {
     use crate::CanvasSession;
 
     #[test]
+    fn brushes_moved_deleted_and_combined_at_random_leave_every_place_sound() {
+        use crate::ToolKind;
+        // a few thousand steps of what the library's lists and swipes do, at random (the same
+        // each run), the library kept and read back now and then: nothing panics, and every place
+        // the app is told of holds a brush
+        let dir = std::env::temp_dir().join(format!(
+            "procraft-brushes-random-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos())
+        ));
+        let path = dir.to_string_lossy().into_owned();
+        let mut s = CanvasSession::new(32, 32);
+        // (what shipped noted, as the apps start)
+        assert!(!s.open_brushes(path.clone()));
+        let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = |most: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % u64::from(most.max(1))) as u32
+        };
+        for step in 0..3000 {
+            let sets = s.brush_library();
+            let total: usize = sets.iter().map(|s| s.brushes.len()).sum();
+            // mostly a set with brushes in it, now and then any place, there or not
+            let full: Vec<u32> = (0..sets.len() as u32).filter(|&i| !sets[i as usize].brushes.is_empty()).collect();
+            let set = if full.is_empty() || next(5) == 0 {
+                next(sets.len() as u32 + 1)
+            } else {
+                full[next(full.len() as u32) as usize]
+            };
+            let count = sets.get(set as usize).map_or(0, |s| s.brushes.len() as u32);
+            let (index, other) = (next(count + 1), next(count + 1));
+            let to_set = next(sets.len() as u32 + 1);
+            match next(16) {
+                0..=2 => {
+                    s.move_brush(set, index, to_set, other);
+                }
+                3 | 4 if total > 30 => {
+                    s.delete_brush(set, index);
+                }
+                5..=7 if total < 400 => {
+                    s.duplicate_brush(set, index);
+                }
+                8 => {
+                    s.combine_brushes(set, index, other);
+                }
+                9 => {
+                    s.uncombine_brush(set, index);
+                }
+                10 => {
+                    s.select_brush(set, index);
+                }
+                11 => {
+                    s.pin_recent_brush(set, index, next(2) == 0);
+                    let key = s.quick_brush_key(set, index);
+                    let _ = s.quick_brush(key);
+                }
+                12 if sets.len() < 16 => {
+                    if next(2) == 0 {
+                        s.new_brush_set();
+                    } else if total < 400 {
+                        s.duplicate_brush_set(set);
+                    }
+                }
+                // mostly an empty set: a set of brushes deleted now and then
+                13 if sets.len() > 6 => {
+                    let empty = (0..sets.len() as u32).find(|&i| sets[i as usize].brushes.is_empty());
+                    match empty {
+                        Some(empty) => {
+                            s.delete_brush_set(empty);
+                        }
+                        None if next(8) == 0 => {
+                            s.delete_brush_set(set);
+                        }
+                        None => {}
+                    }
+                }
+                14 => {
+                    s.move_brush_set(set, to_set);
+                }
+                _ => s.set_tool([ToolKind::Paint, ToolKind::Smudge, ToolKind::Erase][next(3) as usize]),
+            }
+            // what the app is told points at brushes there are
+            let sets = s.brush_library();
+            let holds =
+                |set: u32, index: u32| sets.get(set as usize).is_some_and(|s| (index as usize) < s.brushes.len());
+            let current = s.current_brush();
+            assert!(sets.iter().all(|s| s.brushes.is_empty()) || holds(current.set, current.index), "step {step}");
+            // each once: the Recent set's list is keyed by place, and a place twice stops it
+            let recent = s.recent_brushes();
+            let mut places = std::collections::HashSet::new();
+            for r in &recent {
+                assert!(holds(r.set, r.index), "step {step}: recent {}-{}", r.set, r.index);
+                assert!(places.insert((r.set, r.index)), "step {step}: recent {}-{} twice", r.set, r.index);
+            }
+            for (i, set) in sets.iter().enumerate() {
+                if let Some(chosen) = set.chosen {
+                    assert!(holds(i as u32, chosen), "step {step}: set {i} chose {chosen}");
+                }
+            }
+            if step % 500 == 499 {
+                assert!(s.keep_brushes(path.clone()), "step {step}");
+                let before: Vec<usize> = sets.iter().map(|s| s.brushes.len()).collect();
+                s = CanvasSession::new(32, 32);
+                assert!(s.open_brushes(path.clone()), "step {step}");
+                let after: Vec<usize> = s.brush_library().iter().map(|s| s.brushes.len()).collect();
+                assert_eq!(before, after, "step {step}: read back as kept");
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_brushes_the_app_comes_with_come_back_where_they_ship_once_deleted() {
+        let s = CanvasSession::new(32, 32);
+        let before = s.brush_library();
+        let names = |s: &CanvasSession, set: usize| -> Vec<String> {
+            s.brush_library()
+                .get(set)
+                .map(|set| set.brushes.iter().map(|b| b.name.clone()).collect())
+                .unwrap_or_default()
+        };
+        let first = names(&s, 0);
+        assert!(first.len() >= 3);
+        // nothing gone: nothing comes back
+        assert_eq!(s.restore_shipped_brushes(), 0);
+        // the second brush of the first set, and the whole last set, deleted; a brush kept changed
+        assert!(s.delete_brush(0, 1));
+        let last = before.len() as u32 - 1;
+        let last_name = before[last as usize].name.clone();
+        assert!(s.delete_brush_set(last));
+        assert!(s.rename_brush_set(0, "Mine".into()));
+        let back = s.restore_shipped_brushes();
+        assert_eq!(back as usize, 1 + before[last as usize].brushes.len());
+        // back where it ships, in its set (renamed, it is still where its fellows are)
+        assert_eq!(names(&s, 0), first);
+        let library = s.brush_library();
+        assert_eq!(library.len(), before.len());
+        assert_eq!(library.last().map(|set| set.name.clone()), Some(last_name));
+        assert_eq!(library[0].name, "Mine");
+        assert_eq!(s.restore_shipped_brushes(), 0, "all there now");
+    }
+
+    #[test]
+    fn a_librarys_pictures_are_kept_once_in_files_beside_it_and_come_back() {
+        use procraft_engine::brush::{ResetPoint, Source};
+        use procraft_engine::textures::TEXTURE_SIZE;
+        let dir = std::env::temp_dir().join(format!(
+            "procraft-brushes-pictures-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos())
+        ));
+        let path = dir.to_string_lossy().into_owned();
+        let (library, folder) = (dir.join(super::LIBRARY_FILE), dir.join(crate::brush_pictures::FOLDER));
+        let s = CanvasSession::new(32, 32);
+        assert!(s.duplicate_brush(0, 0).is_some());
+        let shape = Source::new((0..TEXTURE_SIZE * TEXTURE_SIZE).map(|i| (i % 251) as u8).collect()).unwrap();
+        let thumbnail: std::sync::Arc<[u8]> = vec![7u8; 5000].into();
+        {
+            let mut st = s.shared.lock();
+            let b = &mut st.library[0].brushes[0];
+            b.name = "Own shape".into();
+            b.shape.source = Some(shape.clone());
+            b.thumbnail = Some(std::sync::Arc::clone(&thumbnail));
+            // a reset point of it as it is: the same pictures
+            b.reset_point = Some(ResetPoint::of(&b.clone(), 1));
+        }
+        assert!(s.keep_brushes(path.clone()));
+        let text = std::fs::read_to_string(&library).unwrap();
+        assert!(text.contains(crate::brush_pictures::MARK));
+        assert!(!text.contains(&shape.to_text()), "the pixels kept apart");
+        assert!(text.len() < 200_000, "{}", text.len());
+        assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 2, "each picture once");
+
+        // back in another session, from the files (the file changed since it was held in memory)
+        std::fs::write(&library, format!("{text} ")).unwrap();
+        let next = CanvasSession::new(32, 32);
+        assert!(next.open_brushes(path.clone()));
+        {
+            let st = next.shared.lock();
+            let b = st.library[0].brushes.iter().find(|b| b.name == "Own shape").unwrap();
+            assert_eq!(b.shape.source.as_ref().map(|s| s.id), Some(shape.id));
+            assert_eq!(b.thumbnail.as_deref(), Some(&thumbnail[..]));
+            let reset = b.reset_point.as_ref().map(|r| r.brush.shape.source.as_ref().map(|s| s.id));
+            assert_eq!(reset, Some(Some(shape.id)));
+        }
+        // a library from before, its pictures inside it: read as it is
+        let other = CanvasSession::new(32, 32);
+        assert!(other.load_brush_library(s.saved_brush_library()));
+        assert!(other.shared.lock().library[0].brushes.iter().any(|b| b.shape.source.as_ref() == Some(&shape)));
+
+        // a picture nothing names any more goes once it is old; those named stay
+        let stray = folder.join("0000000000000001.picture");
+        std::fs::write(&stray, [1]).unwrap();
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 24 * 60 * 60);
+        for entry in std::fs::read_dir(&folder).unwrap().flatten() {
+            std::fs::File::options().write(true).open(entry.path()).unwrap().set_modified(long_ago).unwrap();
+        }
+        assert!(CanvasSession::new(32, 32).open_brushes(path));
+        assert!(!stray.exists());
+        assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn a_library_kept_in_a_folder_comes_back_with_its_choices() {
         let dir = std::env::temp_dir().join(format!(
             "procraft-brushes-{}-{}",
@@ -1298,6 +1892,53 @@ mod keeping {
     }
 
     #[test]
+    fn a_library_is_written_again_only_once_it_changes() {
+        let dir = std::env::temp_dir().join(format!(
+            "procraft-brushes-again-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos())
+        ));
+        let path = dir.to_string_lossy().into_owned();
+        let (library, choices) = (dir.join(super::LIBRARY_FILE), dir.join(super::CHOICES_FILE));
+        // a mark after the library's text (a space, still JSON): gone once it is written again
+        let mark = || {
+            let mut text = std::fs::read(&library).unwrap();
+            text.push(b' ');
+            std::fs::write(&library, text).unwrap();
+        };
+        let marked = || std::fs::read(&library).unwrap().ends_with(b" ");
+        let s = CanvasSession::new(32, 32);
+        assert!(s.keep_brushes(path.clone()));
+        mark();
+        // a brush chosen and a slider moved: only the choices change
+        let before = std::fs::read_to_string(&choices).unwrap();
+        assert!(s.select_brush(0, 1));
+        s.set_brush_size(0.42);
+        assert!(s.keep_brushes(path.clone()));
+        assert!(marked(), "the library written again with nothing in it changed");
+        assert_ne!(std::fs::read_to_string(&choices).unwrap(), before);
+        // a brush added: written
+        assert!(s.duplicate_brush(0, 0).is_some());
+        assert!(s.keep_brushes(path.clone()));
+        assert!(!marked());
+        // read back by another session, which keeps it as it was: not written
+        let next = CanvasSession::new(32, 32);
+        assert!(next.open_brushes(path.clone()));
+        mark();
+        assert!(next.keep_brushes(path.clone()));
+        assert!(marked());
+        // gone from the folder: written again
+        std::fs::remove_file(&library).unwrap();
+        assert!(next.keep_brushes(path.clone()));
+        assert!(library.is_file());
+        // kept elsewhere: written there
+        let other = dir.join("other");
+        assert!(next.keep_brushes(other.to_string_lossy().into_owned()));
+        assert!(other.join(super::LIBRARY_FILE).is_file());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn a_file_chosen_to_import_is_told_apart_by_its_name_and_contents() {
         let s = CanvasSession::new(32, 32);
         let file = s.brush_as_file(0, 0).unwrap_or_default();
@@ -1307,6 +1948,121 @@ mod keeping {
         assert_eq!(s.import_any_brushes(file, None, 0), Some(0), "no name: told by its contents");
         assert_eq!(s.import_any_brushes(vec![1, 2, 3], Some("junk.abr".into()), 0), None);
         assert_eq!(s.import_any_brushes(vec![1, 2, 3], None, 0), None);
+    }
+
+    #[test]
+    fn the_next_artwork_has_the_library_as_kept_and_a_file_changed_elsewhere_is_read() {
+        let dir = std::env::temp_dir().join(format!(
+            "procraft-brushes-held-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos())
+        ));
+        let path = dir.to_string_lossy().into_owned();
+        let first = CanvasSession::new(32, 32);
+        first.open_brushes(path.clone());
+        let set = first.new_brush_set();
+        assert!(first.rename_brush_set(set, "Mine".into()));
+        let full = first.brush_library().iter().position(|s| s.brushes.len() > 2).unwrap() as u32;
+        assert!(first.select_brush(full, 1));
+        first.set_brush_size(0.37);
+        assert!(first.duplicate_brush(full, 2).is_some());
+        assert!(first.keep_brushes(path.clone()));
+        let (library, choices) = (first.saved_brush_library(), first.saved_brush_choices());
+
+        let next = CanvasSession::new(32, 32);
+        assert!(next.open_brushes(path.clone()));
+        assert_eq!(next.saved_brush_library(), library);
+        assert_eq!(next.saved_brush_choices(), choices);
+        assert!((next.info().size - 0.37).abs() < 1e-4, "{}", next.info().size);
+
+        // the file written by something else: read from it
+        let other = CanvasSession::new(32, 32);
+        let elsewhere = other.saved_brush_library();
+        std::fs::write(dir.join(super::LIBRARY_FILE), &elsewhere).unwrap();
+        let after = CanvasSession::new(32, 32);
+        assert!(after.open_brushes(path));
+        assert_eq!(after.saved_brush_library(), elsewhere);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn brushes_read_ahead_open_as_kept() {
+        let dir = std::env::temp_dir().join(format!(
+            "procraft-brushes-ahead-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos())
+        ));
+        let path = dir.to_string_lossy().into_owned();
+        // nothing kept yet: nothing read
+        super::prepare_brushes(path.clone());
+        let first = CanvasSession::new(32, 32);
+        let set = first.new_brush_set();
+        assert!(first.rename_brush_set(set, "Ahead".into()));
+        assert!(first.keep_brushes(path.clone()));
+        // held for another folder meanwhile, then read ahead for this one
+        assert!(CanvasSession::new(32, 32).keep_brushes(dir.join("other").to_string_lossy().into_owned()));
+        super::prepare_brushes(path.clone());
+        let next = CanvasSession::new(32, 32);
+        assert!(next.open_brushes(path));
+        assert_eq!(next.saved_brush_library(), first.saved_brush_library());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_seconds_own_shape_keeps_its_sizes_through_a_restart() {
+        use procraft_engine::brush::{Brush, Source};
+        use procraft_engine::textures::TEXTURE_SIZE;
+        let s = CanvasSession::new(32, 32);
+        let round = Brush::round_pen();
+        // a second with a shape of its own, its sizes where the round pen's controls sit (so
+        // left out when kept, as its origin's are): other pixels than the round pen's
+        let mut second = Brush::round_pen();
+        second.shape.image = None;
+        second.shape.source = Source::new(vec![255; TEXTURE_SIZE * TEXTURE_SIZE]);
+        second.set_setting("max_size", round.setting("max_size"));
+        second.set_setting("min_size", round.setting("min_size"));
+        assert!((second.min_size - round.min_size).abs() > 0.1, "{} {}", second.min_size, round.min_size);
+        s.shared.lock().library[0].brushes[0].secondary = Some(Box::new(second.clone()));
+        let t = CanvasSession::new(32, 32);
+        assert!(t.load_brush_library(s.saved_brush_library()));
+        let back = t.shared.lock().library[0].brushes[0].secondary.clone().unwrap();
+        assert!((back.max_size - second.max_size).abs() < 1e-3, "{} {}", back.max_size, second.max_size);
+        assert!((back.min_size - second.min_size).abs() < 1e-4, "{} {}", back.min_size, second.min_size);
+    }
+
+    #[test]
+    fn a_held_library_is_used_only_while_its_file_is_as_it_was() {
+        let dir = std::env::temp_dir().join(format!(
+            "procraft-brushes-stamp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(super::LIBRARY_FILE);
+        std::fs::write(&file, b"0123456789").unwrap();
+        let slot = std::sync::Mutex::new(None);
+        let s = CanvasSession::new(32, 32);
+        let library = s.shared.lock().library.clone();
+        let count = library.len();
+        super::remember(&slot, &file, 7, library);
+        assert_eq!(super::remembered(&slot, &file).map(|(l, told)| (l.len(), told)), Some((count, 7)));
+        assert!(super::remembered(&slot, &dir.join("other.json")).is_none(), "another file");
+        // written again at the same size, its time put back: still as it was
+        let time = std::fs::metadata(&file).unwrap().modified().unwrap();
+        std::fs::write(&file, b"9876543210").unwrap();
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(time).unwrap();
+        assert!(super::remembered(&slot, &file).is_some());
+        // another size, or another time: read again
+        std::fs::write(&file, b"01234567890").unwrap();
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(time).unwrap();
+        assert!(super::remembered(&slot, &file).is_none());
+        std::fs::write(&file, b"0123456789").unwrap();
+        let later = time + std::time::Duration::from_secs(5);
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(later).unwrap();
+        assert!(super::remembered(&slot, &file).is_none());
+        std::fs::remove_file(&file).unwrap();
+        assert!(super::remembered(&slot, &file).is_none(), "gone");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 

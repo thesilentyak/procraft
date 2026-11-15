@@ -146,6 +146,8 @@ pub struct Layers {
     control_menu: Menu,
     /// The title's menu, and Delete's question.
     title_menu: Menu,
+    /// The +'s menu, while plugins add kinds of layer: a plain layer or one of each kind.
+    add_menu: Menu,
     deleting: Alert,
     /// Asked before a layer the meshes of a texture set share goes, and which.
     deleting_shared: Alert,
@@ -177,8 +179,15 @@ pub struct Layers {
     pub copied: Option<ThumbnailImage>,
     pub share: bool,
     pub edit_text: Option<u64>,
+    /// The plugins' actions for the current layer's options, and the one tapped there, to run.
+    pub plugin_actions: Vec<procraft_core::PluginAction>,
+    /// The kinds of layer the plugins on add, which the + offers beside a plain layer.
+    pub layer_kinds: Vec<procraft_core::PluginKind>,
+    pub run_action: Option<String>,
     /// Layer Opacity asked for the current layer (two fingers tapped on its row).
     pub layer_opacity: bool,
+    /// The background's colour asked for: its row tapped anywhere but on its box.
+    pub pick_background: bool,
     /// On a model: the mesh open (its texture set's layers under it), the layer whose channels
     /// show, the channel whose colour shows, each channel's own colour (hue, saturation,
     /// brightness) kept while another is painted, the meshes' and channels' pictures, and the
@@ -272,6 +281,7 @@ impl Layers {
         self.control_for = None;
         self.control_pending = false;
         self.title_menu.close();
+        self.add_menu.close();
         self.renaming = None;
         self.blend = None;
         self.press = None;
@@ -289,6 +299,7 @@ impl Layers {
     pub fn modal(&self) -> bool {
         self.options_menu.is_open()
             || self.title_menu.is_open()
+            || self.add_menu.is_open()
             || self.deleting.is_open()
             || self.deleting_shared.is_open()
             || self.locked.is_open()
@@ -379,6 +390,7 @@ impl Layers {
         let mut tapped: Option<&LayerInfo> = None;
         let mut blend_tapped: Option<u64> = None;
         let mut title = Rect::NOTHING;
+        let mut plus = Rect::NOTHING;
         // the only layer (masks aside) is cleared rather than deleted
         let alone = layers.iter().filter(|l| l.kind != LayerType::Mask).count() == 1;
 
@@ -394,12 +406,15 @@ impl Layers {
                 if title_tapped {
                     self.title_menu.open();
                 }
-                let plus = Rect::from_min_size(pos2(body.right() - 18.0 - 40.0, body.top() + 12.0), vec2(40.0, 41.0));
+                plus = Rect::from_min_size(pos2(body.right() - 18.0 - 40.0, body.top() + 12.0), vec2(40.0, 41.0));
                 look.icon(ui, &icons::PLUS_MEDIUM, plus.center(), 41.0, argb(PANEL_GLYPH));
-                if ui.interact(plus, ui.scope_id().with("new layer"), Sense::click()).clicked()
-                    && session.add_layer() == 0
-                {
-                    crate::files::no_room(session);
+                if ui.interact(plus, ui.scope_id().with("new layer"), Sense::click()).clicked() {
+                    // with plugins' kinds of layer on, it asks which
+                    if !self.layer_kinds.is_empty() {
+                        self.add_menu.open();
+                    } else if session.add_layer() == 0 {
+                        crate::files::no_room(session);
+                    }
                 }
                 let list = Rect::from_min_max(
                     pos2(body.left() + 12.0, body.top() + HEADER_HEIGHT),
@@ -413,7 +428,11 @@ impl Layers {
                         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                         .show(ui, |ui| {
                             ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-                            ui.scroll_with_delta(vec2(0.0, -std::mem::take(&mut self.scroll_by)));
+                            // at once: a finger's drag or a dragged row's at the edge, each frame
+                            ui.scroll_with_delta_animation(
+                                vec2(0.0, -std::mem::take(&mut self.scroll_by)),
+                                egui::style::ScrollAnimation::none(),
+                            );
                             let mut dragged = Vec::new();
                             let mut squeezed = Vec::new();
                             for item in &items {
@@ -482,7 +501,8 @@ impl Layers {
                                     {
                                         let since = Instant::now();
                                         let way = Way::Undecided;
-                                        let mouse = !ui.input(|i| i.any_touches());
+                                        // a tablet's pen moving the mouse pointer goes as a finger
+                                        let mouse = !ui.input(|i| i.any_touches()) && crate::pen::mouse_pen().is_none();
                                         self.press = Some(RowPress {
                                             id: l.id,
                                             origin,
@@ -527,7 +547,7 @@ impl Layers {
                             }
                             if model.is_none() {
                                 ui.add_space(10.0);
-                                background_row(ui, look, session);
+                                self.pick_background |= background_row(ui, look, session);
                             }
                             ui.add_space(12.0);
                             // the pinched rows over the rest, the upper over the lower
@@ -592,6 +612,7 @@ impl Layers {
         }
         self.control_options(ctx, look, session, backdrops);
         self.title_menu(ctx, look, session, title, any_picked, backdrops);
+        self.add_menu(ctx, look, session, plus, backdrops);
         // the title menu's Delete asks first
         // asked first; then, as measured, a locked one among them stops it, said why
         if self.deleting.show(ctx, look) == Some(Answer::Action) {
@@ -661,6 +682,49 @@ impl Layers {
                 }
             }
             _ => self.deleting.open("Delete these layers?", "Undo brings them back.", "Delete", Some(&icons::TRASH)),
+        }
+    }
+
+    /// The +'s menu, under it, while plugins add kinds of layer: a plain layer, then one of each
+    /// kind, named as its plugin names it.
+    fn add_menu(
+        &mut self,
+        ctx: &egui::Context,
+        look: &mut Look,
+        session: &CanvasSession,
+        plus: Rect,
+        backdrops: &mut Vec<f32>,
+    ) {
+        if self.layer_kinds.is_empty() {
+            self.add_menu.close();
+        }
+        let ink = menu::INK;
+        let mut entries = vec![Entry::Item(&icons::MENU_NEW_SET, "Layer", ink)];
+        entries.extend(self.layer_kinds.iter().map(|k| Entry::Item(&icons::MENU_NEW_BRUSH, k.label.as_str(), ink)));
+        let size = vec2(menu::LIBRARY_WIDTH, menu::entries_height(&entries));
+        let screen = ctx.content_rect();
+        let left = (plus.right() - size.x).clamp(screen.left(), (screen.right() - size.x).max(screen.left()));
+        let rect = Rect::from_min_size(pos2(left, plus.bottom().max(screen.top() + OPTIONS_TOP)), size);
+        let mut tapped = None;
+        self.add_menu.show(
+            ctx,
+            "layers add menu",
+            rect,
+            pos2(rect.right(), rect.top()),
+            menu::OVER_A_PANEL,
+            backdrops,
+            |ui| {
+                tapped = menu::entries(ui, look, rect, &entries);
+            },
+        );
+        let Some(at) = tapped.filter(|i| *i < entries.len()) else { return };
+        self.add_menu.close();
+        let added = match at.checked_sub(1).and_then(|k| self.layer_kinds.get(k)) {
+            Some(kind) => session.add_plugin_layer(kind.key.clone()),
+            None => session.add_layer(),
+        };
+        if added == 0 {
+            crate::files::no_room(session);
         }
     }
 
@@ -1124,8 +1188,8 @@ impl Layers {
 
     /// Follows the press on a row: moved sideways it slides the row (let go past half its buttons,
     /// it stays open; slid right past half the way, it picks the layer); held still (or, with a
-    /// mouse, moved up or down: a finger doing that scrolls the list), the row is dragged up and down
-    /// and, let go, the layer moves next to the row it is over.
+    /// mouse, moved up or down: a finger or pen doing that scrolls the list, which follows it), the
+    /// row is dragged up and down and, let go, the layer moves next to the row it is over.
     fn follow_press(
         &mut self,
         ctx: &egui::Context,
@@ -1145,6 +1209,11 @@ impl Layers {
                     let sideways = d.x.abs() > d.y.abs();
                     if d.length() > SLOP && (sideways || !p.mouse) {
                         p.way = if sideways { Way::Swipe } else { Way::Ignored };
+                        // up or down: the list follows the finger from where it was put down
+                        if !sideways {
+                            self.scroll_by -= d.y;
+                            ctx.request_repaint();
+                        }
                     } else if p.since.elapsed() >= HOLD || d.length() > SLOP {
                         // a mask stays with its layer
                         if l.is_some_and(|l| l.kind != LayerType::Mask) {
@@ -1185,6 +1254,12 @@ impl Layers {
                         };
                         self.scroll_by = towards.clamp(-1.0, 1.0) * DRAG_SCROLL * ctx.input(|i| i.stable_dt);
                     }
+                    ctx.request_repaint();
+                }
+                // a finger's: the row has the drag (not the list's own drag to scroll), the list
+                // follows it
+                Way::Ignored if !p.mouse => {
+                    self.scroll_by -= ctx.input(|i| i.pointer.delta().y);
                     ctx.request_repaint();
                 }
                 Way::Ignored => {}
@@ -1274,13 +1349,17 @@ impl Layers {
         backdrops: &mut Vec<f32>,
     ) {
         let rows: Vec<LayerOptionRow> = session.layer_options(l.id);
+        // a plugin's actions for the layer, after the app's own
+        let actions = std::mem::take(&mut self.plugin_actions);
+        let count = rows.len() + actions.len();
         // as measured, an empty one (a locked group's or mask's) is a pill 64 tall
-        let height = (7.0 * 2.0 + menu::OPTION_HEIGHT * rows.len() as f32).max(64.0);
+        let height = (7.0 * 2.0 + menu::OPTION_HEIGHT * count as f32).max(64.0);
         let screen = ctx.content_rect();
         let lowest = (screen.bottom() - height).max(screen.top() + OPTIONS_TOP);
         let top = (row_y - height / 2.0).clamp(screen.top() + OPTIONS_TOP, lowest);
         let rect = Rect::from_min_size(pos2(panel.left() + OPTIONS_LEFT, top), vec2(OPTIONS_WIDTH, height));
         let mut chosen = None;
+        let mut action = None;
         self.options_menu.show(
             ctx,
             "layer options",
@@ -1289,19 +1368,29 @@ impl Layers {
             // empty, as measured, the frost alone, untinted
             menu::Glass {
                 corner: OPTIONS_CORNER,
-                fill: if rows.is_empty() { Themed(0, 0) } else { menu::FROSTED.fill },
+                fill: if count == 0 { Themed(0, 0) } else { menu::FROSTED.fill },
                 ..menu::FROSTED
             },
             backdrops,
             |ui| {
-                let places = menu::option_rows(rect.left(), rect.top() + 7.0, rect.width(), rows.len());
-                for (row, r) in places.zip(&rows) {
+                let places: Vec<_> = menu::option_rows(rect.left(), rect.top() + 7.0, rect.width(), count).collect();
+                for (&row, r) in places.iter().zip(&rows) {
                     if menu::option(ui, look, row, &r.label, r.switch_on.unwrap_or(false), r.enabled, false) {
                         chosen = Some(r.option);
                     }
                 }
+                for (&row, a) in places.iter().skip(rows.len()).zip(&actions) {
+                    if menu::option(ui, look, row, &a.label, false, true, false) {
+                        action = Some(a.key.clone());
+                    }
+                }
             },
         );
+        if let Some(key) = action {
+            self.options_menu.close();
+            self.run_action = Some(key);
+            return;
+        }
         // every row closes the menu, a switch's too (it shows ticked next time)
         let Some(does) = chosen else { return };
         self.options_menu.close();
@@ -1330,7 +1419,13 @@ impl Layers {
             LayerOption::EditText => self.edit_text = Some(l.id),
             LayerOption::Rasterize => {
                 session.rasterize_layer(l.id);
-                self.notice = Some(("Text rasterized".into(), true));
+                self.notice = Some((if l.text { "Text rasterized" } else { "Layer rasterized" }.into(), true));
+            }
+            // a plugin's layer: its strokes recoloured, or given the paint brush, as strokes
+            LayerOption::Recolour | LayerOption::ApplyBrush => {
+                let colour = does == LayerOption::Recolour;
+                session.select_layer(l.id);
+                session.restyle_plugin_items(colour, !colour, !colour, !colour);
             }
             LayerOption::MergeDown => _ = session.merge_down(l.id),
             LayerOption::CombineDown => _ = session.combine_down(l.id),
@@ -1732,6 +1827,38 @@ impl Layers {
             let shown = Rect::from_center_size(rect.center(), size * fit);
             painter.image(t.id(), shown, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
         }
+        // a plugin's layer: its kind's badge in its corner, as its manifest draws it
+        if let Some(badge) = &l.plugin_badge {
+            plugin_badge(&painter, rect, badge);
+        }
+    }
+}
+
+/// A plugin's layer's badge (its lines and dots in white over a dark rounded box) in the bottom
+/// right corner of its thumbnail's `rect`.
+fn plugin_badge(painter: &egui::Painter, rect: Rect, badge: &procraft_core::PluginBadge) {
+    let area = Rect::from_min_size(rect.right_bottom() - vec2(3.0 + 18.0, 3.0 + 14.0), vec2(18.0, 14.0));
+    painter.rect_filled(area, 4u8, Color32::from_black_alpha(0x99));
+    let at = |x: f32, y: f32| pos2(area.left() + area.width() * x, area.top() + area.height() * y);
+    let ink = egui::Stroke::new(1.5, Color32::WHITE);
+    for line in &badge.lines {
+        let points: Vec<Pos2> = line.points.as_chunks::<2>().0.iter().map(|&[x, y]| at(x, y)).collect();
+        if points.len() < 2 {
+            continue;
+        }
+        if line.curved {
+            for piece in points.windows(4).step_by(3) {
+                let &[a, b, c, d] = piece else { continue };
+                let curve =
+                    egui::epaint::CubicBezierShape::from_points_stroke([a, b, c, d], false, Color32::TRANSPARENT, ink);
+                painter.add(curve);
+            }
+        } else {
+            painter.add(egui::Shape::line(points, ink));
+        }
+    }
+    for &[x, y] in badge.dots.as_chunks::<2>().0 {
+        painter.rect_filled(Rect::from_center_size(at(x, y), vec2(3.0, 3.0)), 0u8, Color32::WHITE);
     }
 }
 
@@ -1843,8 +1970,9 @@ fn blend_rows(ui: &Ui, look: &mut Look, list: Rect, modes: &[BlendModeInfo], cho
     }
 }
 
-/// The background: its colour and whether it shows.
-fn background_row(ui: &mut Ui, look: &mut Look, session: &CanvasSession) {
+/// The background: its colour and whether it shows. True when the row is tapped anywhere but on its
+/// box, for its colour to be picked.
+fn background_row(ui: &mut Ui, look: &mut Look, session: &CanvasSession) -> bool {
     let background = session.background();
     let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 50.0), Sense::hover());
     ui.painter().rect_filled(row, 17, argb(BACKGROUND_ROW));
@@ -1864,7 +1992,10 @@ fn background_row(ui: &mut Ui, look: &mut Look, session: &CanvasSession) {
     check_box(ui, look, visibility.center(), background.visible, argb(CHECK_FILL));
     if ui.interact(visibility, ui.scope_id().with("background visible"), Sense::click()).clicked() {
         session.set_background_visible(!background.visible);
+        return false;
     }
+    let rest = Rect::from_min_max(row.min, pos2(visibility.left(), row.max.y));
+    ui.interact(rest, ui.scope_id().with("background colour"), Sense::click()).clicked()
 }
 
 /// A visibility box: filled with a check cut out of it when shown, an outline when hidden.
@@ -2000,5 +2131,122 @@ impl Pinch {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{Event, Modifiers, PointerButton, RawInput};
+
+    /// A tap on the background's row, on its box or left of it: whether the row asked for its
+    /// colour, and whether the background shows after.
+    fn tap_background_row(on_box: bool) -> (bool, bool) {
+        let (ctx, mut look) = (egui::Context::default(), Look::default());
+        crate::look::install_fonts(&ctx);
+        let session = CanvasSession::new(64, 64);
+        let (mut row, mut asked) = (Rect::NOTHING, false);
+        let press = |pos, pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        for step in 0..6 {
+            // the box's middle 8 + 22 in from the row's right; the name half way along the row
+            let at = if on_box { pos2(row.right() - 30.0, row.center().y) } else { row.center() };
+            let events = match step {
+                2 => vec![Event::PointerMoved(at)],
+                3 => vec![press(at, true)],
+                4 => vec![press(at, false)],
+                _ => Vec::new(),
+            };
+            let raw = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(384.0, 200.0))),
+                time: Some(f64::from(step) / 60.0),
+                events,
+                ..RawInput::default()
+            };
+            let mut output = ctx.clone().run_ui(raw, |ui| {
+                row = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), 50.0));
+                asked |= background_row(ui, &mut look, &session);
+            });
+            output.textures_delta.clear();
+        }
+        (asked, session.background().visible)
+    }
+
+    /// A finger dragged 180 points up a row of a long list, quickly (before a hold picks the row
+    /// up): how far the row moved up, points.
+    fn finger_drag_up_a_row() -> f32 {
+        let (ctx, mut look) = (egui::Context::default(), Look::default());
+        crate::look::install_fonts(&ctx);
+        let session = CanvasSession::new(64, 64);
+        for _ in 0..24 {
+            session.add_layer();
+        }
+        let (mut layers, mut colours) = (Layers::default(), Colours::default());
+        let screen = Rect::from_min_size(Pos2::ZERO, vec2(1200.0, 800.0));
+        let button = Rect::from_min_size(pos2(1000.0, 10.0), vec2(40.0, 40.0));
+        let mut step = 0;
+        let mut frame = |layers: &mut Layers, events: Vec<Event>| {
+            let raw = RawInput {
+                screen_rect: Some(screen),
+                time: Some(f64::from(step) / 60.0),
+                events,
+                ..RawInput::default()
+            };
+            step += 1;
+            let mut output = ctx.clone().run_ui(raw, |ui| {
+                layers.show(ui.ctx(), &mut look, &session, &mut colours, button, &mut Vec::new());
+            });
+            output.textures_delta.clear();
+        };
+        for _ in 0..4 {
+            frame(&mut layers, Vec::new());
+        }
+        // a row half way down the list as shown
+        let list = layers.list.unwrap();
+        let mut rows: Vec<(u64, Rect)> =
+            layers.last_rows.iter().filter(|(_, r)| list.contains(r.center())).map(|(id, r)| (*id, *r)).collect();
+        rows.sort_by(|a, b| a.1.top().total_cmp(&b.1.top()));
+        let (id, row) = rows[rows.len() / 2];
+        let touch = |phase, pos| Event::Touch {
+            device_id: egui::TouchDeviceId(1),
+            id: egui::TouchId(1),
+            phase,
+            pos,
+            force: None,
+        };
+        let button_at = |pos, pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        // as egui-winit gives a touch: the touch, and the pointer it moves
+        let mut at = row.center();
+        frame(&mut layers, vec![touch(egui::TouchPhase::Start, at), Event::PointerMoved(at), button_at(at, true)]);
+        for _ in 0..15 {
+            at.y -= 12.0;
+            frame(&mut layers, vec![touch(egui::TouchPhase::Move, at), Event::PointerMoved(at)]);
+        }
+        frame(&mut layers, vec![touch(egui::TouchPhase::End, at), button_at(at, false), Event::PointerGone]);
+        for _ in 0..4 {
+            frame(&mut layers, Vec::new());
+        }
+        layers.last_rows.get(&id).map_or(0.0, |after| row.top() - after.top())
+    }
+
+    #[test]
+    fn a_finger_dragged_up_a_row_scrolls_the_list() {
+        let moved = finger_drag_up_a_row();
+        assert!(moved > 120.0, "the row moved {moved} points up");
+    }
+
+    #[test]
+    fn the_background_row_tapped_asks_for_its_colour_and_its_box_tapped_hides_it() {
+        assert_eq!(tap_background_row(false), (true, true), "the row: its colour, still shown");
+        assert_eq!(tap_background_row(true), (false, false), "the box: hidden, no colour asked");
     }
 }

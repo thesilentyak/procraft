@@ -13,7 +13,7 @@
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher"
-        android:supportsRtl="true"
+        android:supportsRtl="false"
         android:theme="@style/Theme.ProCraft">
 
         <!-- configuration changes are handled in place: the canvas and its GPU state stay -->
@@ -66,6 +66,9 @@
                 <data android:pathSuffix=".brushset" />
                 <data android:pathPattern=".*\\.brushset" />
                 <data android:pathPattern=".*\\..*\\.brushset" />
+                <data android:pathSuffix=".brushlibrary" />
+                <data android:pathPattern=".*\\.brushlibrary" />
+                <data android:pathPattern=".*\\..*\\.brushlibrary" />
                 <data android:pathSuffix=".swatches" />
                 <data android:pathPattern=".*\\.swatches" />
                 <data android:pathPattern=".*\\..*\\.swatches" />
@@ -78,6 +81,9 @@
                 <data android:pathSuffix=".sut" />
                 <data android:pathPattern=".*\\.sut" />
                 <data android:pathPattern=".*\\..*\\.sut" />
+                <data android:pathSuffix=".sutg" />
+                <data android:pathPattern=".*\\.sutg" />
+                <data android:pathPattern=".*\\..*\\.sutg" />
                 <data android:pathSuffix=".kpp" />
                 <data android:pathPattern=".*\\.kpp" />
                 <data android:pathPattern=".*\\..*\\.kpp" />
@@ -123,6 +129,9 @@
                 <data android:pathSuffix=".brushset" />
                 <data android:pathPattern=".*\\.brushset" />
                 <data android:pathPattern=".*\\..*\\.brushset" />
+                <data android:pathSuffix=".brushlibrary" />
+                <data android:pathPattern=".*\\.brushlibrary" />
+                <data android:pathPattern=".*\\..*\\.brushlibrary" />
                 <data android:pathSuffix=".swatches" />
                 <data android:pathPattern=".*\\.swatches" />
                 <data android:pathPattern=".*\\..*\\.swatches" />
@@ -135,6 +144,9 @@
                 <data android:pathSuffix=".sut" />
                 <data android:pathPattern=".*\\.sut" />
                 <data android:pathPattern=".*\\..*\\.sut" />
+                <data android:pathSuffix=".sutg" />
+                <data android:pathPattern=".*\\.sutg" />
+                <data android:pathPattern=".*\\..*\\.sutg" />
                 <data android:pathSuffix=".kpp" />
                 <data android:pathPattern=".*\\.kpp" />
                 <data android:pathPattern=".*\\..*\\.kpp" />

@@ -637,6 +637,7 @@ fn add_item(
                 private: false,
                 assisted: false,
                 control: None,
+                plugin: None,
             });
         }
         _ => {
@@ -669,6 +670,7 @@ fn add_item(
                 private: item.bool("private").unwrap_or(false),
                 assisted: item.bool("perspectiveAssisted").unwrap_or(false),
                 control: None,
+                plugin: None,
             });
             if !uuid.is_empty() {
                 pixels.push((lid, canvas.pixels(&uuid, 4, 0)?));
@@ -693,6 +695,7 @@ fn add_item(
                     private: false,
                     assisted: false,
                     control: None,
+                    plugin: None,
                 });
                 if let Some(m) = mask.string("UUID") {
                     // a mask stores only the tiles painted on: the rest shows the layer

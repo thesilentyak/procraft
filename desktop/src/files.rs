@@ -37,6 +37,8 @@ pub enum Format {
     ModelTiff,
     ModelTextures,
     ModelArtwork,
+    /// A plugin's artwork, its shapes kept.
+    Svg,
 }
 
 impl Format {
@@ -53,6 +55,7 @@ impl Format {
             Format::Jpeg | Format::ModelJpeg => "JPEG",
             Format::ModelObj => "OBJ",
             Format::ModelUsdz => "USDZ",
+            Format::Svg => "SVG",
         }
     }
 
@@ -73,6 +76,7 @@ impl Format {
             Format::Tiff | Format::ModelTiff => "tiff",
             Format::Jpeg | Format::ModelJpeg => "jpg",
             Format::ModelObj => "zip",
+            Format::Svg => "svg",
             Format::ModelUsdz => "usdz",
         }
     }
@@ -99,11 +103,11 @@ pub fn say(text: &str) {
     MessageDialog::new().set_level(MessageLevel::Info).set_title(crate::APP_NAME).set_description(text).show();
 }
 
-/// Whether the file at `path` holds brushes, by its name (a zip by what it holds): ours (a brush
-/// or a set) or another app's.
+/// Whether the file at `path` holds brushes, by its name (a zip by what it holds): ours (a brush,
+/// a set or a library) or another app's.
 pub fn is_brush_file(path: &Path) -> bool {
     let extension = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-    ["brush", "brushset"].contains(&extension.as_str())
+    ["brush", "brushset", "brushlibrary"].contains(&extension.as_str())
         || procraft_core::OTHER_BRUSH_EXTENSIONS.contains(&extension.as_str())
         // a brush or a set sent on as a plain zip (told by its names, not read whole)
         || (extension == "zip"
@@ -234,6 +238,21 @@ pub fn tell_later(title: &str, text: &str) {
     TOLD.lock().unwrap_or_else(|e| e.into_inner()).push((title.to_owned(), text.to_owned()));
 }
 
+/// Keeps `session`'s brushes in their folder. One that can't (the disk full, say) is told once,
+/// from the window's thread, and not again until they are kept once more.
+pub fn keep_brushes(session: &procraft_core::CanvasSession) {
+    static FAILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if session.keep_brushes(brushes_dir()) {
+        FAILING.store(false, std::sync::atomic::Ordering::Relaxed);
+    } else if !FAILING.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tell_later(
+            "Can't keep the brushes",
+            "The brush library couldn't be kept. The disk may be full: brushes brought in or changed \
+             since are lost when ProCraft closes, unless some room is made.",
+        );
+    }
+}
+
 /// Shows the messages the writing threads left.
 pub fn tell_what_was_told() {
     let told = std::mem::take(&mut *TOLD.lock().unwrap_or_else(|e| e.into_inner()));
@@ -258,6 +277,19 @@ pub fn save_file(bytes: &[u8], name: &str, extension: &str, kind: &str) {
     // a file there already is replaced only once this one is written whole
     if let Err(e) = write_whole(&path, bytes) {
         tell("Can't share", &e.to_string());
+    }
+}
+
+/// A sound the user picks (titled `title`): a WAV file, read whole, with its name.
+pub fn pick_sound(title: &str) -> Option<(Vec<u8>, String)> {
+    let path = FileDialog::new().set_title(title).add_filter("Sounds", &["wav", "wave"]).pick_file()?;
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    match std::fs::read(&path) {
+        Ok(bytes) => Some((bytes, name)),
+        Err(_) => {
+            say("This file could not be read.");
+            None
+        }
     }
 }
 
@@ -376,6 +408,15 @@ pub fn new_from_preset(preset: &CanvasPreset) -> Arc<CanvasSession> {
     session
 }
 
+/// The time-lapse settings `preset` gives a new artwork, kept in its folder `dir` before it opens.
+pub fn keep_preset_time_lapse(preset: &CanvasPreset, dir: &str) {
+    procraft_core::TimeLapse::new(dir.to_owned()).set_settings(procraft_core::TimeLapseSettings {
+        resolution: preset.time_lapse_resolution,
+        quality: preset.time_lapse_quality,
+        hevc: preset.time_lapse_hevc,
+    });
+}
+
 /// A colour profile the user picks (an .icc file), added to those a canvas can be in; its name, or
 /// none (said so) if it isn't one.
 pub fn import_profile() -> Option<String> {
@@ -445,7 +486,8 @@ pub fn is_palette_file(path: &Path) -> bool {
 /// The files the gallery's Import brings in, as the user picks them: an artwork or a model (as
 /// [`pick_artwork`] takes), palettes and brushes.
 pub fn pick_import() -> Option<Vec<PathBuf>> {
-    let brushes: Vec<&str> = ["brush", "brushset"].into_iter().chain(procraft_core::OTHER_BRUSH_EXTENSIONS).collect();
+    let brushes: Vec<&str> =
+        ["brush", "brushset", "brushlibrary"].into_iter().chain(procraft_core::OTHER_BRUSH_EXTENSIONS).collect();
     let more: Vec<&str> = PALETTE_EXTENSIONS.into_iter().chain(brushes).collect();
     pick_artwork_files(&more)
 }
@@ -731,8 +773,35 @@ pub fn export(
             Format::ModelUsdz => session.export_model_usdz(at),
             Format::ModelRender => session.export_model_render(at, false),
             Format::ModelTiff => session.export_model_tiff(at),
+            Format::Svg => session.export_svg(at),
             Format::LayerPngs | Format::ChosenLayerPngs | Format::ModelTextures => Ok(()),
         }?;
+        Ok(vec![part])
+    });
+}
+
+/// Writes the file plugin export `key` makes of the artwork's layers where the user picks, as
+/// [`export`] writes the app's own.
+pub fn export_plugin(session: &Arc<CanvasSession>, key: &str, card: &mut crate::export_card::ExportCard) {
+    if card.busy() {
+        return;
+    }
+    let Some(export) = session.plugin_exports().into_iter().find(|e| e.key == key) else { return };
+    let extension = export.extension.clone();
+    let Some(path) = FileDialog::new()
+        .set_title(format!("Export {}", export.label))
+        .add_filter(export.label.as_str(), &[extension.as_str()])
+        .set_file_name(format!("{}.{extension}", export_file_name(session.name(), false)))
+        .save_file()
+    else {
+        return;
+    };
+    let path = with_extension(path, &extension);
+    let key = key.to_owned();
+    writing(session, card, "Can't export", move |session| {
+        // written beside it first, so a cancelled export leaves what was there as it was
+        let part = PathBuf::from(format!("{}.part", path.to_string_lossy()));
+        session.export_plugin(key, part.to_string_lossy().into_owned())?;
         Ok(vec![part])
     });
 }
@@ -932,6 +1001,17 @@ fn seed() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_artwork_records_its_time_lapse_as_its_preset_says() {
+        let dir = folder("preset-time-lapse");
+        let mut preset = procraft_core::standard_presets().remove(0);
+        (preset.time_lapse_resolution, preset.time_lapse_quality, preset.time_lapse_hevc) = (2, 3, true);
+        keep_preset_time_lapse(&preset, &dir.to_string_lossy());
+        let settings = procraft_core::TimeLapse::new(dir.to_string_lossy().into_owned()).settings();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(settings, procraft_core::TimeLapseSettings { resolution: 2, quality: 3, hevc: true });
+    }
 
     #[test]
     fn a_message_has_other_ways_of_showing_with_its_words_in_each() {

@@ -11,7 +11,7 @@ plugins {
 val cargoWorkspaceDir: File = rootDir.parentFile
 val rustAbis: List<String> =
     providers.gradleProperty("procraft.abis").getOrElse("arm64-v8a,x86_64").split(',').map { it.trim() }.filter { it.isNotEmpty() }
-val minApi = 29
+val minApi = 28
 // Image generation on a ComfyUI server (procraft-core's `generation` feature, src/generation/):
 // on unless -Pprocraft.generation=false. Off, the app builds without it, its networking or the
 // INTERNET permission.

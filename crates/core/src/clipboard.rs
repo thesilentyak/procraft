@@ -120,6 +120,25 @@ fn placed(image: ThumbnailImage, width: u32, height: u32, fit: bool) -> Option<V
     Some(out)
 }
 
+/// A copy as it goes on a `width` × `height` canvas, and whether it is fitted there: from a canvas
+/// this size it lands where it was; from another size its painted part is centred, scaled down
+/// only if it is larger, so nothing of it is cut off.
+fn to_paste(image: ThumbnailImage, width: u32, height: u32) -> (ThumbnailImage, bool) {
+    if (image.width, image.height) == (width, height) {
+        return (image, false);
+    }
+    let whole = IRect::from_size(image.width, image.height);
+    let Some(rect) = crate::layer_ops::painted_rect(&image.rgba, image.width).filter(|&r| r != whole) else {
+        return (image, true);
+    };
+    let (row, x0, x1) = (image.width as usize * 4, rect.x0 as usize * 4, rect.x1 as usize * 4);
+    let mut rgba = Vec::with_capacity((x1 - x0) * rect.height() as usize);
+    for line in image.rgba.chunks_exact(row.max(1)).skip(rect.y0 as usize).take(rect.height() as usize) {
+        rgba.extend_from_slice(line.get(x0..x1).unwrap_or_default());
+    }
+    (ThumbnailImage { width: rect.width(), height: rect.height(), rgba }, true)
+}
+
 /// `pixels` (premultiplied RGBA8, `width` wide) mirrored left to right, or top to bottom (as the
 /// GPU's flip should).
 #[cfg(test)]
@@ -162,14 +181,15 @@ impl CanvasSession {
         Some(copied)
     }
 
-    /// A new layer above the current one holding `image` where it was copied from (centred when
-    /// it is another size), or the current mask holding it, if a plugin says to and it can; returns
-    /// the layer's id.
+    /// A new layer above the current one holding `image` where it was copied from (from a canvas
+    /// of another size, what is painted of it centred and scaled down to fit), or the current mask
+    /// holding it, if a plugin says to and it can; returns the layer's id.
     pub fn paste(&self, image: ThumbnailImage) -> Option<u64> {
-        if let Some(pasted) = self.mask_to_paste_into().and_then(|mask| self.paste_into(mask, image.clone(), false)) {
+        let (image, fit) = self.to_paste(image);
+        if let Some(pasted) = self.mask_to_paste_into().and_then(|mask| self.paste_into(mask, image.clone(), fit)) {
             return Some(pasted);
         }
-        self.add_picture(image, false, false)
+        self.add_picture(image, fit, false)
     }
 
     /// Whether what is pasted now goes into the current mask: through a plugin a row at a time, which
@@ -180,7 +200,8 @@ impl CanvasSession {
 
     /// As [`paste`](Self::paste), on a private layer: one the gallery's thumbnail leaves out.
     pub fn paste_private(&self, image: ThumbnailImage) -> Option<u64> {
-        self.add_picture(image, false, true)
+        let (image, fit) = self.to_paste(image);
+        self.add_picture(image, fit, true)
     }
 
     /// A new layer above the current one holding `image` (a photo or file, straight RGBA8),
@@ -252,16 +273,50 @@ impl CanvasSession {
         st.settle();
         st.flush();
         let ids: Vec<LayerId> = st.doc.layer_ids().collect();
+        if st.canvas.is_none() {
+            return;
+        }
+        // plugins' layers' items mirrored with their pixels, in the same step (those whose plugin
+        // can't move them become ordinary layers)
+        let before = st.doc.clone();
+        let (w, h) = (st.doc.width() as f32, st.doc.height() as f32);
+        let flip = if horizontal {
+            procraft_engine::geom::Affine { a: -1.0, b: 0.0, c: 0.0, d: 1.0, e: w, f: 0.0 }
+        } else {
+            procraft_engine::geom::Affine { a: 1.0, b: 0.0, c: 0.0, d: -1.0, e: 0.0, f: h }
+        };
+        let mut doc = st.doc.clone();
+        let moved = st.move_all_items(flip, &mut doc);
+        let rasterized =
+            doc.layers().iter().zip(before.layers()).any(|(a, b)| a.plugin.is_none() && b.plugin.is_some());
+        st.doc = doc;
         let Some(canvas) = st.canvas.as_mut() else { return };
         canvas.name_next_step(if horizontal { "flip canvas horizontally" } else { "flip canvas vertically" });
         // mirrored on the GPU, nothing read back
-        canvas.flip_layers(ids, horizontal);
+        if rasterized {
+            canvas.flip_layers_and_document(ids, horizontal, before);
+        } else {
+            canvas.flip_layers(ids, horizontal);
+        }
+        st.flush();
+        if let Some(made) = st.canvas.as_ref().and_then(procraft_gpu::Canvas::undo_step) {
+            st.note_moved_data(made, moved);
+        }
         st.revision += 1;
         self.shared.frame(st);
     }
 }
 
 impl CanvasSession {
+    /// A copy as it goes on this canvas, and whether it is fitted there ([`to_paste`]).
+    fn to_paste(&self, image: ThumbnailImage) -> (ThumbnailImage, bool) {
+        let (w, h) = {
+            let st = self.shared.lock();
+            (st.doc.width(), st.doc.height())
+        };
+        to_paste(image, w, h)
+    }
+
     /// The current layer, if it is a mask and a plugin says what is pasted goes into it.
     fn mask_to_paste_into(&self) -> Option<LayerId> {
         let st = self.shared.lock();

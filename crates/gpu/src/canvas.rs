@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
 
 use procraft_engine::animation::{self, FrameLook};
@@ -21,8 +21,12 @@ use wgpu::util::DeviceExt;
 use crate::{Gpu, GpuError};
 
 pub(crate) mod plugin_filter;
+pub(crate) mod plugin_picture;
 
 const LAYER_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// The id the next canvas made takes (see [`Canvas::id`]).
+static NEXT_CANVAS: AtomicU64 = AtomicU64::new(1);
 
 /// The most textures the canvas's size kept for reuse (see `Canvas::spares`).
 const SPARES_KEPT: usize = 1;
@@ -39,13 +43,38 @@ const MULTIPLY_MODE: u32 = 1;
 const STROKE_LUMINANCE: u32 = 0x100;
 
 /// The largest uniform block a shader reads.
-const UNIFORM_SIZE: u64 = 128;
+const UNIFORM_SIZE: u64 = 144;
 const _: () = assert!(
     size_of::<LayerUniform>() as u64 <= UNIFORM_SIZE
         && size_of::<StampUniform>() as u64 <= UNIFORM_SIZE
         && size_of::<FilterUniform>() as u64 <= UNIFORM_SIZE,
     "a uniform block outgrew its binding"
 );
+
+/// `s` given in another canvas's pixels, as drawn on one `k` times as big whose top left is at
+/// `origin` of those: where it is, and its moving grain with it (its size is scaled as it is drawn,
+/// see [`scaled_radius`]).
+fn scaled_stamp(s: &Stamp, origin: [f32; 2], k: f32) -> Stamp {
+    let mut s = *s;
+    s.center = procraft_engine::geom::Vec2::new((s.center.x - origin[0]) * k, (s.center.y - origin[1]) * k);
+    s.grain_offset = s.grain_offset * k;
+    s.grain_size *= k;
+    s.distance *= k;
+    s
+}
+
+/// How far past its radius a stamp's shape reaches where it is drawn: half a pixel of the round
+/// tip's rim, or the shape's quad's reach (as `stamp.wgsl` has them).
+fn stamp_rim(style: &StrokeStyle) -> f32 {
+    if style.shape.is_some() { std::f32::consts::FRAC_1_SQRT_2 } else { 0.5 }
+}
+
+/// A stamp drawn at `radius` (its rim past that) on a canvas, as drawn `k` times as big: its edge,
+/// rim and all, as far out, the rim itself a pixel of the bigger one.
+fn scaled_radius(style: &StrokeStyle, radius: f32, k: f32) -> f32 {
+    let rim = stamp_rim(style);
+    ((radius + rim) * k - rim).max(0.0)
+}
 
 /// The vertex layout of a warp mesh corner: where it goes, and where it came from (pixels).
 const MESH_ATTRIBUTES: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2];
@@ -74,6 +103,10 @@ struct OverlayUniform {
 /// a fair margin even at a hundredth of its speed. Much less costs more than it saves: a tiled
 /// GPU can read and write the whole stroke for each piece.
 const WORK_AT_ONCE: u64 = 64 << 20;
+/// The most stamps one render uploads (the rest in renders after it, at once): a long stroke's end
+/// redraws all of it, and its millions of stamps in one buffer could pass the most the GPU makes,
+/// leaving no buffer to draw this or any later stroke with. 1M stamps take about 100 MB.
+const STAMPS_AT_ONCE: u64 = 1 << 20;
 /// What a stamp counts for besides the pixels it covers; and a stamp painted in place, a compute
 /// pass for each, for each pixel and for itself.
 const STAMP_WORK: u64 = 1 << 10;
@@ -303,7 +336,9 @@ impl StrokeStyle {
             preserve_alpha,
             shape: brush.shape.image,
             grain: brush.grain.image.filter(|_| brush.grain.depth > 0.0),
-            grain_mode: brush.grain.mode,
+            // a grain fixed to the canvas going on stamp by stamp goes the moving grain's way, each
+            // stamp reading it where it lands
+            grain_mode: if brush.grain_each_stamp() { GrainMode::Moving } else { brush.grain.mode },
             grain_scale: brush.grain_tile().max(1.0),
             grain_depth: brush.grain.depth.clamp(0.0, 1.0),
             rendering: brush.rendering,
@@ -486,7 +521,8 @@ fn draw_glass(
 ) {
     let (tw, th) = (size.0.max(1) as f32, size.1.max(1) as f32);
     pass.set_pipeline(frost);
-    for (bind, regions) in [(&small.binds[2], backdrop.regions), (&small.binds[0], backdrop.windows)] {
+    for (bind, regions, window) in [(&small.binds[2], backdrop.regions, 0.0), (&small.binds[0], backdrop.windows, 1.0)]
+    {
         pass.set_bind_group(0, bind, &[]);
         for &[x0, y0, x1, y1, corner, alpha] in regions {
             let usable = [x0, y0, x1, y1, corner, alpha].iter().all(|v| v.is_finite());
@@ -496,7 +532,7 @@ fn draw_glass(
             let offset = uniforms.push(&BackdropUniform {
                 v0: [x0, y0, x1, y1],
                 v1: [corner, tw, th, k],
-                v2: [alpha.min(1.0), 0.0, 0.0, 0.0],
+                v2: [alpha.min(1.0), window, 0.0, 0.0],
             });
             pass.set_bind_group(1, uniform_bind, &[offset]);
             pass.draw(0..6, 0..1);
@@ -561,6 +597,48 @@ pub struct Thumbnail {
     pub rgba: Vec<u8>,
 }
 
+/// A [`Thumbnail`] on its way back from the GPU: its copy is queued (under whatever lock guards
+/// the canvas), its pixels waited for later, the lock let go ([`PendingThumbnail::pixels`]).
+pub struct PendingThumbnail {
+    width: u32,
+    height: u32,
+    read: Readback,
+}
+
+impl PendingThumbnail {
+    /// The picture, once the GPU has copied it.
+    pub fn pixels(self) -> Result<Thumbnail, GpuError> {
+        Ok(Thumbnail { width: self.width, height: self.height, rgba: self.read.pixels()? })
+    }
+}
+
+/// A layer thumbnail begun ([`Canvas::start_layer_thumbnail`]): the picture already, or the coarse
+/// copy it is found in on its way back.
+pub enum LayerThumbnailStep {
+    Ready(Thumbnail),
+    Coarse { pending: PendingThumbnail, mask: bool },
+}
+
+/// A layer thumbnail's region on its way back ([`Canvas::start_layer_thumbnail_fine`]), and what
+/// to cut it to once it is.
+pub struct FineThumbnail {
+    pending: PendingThumbnail,
+    /// Cut to what is painted once back (a mask's ink, else coverage), or left whole.
+    cut_mask: Option<bool>,
+}
+
+impl FineThumbnail {
+    /// The thumbnail, once the GPU has copied its region: cut to what is painted in it.
+    pub fn pixels(self) -> Result<Thumbnail, GpuError> {
+        let fine = self.pending.pixels()?;
+        let painted = self.cut_mask.and_then(|mask| if mask { ink_bounds(&fine) } else { alpha_bounds(&fine) });
+        Ok(match painted {
+            Some(b) => crop(&fine, b),
+            None => fine,
+        })
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct StampInstance {
@@ -608,25 +686,30 @@ fn capped_alpha(style: &StrokeStyle, capped: bool, s: &Stamp) -> (f32, f32) {
     }
 }
 
-/// How far past its size a round tip reaches, by its hardness: (scale, growth) for its drawn
-/// radius, scale·r + growth. Measured for a hard tip (0.95: a stroke of diameter d is 0.971·d +
-/// 1.87 px across) and a medium hard one (0.75: 1.043·d + 1.44 px), whose soft rim builds up
-/// past the size along a stroke; between them in between, and no further either way.
-fn round_tip_reach(hardness: f32) -> (f32, f32) {
+/// How far past its size a round tip of radius `r` reaches, by its hardness: (scale, growth) for
+/// its drawn radius, scale·r + growth. Measured for a hard tip (0.95: a stroke of diameter d is
+/// 0.971·d + 1.87 px across) and a medium hard one (0.75: 1.043·d + 1.44 px), whose soft rim
+/// builds up past the size along a stroke; between them in between, and no further either way.
+/// Those were measured from 5 px across up. Below about 6 px a hard tip reaches less far, down to
+/// 0.55 of it for the least tip: a shape so small is laid on a quad only 0.71 px past it, from
+/// its coarsest image, so a thin line keeps close to its size (a medium hard tip's softer rim
+/// already does).
+fn round_tip_reach(hardness: f32, r: f32) -> (f32, f32) {
     let t = if hardness.is_finite() { ((hardness - 0.75) / 0.2).clamp(0.0, 1.0) } else { 1.0 };
-    (1.096 + (0.971 - 1.096) * t, 0.36 + (0.735 - 0.36) * t)
+    let small = 1.0 - t * (0.45 - 0.14 * r).max(0.0);
+    (1.096 + (0.971 - 1.096) * t, (0.36 + (0.735 - 0.36) * t) * small)
 }
 
 /// The radius a stamp of `radius` is drawn at in `style`, thinned `taper` of the way by a taper
 /// (the round tip's rim with it: measured, a taper narrows a thin brush and a wide one to the same
-/// shares of their widths).
+/// shares of their widths, so its reach goes by the stamp's size before the taper).
 fn drawn_radius(style: &StrokeStyle, radius: f32, taper: f32) -> f32 {
     let r = radius.max(0.0);
     if style.shape.is_some() || r <= 0.0 {
         return r;
     }
-    let (scale, growth) = round_tip_reach(style.hardness);
     let taper = if taper.is_finite() { taper.clamp(0.0, 1.0) } else { 1.0 };
+    let (scale, growth) = round_tip_reach(style.hardness, if taper > 0.0 { r / taper } else { r });
     r * scale + growth * taper
 }
 
@@ -709,6 +792,10 @@ struct LayerUniform {
     clip_masked: f32,
     /// Pixels a side of the image the grain is read from.
     grain_side: f32,
+    /// How many of this canvas's pixels a pixel of the canvas strokes are given in takes, and
+    /// where its top left is in those (see [`Canvas::draw_scaled`]): what grain fixed to the
+    /// canvas is read by.
+    scaled: [f32; 4],
 }
 
 impl Default for LayerUniform {
@@ -740,6 +827,7 @@ impl Default for LayerUniform {
             dual_threshold: -1.0,
             clip_masked: 0.0,
             grain_side: TEXTURE_SIZE as f32,
+            scaled: [1.0, 0.0, 0.0, 0.0],
         }
     }
 }
@@ -797,6 +885,9 @@ struct DisplayUniform {
     c0: [f32; 4],
     c1: [f32; 4],
     c2: [f32; 4],
+    /// How far the quad reaches past the canvas's sides (its 0..1 across and down), then 1 to
+    /// smooth the edge over that; all 0 for a quad drawn exactly.
+    edge: [f32; 4],
 }
 
 impl DisplayUniform {
@@ -806,10 +897,62 @@ impl DisplayUniform {
         let row = |r: [f32; 3], on: f32| [r[0], r[1], r[2], on];
         let table = if lut { 1.0 } else { 0.0 };
         match convert.filter(|_| !lut) {
-            Some([r0, r1, r2]) => DisplayUniform { m0, m1, c0: row(r0, 1.0), c1: row(r1, 0.0), c2: row(r2, 0.0) },
-            None => DisplayUniform { m0, m1, c0: [0.0; 4], c1: [0.0, 0.0, 0.0, table], c2: [0.0; 4] },
+            Some([r0, r1, r2]) => {
+                DisplayUniform { m0, m1, c0: row(r0, 1.0), c1: row(r1, 0.0), c2: row(r2, 0.0), edge: [0.0; 4] }
+            }
+            None => DisplayUniform { m0, m1, c0: [0.0; 4], c1: [0.0, 0.0, 0.0, table], c2: [0.0; 4], edge: [0.0; 4] },
         }
     }
+
+    /// With the canvas's edge smoothed, for the map `m` (the unit square to clip space) onto a
+    /// target `size` pixels: the quad reaches a target pixel past each side, and each pixel along
+    /// the edge shows as much of the canvas as covers it, not all or none (steps along a turned
+    /// canvas's sides).
+    fn smoothed(mut self, m: &Affine, size: (f32, f32)) -> DisplayUniform {
+        let across = (m.a * size.0 / 2.0).hypot(m.b * size.1 / 2.0);
+        let down = (m.c * size.0 / 2.0).hypot(m.d * size.1 / 2.0);
+        if across.is_finite() && down.is_finite() && across > 0.0 && down > 0.0 {
+            self.edge = [1.0 / across, 1.0 / down, 1.0, 0.0];
+        }
+        self
+    }
+}
+
+/// The most points a veil's hole has (see [`Canvas::veil_hole`]).
+pub const VEIL_POINTS: usize = 64;
+
+/// What the veil's shader is told: its rectangle on the canvas (left, top, width, height), the
+/// colour round the canvas as the target takes it and how many points the hole has, and the
+/// hole's outline (two points an entry), canvas pixels.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct VeilUniform {
+    rect: [f32; 4],
+    surround: [f32; 4],
+    points: [[f32; 4]; VEIL_POINTS / 2],
+}
+
+/// Part of the composite as it was before a change, drawn over the canvas but for a hole that
+/// grows: the change shown spreading in from a point (see [`Canvas::veil_begin`]).
+struct Veil {
+    rect: IRect,
+    /// Its picture, as it is shown smoothed or crisp (see [`Target::crisp_from`]).
+    _texture: wgpu::Texture,
+    bind: wgpu::BindGroup,
+    crisp: wgpu::BindGroup,
+    uniform: wgpu::Buffer,
+    uniform_bind: wgpu::BindGroup,
+    /// The hole this frame, canvas pixels.
+    hole: Vec<[f32; 2]>,
+}
+
+/// Part of the canvas drawn again at the target's resolution, shown over it in its place (see
+/// [`Canvas::set_sharp`]).
+struct Sharp {
+    /// Where on the canvas: left, top, width, height (canvas pixels, fractions allowed).
+    rect: [f32; 4],
+    _texture: wgpu::Texture,
+    bind: wgpu::BindGroup,
 }
 
 /// An encoded colour moved by a linear-light matrix (clipped), as the display shader does.
@@ -1237,6 +1380,8 @@ struct ActiveStroke {
     pencil: bool,
     /// A dual brush's second stroke, if it has one.
     second: Option<SecondStroke>,
+    /// Lays its pixels only within this (see [`Canvas::lay_within`]).
+    within: Option<IRect>,
 }
 
 /// A dual brush's second stroke, drawn along the open stroke's path into a texture of its own
@@ -1365,6 +1510,8 @@ enum Op {
     Flip {
         layers: Vec<LayerId>,
         horizontal: bool,
+        /// The document as it was, when that changed too.
+        before: Option<Box<Document>>,
     },
     /// Layers' pixels are replaced inside a rectangle each (premultiplied RGBA8, the rectangle's
     /// rows), together as one undo step keeping those rectangles, with the document as it was
@@ -1375,6 +1522,24 @@ enum Op {
     },
     /// A layer's pixels are replaced with no undo step (during an edit held with `Hold`).
     Put(LayerId, Vec<u8>),
+    /// Pixels laid over part of a layer (premultiplied RGBA8, `rect`'s rows), source over, as one
+    /// undo step keeping what was there.
+    Over {
+        layer: LayerId,
+        rect: IRect,
+        /// What of it is laid (within `rect`).
+        within: IRect,
+        pixels: Vec<u8>,
+    },
+    /// A layer redrawn with no undo step from another canvas's layer (`source`, `size` pixels),
+    /// each pixel from where `to_source` (3 × 3, rows) takes it there, filtered so.
+    RedrawFrom {
+        layer: LayerId,
+        source: wgpu::TextureView,
+        size: (u32, u32),
+        to_source: [f32; 9],
+        resample: Resample,
+    },
     /// Part of a layer's pixels replaced so: the rectangle at (`x`, `y`), `width` x `height`.
     PutRegion {
         layer: LayerId,
@@ -1386,6 +1551,9 @@ enum Op {
     },
     /// A layer's pixels are set aside: what an edit made of many changes goes back to.
     Hold(LayerId),
+    /// While the layer held stays held, its changes make no steps of their own (its one step is
+    /// made as it is released).
+    HoldQuietly,
     /// The held pixels, and the document as it was (`before`), become one undo step (`keep`), or
     /// the pixels are put back.
     Release {
@@ -1701,6 +1869,13 @@ pub(crate) struct Pipelines {
     overlay_module: wgpu::ShaderModule,
     /// Frosted panels: the blur passes and the regions drawn.
     backdrop_module: wgpu::ShaderModule,
+    /// A veil over the canvas (see [`Canvas::veil_begin`]): its uniform, and the display's
+    /// groups with it.
+    veil_layout: wgpu::BindGroupLayout,
+    veil_pipeline_layout: wgpu::PipelineLayout,
+    /// The pipeline cache they are made with, kept between runs (see `kept`): the screen's
+    /// pipelines, made as a window first shows a canvas, as well.
+    cache: Option<wgpu::PipelineCache>,
 }
 
 /// A canvas's own pipelines for drawing to a window, made for each target format as it comes.
@@ -1713,9 +1888,12 @@ struct ScreenPipelines {
     selection: HashMap<(wgpu::TextureFormat, bool), wgpu::RenderPipeline>,
     blur: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     frost: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
+    veil: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
 }
 
 pub struct Canvas {
+    /// Its own among the canvases made while the app runs.
+    id: u64,
     width: u32,
     height: u32,
     pipelines: std::sync::Arc<Pipelines>,
@@ -1783,6 +1961,8 @@ pub struct Canvas {
     /// Where an adjustment is painted on (Pencil), instead of everywhere the selection takes.
     pencil: Option<PencilMask>,
     liquify: Option<LiquifyField>,
+    /// An adjustment leaves the layer's alpha as it is (the layer's Alpha Lock).
+    filter_keeps_alpha: bool,
     /// The curves or gradient adjustments read (256 RGBA8 entries).
     table: wgpu::Texture,
     table_view: wgpu::TextureView,
@@ -1805,6 +1985,8 @@ pub struct Canvas {
     stamp_capacity: u64,
     /// The most stamps' work sent to the GPU as one piece (see [`WORK_AT_ONCE`]).
     work_at_once: u64,
+    /// The most stamps one render uploads (see [`STAMPS_AT_ONCE`]).
+    stamps_at_once: u64,
     /// Pieces of work sent early, there being too much for one.
     pieces_sent: u64,
     /// How the last plugin filter's draw went, not yet asked for.
@@ -1817,8 +1999,13 @@ pub struct Canvas {
     /// until it ends. And whether that is still to be told.
     smudge_refused: bool,
     smudge_untold: bool,
-    /// A layer's pixels set aside by [`Canvas::hold_layer`].
+    /// A layer's pixels set aside by [`Canvas::hold_layer`], and whether its changes meanwhile make
+    /// no steps of their own ([`Canvas::hold_layer_quietly`]).
     held: Option<Snapshot>,
+    held_quietly: bool,
+    /// Part of the composite kept as it was, drawn over the canvas but for a hole (see
+    /// [`Canvas::veil_begin`]).
+    veil: Option<Veil>,
     /// Counts the undo steps ever made, so that a change since some moment shows.
     steps_made: u64,
     /// The steps made when [`Canvas::mark_steps`] was last done.
@@ -1827,6 +2014,18 @@ pub struct Canvas {
     next_name: Option<String>,
     /// Where the next stroke committed changes pixels, if known more closely than its bounds.
     within: Option<Vec<IRect>>,
+    /// Where strokes begun from now on lay their pixels, when only part of a layer is laid again
+    /// (see [`Canvas::lay_within`]).
+    lay_within: Option<IRect>,
+    /// Strokes begun from now on are only measured (see [`Canvas::measure`]).
+    measuring: bool,
+    /// Where the stroke ended last reached, and whether it changed its layer as it went.
+    last_ended: Option<(IRect, bool)>,
+    /// Strokes are given in another canvas's pixels, drawn here this many times as big, from this
+    /// point of those at the top left (see [`Canvas::draw_scaled`]).
+    scaled: Option<([f32; 2], f32)>,
+    /// Part of the canvas drawn again sharper, shown over it in its place.
+    sharp: Option<Sharp>,
     smudge_params: wgpu::Buffer,
     smudge_capacity: u64,
     /// The passes of wet paint a render lays (see [`WetPass`]), and how many it holds.
@@ -2080,6 +2279,7 @@ impl Canvas {
         let stamp_capacity = 4096;
         let stamp_buffer = stamp_buffer(device, stamp_capacity);
         let canvas = Canvas {
+            id: NEXT_CANVAS.fetch_add(1, Ordering::Relaxed),
             width,
             height,
             pipelines,
@@ -2109,6 +2309,7 @@ impl Canvas {
             everything,
             pencil: None,
             liquify: None,
+            filter_keeps_alpha: false,
             table,
             table_view,
             selection: None,
@@ -2124,6 +2325,7 @@ impl Canvas {
             stamp_buffer,
             stamp_capacity,
             work_at_once: WORK_AT_ONCE,
+            stamps_at_once: STAMPS_AT_ONCE,
             pieces_sent: 0,
             filter_run: None,
             composites: 0,
@@ -2132,10 +2334,17 @@ impl Canvas {
             smudge_refused: false,
             smudge_untold: false,
             held: None,
+            held_quietly: false,
+            veil: None,
             steps_made: 0,
             mark: None,
             next_name: None,
             within: None,
+            lay_within: None,
+            measuring: false,
+            last_ended: None,
+            scaled: None,
+            sharp: None,
             smudge_params: smudge_params(device, 64),
             smudge_spare: [spare_buffer(device), spare_buffer(device)],
             smudge_capacity: 64,
@@ -2178,6 +2387,12 @@ impl Canvas {
 
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    /// Its own among the canvases made while the app runs: what was known of another's layers
+    /// isn't taken for its own.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// Points `style` at `brush`'s own shape and grain images, if it has them, putting them in
@@ -2479,7 +2694,8 @@ impl Canvas {
     pub fn begin_stroke(&mut self, layer: LayerId, style: StrokeStyle) {
         self.end_stroke();
         self.prediction.clear();
-        self.active = Some(ActiveStroke { layer, style, bounds: IRect::EMPTY, pencil: false, second: None });
+        let within = self.lay_within;
+        self.active = Some(ActiveStroke { layer, style, bounds: IRect::EMPTY, pencil: false, second: None, within });
     }
 
     /// Begins a stroke as [`Canvas::begin_stroke`] does, with a dual brush's second (its stamps
@@ -2489,7 +2705,9 @@ impl Canvas {
         if let Some(active) = self.active.as_mut() {
             active.second = Some(second);
         }
-        self.ops.push(Op::ClearSecond(second));
+        if !self.measuring {
+            self.ops.push(Op::ClearSecond(second));
+        }
     }
 
     /// Draws more of the open stroke's second.
@@ -2573,8 +2791,9 @@ impl Canvas {
             return;
         }
         let at = self.ops.len();
+        // (measured, it counts where the stroke reaches, as drawn)
         let bounds = self.push_stamps(stamps, false);
-        if bounds.is_empty() {
+        if bounds.is_empty() || self.measuring {
             return;
         }
         self.ops.insert(at, Op::SaveTip(bounds));
@@ -2596,17 +2815,52 @@ impl Canvas {
 
     /// As [`Canvas::push_stamps`], into the open stroke's second if `second` (none without one).
     fn push_stamps_to(&mut self, stamps: &[Stamp], clear: bool, second: bool) -> IRect {
+        // given in another canvas's pixels: drawn here as much bigger
+        let mapped: Vec<Stamp>;
+        let stamps = match self.scaled {
+            Some((origin, k)) => {
+                mapped = stamps.iter().map(|s| scaled_stamp(s, origin, k)).collect();
+                &mapped[..]
+            }
+            None => stamps,
+        };
         let full = self.full();
         let Some(active) = self.active.as_mut() else { return IRect::EMPTY };
-        let mut bounds = IRect::EMPTY;
         let style = match (second, active.second) {
             (false, _) => active.style,
             (true, Some(s)) => s.style,
             (true, None) => return IRect::EMPTY,
         };
         let capped = self.pipelines.stamp_capped.is_some();
+        let scale = self.scaled.map(|(_, k)| k);
+        let drawn_at = |s: &Stamp| {
+            let radius = drawn_radius(&style, s.radius, s.taper);
+            scale.map_or(radius, |k| scaled_radius(&style, radius, k))
+        };
+        let reach = |s: &Stamp| {
+            let radius = drawn_at(s);
+            let tall = if s.roundness.is_finite() { s.roundness.clamp(1.0, MOST_ROUNDNESS) } else { 1.0 };
+            IRect::around(s.center, radius * tall * std::f32::consts::SQRT_2)
+        };
         let drawn: Vec<&Stamp> =
             stamps.iter().filter(|s| s.center.is_finite() && s.radius.is_finite() && s.alpha.is_finite()).collect();
+        // where all of them reach, though only those reaching where the stroke is laid are drawn
+        // (each pixel built up from its own stamps alone: never a stroke laid in place)
+        let bounds = drawn.iter().fold(IRect::EMPTY, |b, s| b.union(reach(s))).intersect(full);
+        let within = active.within.filter(|_| !style.in_place());
+        let drawn: Vec<&Stamp> =
+            drawn.into_iter().filter(|s| within.is_none_or(|w| !reach(s).intersect(w).is_empty())).collect();
+        if clear && !second {
+            if !self.measuring {
+                self.dirty = self.dirty.union(active.bounds);
+            }
+            active.bounds = bounds;
+        } else {
+            active.bounds = active.bounds.union(bounds);
+        }
+        if self.measuring {
+            return bounds;
+        }
         let wet: Vec<[f32; 8]> =
             drawn.iter().map(|s| s.wet.map(|v| if v.is_finite() { v.clamp(0.0, 1.0) } else { 1.0 })).collect();
         let times: Vec<Paced> = drawn
@@ -2619,9 +2873,7 @@ impl Canvas {
         let instances: Vec<StampInstance> = drawn
             .iter()
             .map(|s| {
-                let radius = drawn_radius(&style, s.radius, s.taper);
-                let tall = if s.roundness.is_finite() { s.roundness.clamp(1.0, MOST_ROUNDNESS) } else { 1.0 };
-                bounds = bounds.union(IRect::around(s.center, radius * tall * std::f32::consts::SQRT_2));
+                let radius = drawn_at(s);
                 // without the capped pipeline, the transfer goes into the stamp
                 let (alpha, transfer) = capped_alpha(&style, capped, s);
                 StampInstance {
@@ -2647,13 +2899,6 @@ impl Canvas {
                 }
             })
             .collect();
-        let bounds = bounds.intersect(full);
-        if clear && !second {
-            self.dirty = self.dirty.union(active.bounds);
-            active.bounds = bounds;
-        } else {
-            active.bounds = active.bounds.union(bounds);
-        }
         self.dirty = self.dirty.union(bounds);
         if !instances.is_empty() || clear {
             let pencil = active.pencil;
@@ -2716,8 +2961,130 @@ impl Canvas {
         self.prediction.clear();
         self.untip();
         if let Some(active) = self.active.take() {
-            self.ops.push(Op::Commit(active));
+            self.last_ended = Some((active.bounds, active.style.in_place()));
+            if !self.measuring {
+                self.ops.push(Op::Commit(active));
+            }
         }
+    }
+
+    /// Strokes begun from now on lay their pixels only within `rect` (none: wherever they reach),
+    /// for part of a layer laid again: what they reach outside it is left as it is, and their stamps
+    /// there aren't drawn. A stroke laid in place (smudging, painting wet) isn't held to it.
+    pub fn lay_within(&mut self, rect: Option<IRect>) {
+        self.lay_within = rect;
+    }
+
+    /// With `on`, strokes begun from now on are only measured: where each would reach is found
+    /// ([`Canvas::last_stroke`] as it ends) and nothing is drawn or kept. Without, they are drawn
+    /// again.
+    pub fn measure(&mut self, on: bool) {
+        self.prediction.clear();
+        self.measuring = on;
+    }
+
+    /// Where the stroke ended last reached (all of it, wherever [`Canvas::lay_within`] laid it),
+    /// and whether it changed its layer as it went (smudging, painting wet); none before any.
+    pub fn last_stroke(&self) -> Option<(IRect, bool)> {
+        self.last_ended
+    }
+
+    /// Lays `pixels` (premultiplied RGBA8, the rows of `rect`) over `layer` there, source over, as a
+    /// stroke is laid: one undo step keeping what was there. Only within the rectangle
+    /// [`Canvas::lay_within`] says, if it says one; nothing while measuring (see
+    /// [`Canvas::measure`]). Pixels of the wrong size are left out.
+    pub fn lay_over(&mut self, layer: LayerId, rect: IRect, pixels: Vec<u8>) {
+        if self.measuring || rect.is_empty() || pixels.len() != rect.width() as usize * rect.height() as usize * 4 {
+            return;
+        }
+        self.end_stroke();
+        let within = self.lay_within.map_or(rect, |w| rect.intersect(w));
+        if within.is_empty() {
+            return;
+        }
+        self.ops.push(Op::Over { layer, rect, within, pixels });
+    }
+
+    /// Whether strokes are only being measured (see [`Canvas::measure`]).
+    pub fn measuring(&self) -> bool {
+        self.measuring
+    }
+
+    /// Strokes given from now on are in another canvas's pixels, `scale` of this one's each, the
+    /// point `origin` of those at this one's top left: drawn here as much bigger (their stamps,
+    /// their moving grain and the grain fixed to the canvas with them), for part of that canvas
+    /// drawn sharper.
+    pub fn draw_scaled(&mut self, origin: [f32; 2], scale: f32) {
+        let ok = origin.iter().all(|v| v.is_finite()) && scale.is_finite() && scale > 0.0;
+        self.scaled = ok.then_some((origin, scale));
+    }
+
+    /// Redraws `layer` from another canvas's layer `source` (`size` pixels, premultiplied), each
+    /// pixel here from where `to_source` takes it there (pixel middles at halves), filtered as
+    /// `resample` says; no undo step.
+    pub fn redraw_from(
+        &mut self,
+        layer: LayerId,
+        source: wgpu::TextureView,
+        size: (u32, u32),
+        to_source: Affine,
+        resample: Resample,
+    ) {
+        let t = to_source;
+        let to_source = [t.a, t.c, t.e, t.b, t.d, t.f, 0.0, 0.0, 1.0];
+        self.ops.push(Op::RedrawFrom { layer, source, size, to_source, resample });
+    }
+
+    /// Layer `layer`'s pixels for another canvas to read (see [`Canvas::redraw_from`]), as they are
+    /// once the work queued is done (done here), given their texture again if they were put away.
+    pub fn layer_to_read(&mut self, gpu: &Gpu, doc: &mut Document, layer: LayerId) -> Option<wgpu::TextureView> {
+        self.render(gpu, doc, None);
+        if !self.layers.contains_key(&layer) {
+            self.restore(gpu, layer);
+        }
+        self.layers.get(&layer).map(|l| l.view.clone())
+    }
+
+    /// Shows `picture` (its top left `size` pixels, premultiplied, as composited) over the canvas
+    /// rectangle `rect` (left, top, width, height in canvas pixels, fractions allowed) in place of
+    /// the canvas there: part of it drawn again at the target's resolution, copied now. None takes
+    /// it away.
+    pub fn set_sharp(&mut self, gpu: &Gpu, picture: Option<(&wgpu::Texture, (u32, u32), [f32; 4])>) {
+        self.sharp = None;
+        let Some((source, (w, h), rect)) = picture else { return };
+        let fits = w > 0 && h > 0 && w <= source.width() && h <= source.height();
+        if !fits || !rect.iter().all(|v| v.is_finite()) || rect[2] <= 0.0 || rect[3] <= 0.0 {
+            return;
+        }
+        let device = &gpu.device;
+        let texture = texture(device, "sharp", w, h, LAYER_FORMAT);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("sharp") });
+        encoder.copy_texture_to_texture(copy_at(source, 0, 0), copy_at(&texture, 0, 0), extent(w, h));
+        gpu.queue.submit([encoder.finish()]);
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind = sampled_bind(device, &self.pipelines.sampled_layout, &view, &self.sampler);
+        self.sharp = Some(Sharp { rect, _texture: texture, bind });
+    }
+
+    /// The composite's texture (see [`Canvas::composite_view`]).
+    pub fn composite_texture(&self) -> &wgpu::Texture {
+        &self.composite
+    }
+
+    /// Whether work is queued, or the picture is to be composited again: what shows is about to
+    /// change.
+    pub fn changes_queued(&self) -> bool {
+        !self.ops.is_empty() || !self.dirty.is_empty() || self.active.is_some()
+    }
+
+    /// Whether part of the canvas shows drawn again sharper (see [`Canvas::set_sharp`]).
+    pub fn shows_sharp(&self) -> bool {
+        self.sharp.is_some()
+    }
+
+    /// Whether work queued and not yet done changes `layer`'s pixels (a stroke open on it counts).
+    pub fn writes_queued(&self, layer: LayerId) -> bool {
+        self.ops_layers().1.contains(&layer)
     }
 
     /// Ends the open stroke as [`Canvas::end_stroke`] does, knowing that it changes pixels only
@@ -2739,6 +3106,17 @@ impl Canvas {
         self.work_at_once = work;
     }
 
+    /// Uploads at most this many stamps in a render, in place of [`STAMPS_AT_ONCE`]: for tests.
+    #[doc(hidden)]
+    pub fn set_stamps_at_once(&mut self, stamps: u64) {
+        self.stamps_at_once = stamps.max(1);
+    }
+
+    /// The most stamps one buffer of this device holds.
+    fn stamps_in_a_buffer(device: &wgpu::Device) -> u64 {
+        (device.limits().max_buffer_size / size_of::<StampInstance>() as u64).max(1)
+    }
+
     /// How many pieces of work were sent early, there being too much for one: for tests.
     #[doc(hidden)]
     pub fn pieces_sent(&self) -> u64 {
@@ -2754,7 +3132,9 @@ impl Canvas {
     pub fn cancel_stroke(&mut self) {
         self.prediction.clear();
         self.tip = None;
-        if let Some(active) = self.active.take() {
+        if let Some(active) = self.active.take()
+            && !self.measuring
+        {
             self.dirty = self.dirty.union(active.bounds);
             self.ops.push(Op::Cancel);
         }
@@ -2833,11 +3213,111 @@ impl Canvas {
         self.ops.push(Op::Hold(layer));
     }
 
+    /// Sets a layer's pixels aside as [`Canvas::hold_layer`] does, for an edit made of strokes and
+    /// clearing (laying a layer's strokes again, say): until [`Canvas::release_layer`], what changes
+    /// it makes no undo step of its own, so the edit keeps one copy of the layer, not one for each.
+    pub fn hold_layer_quietly(&mut self, layer: LayerId) {
+        self.hold_layer(layer);
+        self.ops.push(Op::HoldQuietly);
+    }
+
     /// Ends a held edit: `keep` makes it one undo step back to the held pixels and `before` (the
     /// document as the edit began); otherwise the held pixels are put back.
     pub fn release_layer(&mut self, keep: bool, before: Option<Document>) {
         self.ops.push(Op::Release { keep, before: before.map(Box::new) });
         self.invalidate();
+    }
+
+    /// Keeps the composite inside `rect` as it is now (copied at once, before any work still
+    /// queued), to show over the canvas but for a hole given each frame ([`Canvas::veil_hole`]),
+    /// until [`Canvas::veil_end`]: a change queued after this then shows only through the hole.
+    /// Kept at `scale` target pixels to a canvas pixel where that is under one (box-filtered), so
+    /// a large canvas zoomed out keeps no more than the screen shows. A veil already kept goes;
+    /// nothing is kept for a rectangle off the canvas.
+    pub fn veil_begin(&mut self, gpu: &Gpu, rect: IRect, scale: f32) {
+        self.veil = None;
+        let rect = rect.intersect(self.full());
+        if rect.is_empty() {
+            return;
+        }
+        let device = &gpu.device;
+        let scale = if scale.is_finite() { scale.clamp(1e-3, 1.0) } else { 1.0 };
+        let (rw, rh) = (rect.width(), rect.height());
+        let fit = |side: u32| ((side as f32 * scale).ceil() as u32).clamp(1, side);
+        let (w, h) = (fit(rw), fit(rh));
+        let texture = texture(device, "veil", w, h, LAYER_FORMAT);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("veil") });
+        if (w, h) == (rw, rh) {
+            encoder.copy_texture_to_texture(
+                copy_at(&self.composite, rect.x0, rect.y0),
+                copy_at(&texture, 0, 0),
+                extent(rw, rh),
+            );
+        } else {
+            // box-filtered down, as a thumbnail is
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind = sampled_bind(device, &self.pipelines.sampled_layout, &self.composite_view, &self.sampler);
+            let mut data = UniformData::default();
+            let (cw, ch) = (self.width.max(1) as f32, self.height.max(1) as f32);
+            let (fw, fh) = (rw as f32, rh as f32);
+            let offset = data.push(&DisplayUniform::new(
+                [w as f32, h as f32, fw / w as f32, fh / h as f32],
+                [rect.x0 as f32 / cw, rect.y0 as f32 / ch, fw / cw, fh / ch],
+                None,
+                false,
+            ));
+            {
+                let mut pass = render_pass(&mut encoder, "veil", &view, wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT));
+                pass.set_pipeline(&self.pipelines.thumb);
+                pass.set_bind_group(0, &bind, &[]);
+                pass.set_bind_group(1, &self.uniform_bind, &[offset]);
+                pass.draw(0..3, 0..1);
+            }
+            self.write_uniforms(gpu, &data);
+        }
+        gpu.queue.submit([encoder.finish()]);
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let crisp_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("veil crisp"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let layout = &self.pipelines.sampled_layout;
+        let bind = sampled_bind(device, layout, &view, &self.sampler);
+        let crisp = sampled_bind(device, layout, &view, &crisp_sampler);
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("veil"),
+            size: size_of::<VeilUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let uniform_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("veil"),
+            layout: &self.pipelines.veil_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() }],
+        });
+        self.veil = Some(Veil { rect, _texture: texture, bind, crisp, uniform, uniform_bind, hole: Vec::new() });
+    }
+
+    /// The veil's hole from now on: a closed outline in canvas pixels, its first
+    /// [`VEIL_POINTS`] points (fewer than three: no hole). Where the hole is the canvas shows as
+    /// it is now.
+    pub fn veil_hole(&mut self, hole: &[[f32; 2]]) {
+        if let Some(veil) = self.veil.as_mut() {
+            veil.hole.clear();
+            veil.hole.extend(hole.iter().take(VEIL_POINTS).filter(|p| p[0].is_finite() && p[1].is_finite()));
+        }
+    }
+
+    /// The veil goes: the canvas shows as it is.
+    pub fn veil_end(&mut self) {
+        self.veil = None;
+    }
+
+    /// The rectangle a veil is kept for, while there is one.
+    pub fn veil_rect(&self) -> Option<IRect> {
+        self.veil.as_ref().map(|v| v.rect)
     }
 
     /// Replaces a layer's pixels inside `rect` with `part` (premultiplied RGBA8, the rectangle's
@@ -2856,7 +3336,15 @@ impl Canvas {
     /// GPU, nothing read back.
     pub fn flip_layers(&mut self, layers: Vec<LayerId>, horizontal: bool) {
         self.end_stroke();
-        self.ops.push(Op::Flip { layers, horizontal });
+        self.ops.push(Op::Flip { layers, horizontal, before: None });
+    }
+
+    /// [`Canvas::flip_layers`], changing the document together: one undo step back to the layers
+    /// as they were and to `before` (the document as it was).
+    pub fn flip_layers_and_document(&mut self, layers: Vec<LayerId>, horizontal: bool, before: Document) {
+        self.end_stroke();
+        self.ops.push(Op::Flip { layers, horizontal, before: Some(Box::new(before)) });
+        self.invalidate();
     }
 
     /// Replaces several layers' pixels at once, as one undo step; pictures of the wrong size are
@@ -3183,6 +3671,8 @@ impl Canvas {
                 | Op::TransformAlso(id)
                 | Op::Put(id, _)
                 | Op::PutRegion { layer: id, .. }
+                | Op::RedrawFrom { layer: id, .. }
+                | Op::Over { layer: id, .. }
                 | Op::Hold(id) => written.push(*id),
                 Op::Write { layers, .. } => written.extend(layers.iter().map(|(id, ..)| *id)),
                 Op::Flip { layers, .. } => written.extend(layers.iter().copied()),
@@ -3508,7 +3998,8 @@ impl Canvas {
     pub fn begin_pencil_stroke(&mut self, layer: LayerId, style: StrokeStyle) {
         self.end_stroke();
         self.prediction.clear();
-        self.active = Some(ActiveStroke { layer, style, bounds: IRect::EMPTY, pencil: true, second: None });
+        self.active =
+            Some(ActiveStroke { layer, style, bounds: IRect::EMPTY, pencil: true, second: None, within: None });
     }
 
     /// A step of the liquify brush: `stamps` added up, then the field carried along by them.
@@ -3604,6 +4095,11 @@ impl Canvas {
         self.replace_placement(Op::FilterSet(filter));
     }
 
+    /// Whether adjustments leave the layer's alpha as it is, as its Alpha Lock asks.
+    pub fn set_filter_keeps_alpha(&mut self, on: bool) {
+        self.filter_keeps_alpha = on;
+    }
+
     /// Queues a redraw of the layer being transformed; only the latest needs drawing.
     fn replace_placement(&mut self, op: Op) {
         if let Some(Op::TransformSet { .. } | Op::TransformMesh { .. } | Op::FilterSet(_) | Op::PluginFilter(_)) =
@@ -3661,7 +4157,13 @@ impl Canvas {
                 }
                 Op::Write { layers, .. } => ids.extend(layers.iter().map(|(id, ..)| *id)),
                 Op::Flip { layers, .. } => ids.extend(layers.iter().copied()),
-                Op::Put(id, _) | Op::PutRegion { layer: id, .. } | Op::Hold(id) => ids.push(*id),
+                Op::Put(id, _)
+                | Op::PutRegion { layer: id, .. }
+                | Op::Hold(id)
+                | Op::RedrawFrom { layer: id, .. }
+                | Op::Over { layer: id, .. } => {
+                    ids.push(*id);
+                }
                 Op::Release { before: Some(d), .. } => ids.extend(d.pixel_layer_ids()),
                 _ => {}
             }
@@ -3765,7 +4267,28 @@ impl Canvas {
         });
         let depth = flattening.max().unwrap_or(0);
         self.make_groups(device, depth);
-        let ops = in_pieces(without_passing_tips(std::mem::take(&mut self.ops)), self.full(), self.work_at_once);
+        // no more stamps than one upload takes (room left for the predicted tail): the rest wait for
+        // a render after this one's
+        let most_stamps = self.stamps_at_once.min(Self::stamps_in_a_buffer(device) / 2).max(1);
+        let ops =
+            in_pieces(without_passing_tips(std::mem::take(&mut self.ops)), self.full(), self.work_at_once, most_stamps);
+        let (ops, held_back) = {
+            let (mut taken, mut count) = (Vec::with_capacity(ops.len()), 0u64);
+            let mut ops = ops.into_iter();
+            let mut held_back = false;
+            while let Some(op) = ops.next() {
+                let n = if let Op::Stamps { instances, .. } = &op { instances.len() as u64 } else { 0 };
+                if count > 0 && count.saturating_add(n) > most_stamps {
+                    let rest: Vec<Op> = std::iter::once(op).chain(ops.by_ref()).collect();
+                    self.ops.splice(0..0, rest);
+                    held_back = true;
+                    break;
+                }
+                count = count.saturating_add(n);
+                taken.push(op);
+            }
+            (taken, held_back)
+        };
 
         // this frame's stamps in one upload
         let mut instances: Vec<StampInstance> = Vec::new();
@@ -3782,7 +4305,8 @@ impl Canvas {
         let predicted = predicted_first..u32::try_from(instances.len()).unwrap_or(u32::MAX);
         let needed = instances.len() as u64;
         if needed > self.stamp_capacity {
-            self.stamp_capacity = needed.next_power_of_two();
+            // doubled for the strokes to come, as far as a buffer goes
+            self.stamp_capacity = needed.next_power_of_two().min(Self::stamps_in_a_buffer(device)).max(needed);
             self.stamp_buffer = stamp_buffer(device, self.stamp_capacity);
         }
         if !instances.is_empty() {
@@ -3794,7 +4318,8 @@ impl Canvas {
         // remaking the caches composites the layers once more
         let cached = if self.cache_composites { doc.layers().len() + 2 } else { 0 };
         let worked: usize = ops.iter().map(|op| self.slots_for(op, &ops)).sum();
-        let slots = (worked + doc.layers().len() + 4 + frosted + cached) as u64;
+        let veiled = usize::from(self.veil.is_some());
+        let slots = (worked + doc.layers().len() + 4 + veiled + frosted + cached) as u64;
         if slots > self.uniform_slots {
             self.uniform_slots = slots.next_power_of_two();
             let (buffer, bind) = uniforms(device, &self.pipelines.uniform_layout, self.uniform_slots);
@@ -3837,7 +4362,7 @@ impl Canvas {
         // the layers a stroke was put into in this render's work so far, and whether the rest of
         // the work waits for a render of its own
         let mut committed: Vec<LayerId> = Vec::new();
-        let mut deferred = false;
+        let mut deferred = held_back;
         // stamps' work recorded and not sent yet
         let mut recorded = 0u64;
         let mut ops = ops.into_iter();
@@ -4110,6 +4635,121 @@ impl Canvas {
                     self.dirty = full;
                     history_changed = true;
                 }
+                Op::Over { layer: id, rect, within, pixels } => {
+                    let full = self.full();
+                    let kept = within.intersect(rect).intersect(full);
+                    if !kept.is_empty()
+                        && self.layers.contains_key(&id)
+                        && let Some(snapshot) = self.snapshot(device, &mut encoder, id, kept)
+                    {
+                        self.push_step(Step {
+                            made: 0,
+                            name: None,
+                            doc: None,
+                            pixels: vec![snapshot],
+                            selection: None,
+                            flip: None,
+                        });
+                        let (w, h) = (rect.width(), rect.height());
+                        let source = device.create_texture(&wgpu::TextureDescriptor {
+                            label: Some("laid over"),
+                            size: extent(w, h),
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: LAYER_FORMAT,
+                            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                            view_formats: &[],
+                        });
+                        gpu.queue.write_texture(
+                            source.as_image_copy(),
+                            &pixels,
+                            wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(w * 4),
+                                rows_per_image: Some(h),
+                            },
+                            extent(w, h),
+                        );
+                        let view = source.create_view(&wgpu::TextureViewDescriptor::default());
+                        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("laid over"),
+                            layout: &self.pipelines.transform_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: wgpu::BindingResource::TextureView(&view),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: wgpu::BindingResource::TextureView(&self.everything),
+                                },
+                            ],
+                        });
+                        // each pixel from the same one of the picture, nearest
+                        let (x, y) = (rect.x0 as f32, rect.y0 as f32);
+                        let offset = uniforms.push(&TransformUniform {
+                            r0: [1.0, 0.0, -x, 0.0],
+                            r1: [0.0, 1.0, -y, 0.0],
+                            r2: [0.0, 0.0, 1.0, 0.0],
+                            p: [0.0, w as f32, h as f32, 0.0],
+                        });
+                        if let Some(layer) = self.layers.get(&id) {
+                            let mut pass = render_pass(&mut encoder, "laid over", &layer.view, wgpu::LoadOp::Load);
+                            pass.set_pipeline(&self.pipelines.transform);
+                            scissor(&mut pass, kept);
+                            pass.set_bind_group(0, &bind, &[]);
+                            pass.set_bind_group(1, &self.uniform_bind, &[offset]);
+                            pass.draw(0..3, 0..1);
+                        }
+                        self.dirty = self.dirty.union(kept);
+                    }
+                }
+                Op::RedrawFrom { layer: id, source, size, to_source: m, resample } => {
+                    if let Some(layer) = self.layers.get(&id) {
+                        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("redrawn from"),
+                            layout: &self.pipelines.transform_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: wgpu::BindingResource::TextureView(&source),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: wgpu::BindingResource::TextureView(&self.everything),
+                                },
+                            ],
+                        });
+                        let filter = match resample {
+                            Resample::Nearest => 0.0,
+                            Resample::Bilinear => 1.0,
+                            Resample::Bicubic => 2.0,
+                        };
+                        let [a, b, c, d, e, f, g, h, i] = m;
+                        let offset = uniforms.push(&TransformUniform {
+                            r0: [a, b, c, 0.0],
+                            r1: [d, e, f, 0.0],
+                            r2: [g, h, i, 0.0],
+                            p: [filter, size.0 as f32, size.1 as f32, 0.0],
+                        });
+                        let clear = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
+                        let mut pass = render_pass(&mut encoder, "redrawn from", &layer.view, clear);
+                        pass.set_pipeline(&self.pipelines.transform);
+                        pass.set_bind_group(0, &bind, &[]);
+                        pass.set_bind_group(1, &self.uniform_bind, &[offset]);
+                        pass.draw(0..3, 0..1);
+                    }
+                    self.dirty = self.full();
+                }
                 Op::Put(id, pixels) => {
                     if let Some(layer) = self.layers.get(&id) {
                         let (full, row) = (self.full(), self.width as usize * 4);
@@ -4129,9 +4769,12 @@ impl Canvas {
                 Op::Hold(id) => {
                     let full = self.full();
                     self.held = self.snapshot(device, &mut encoder, id, full);
+                    self.held_quietly = false;
                 }
+                Op::HoldQuietly => self.held_quietly = self.held.is_some(),
                 Op::Release { keep, before } => {
                     let held = self.held.take();
+                    self.held_quietly = false;
                     if keep {
                         if held.is_some() || before.is_some() {
                             self.push_step(Step {
@@ -4155,12 +4798,13 @@ impl Canvas {
                     }
                     self.dirty = self.full();
                 }
-                Op::Flip { layers, horizontal } => {
-                    // undone by flipping again: nothing kept
+                Op::Flip { layers, horizontal, before } => {
+                    // undone by flipping again: nothing kept (but the document as it was, if it
+                    // changed too)
                     let step = Step {
                         made: 0,
                         name: None,
-                        doc: None,
+                        doc: before,
                         pixels: Vec::new(),
                         selection: None,
                         flip: Some((layers.clone(), horizontal)),
@@ -4594,6 +5238,26 @@ impl Canvas {
             self.dirty = IRect::EMPTY;
         }
 
+        // the veil's rectangle, the colour round the canvas and its hole, for its shader
+        if let (Some(target), Some(veil)) = (target.as_ref(), self.veil.as_ref()) {
+            let srgb = target.format.is_srgb();
+            let around = target.surround.map(|c| if srgb { srgb_to_linear(c) } else { c });
+            let mut points = [[0.0; 4]; VEIL_POINTS / 2];
+            for (entry, pair) in points.iter_mut().zip(veil.hole.chunks(2)) {
+                match pair {
+                    [a, b] => *entry = [a[0], a[1], b[0], b[1]],
+                    [a] => *entry = [a[0], a[1], 0.0, 0.0],
+                    _ => {}
+                }
+            }
+            let r = veil.rect;
+            let uniform = VeilUniform {
+                rect: [r.x0 as f32, r.y0 as f32, r.width() as f32, r.height() as f32],
+                surround: [around[0], around[1], around[2], veil.hole.len() as f32],
+                points,
+            };
+            gpu.queue.write_buffer(&veil.uniform, 0, bytemuck::bytes_of(&uniform));
+        }
         if let Some(target) = target {
             // what the glass shows is worked out first: drawn in the display's own pass, a tiled
             // GPU needn't write the whole target out and read it back for a pass of its own
@@ -5160,6 +5824,8 @@ impl Canvas {
         stroke: ActiveStroke,
     ) {
         let rect = stroke.bounds.intersect(self.full());
+        // laid only within part of the layer (never one laid in place: it has changed it already)
+        let rect = stroke.within.filter(|_| !stroke.style.in_place()).map_or(rect, |w| rect.intersect(w));
         let within = self.within.take();
         if !rect.is_empty() && self.layers.contains_key(&stroke.layer) {
             // what the stroke can change: its bounds, or only the rectangles it was said to reach
@@ -5170,6 +5836,7 @@ impl Canvas {
                 self.push_step(Step { made: 0, name: None, doc: None, pixels, selection: None, flip: None });
             }
             let opacity = stroke.style.opacity.clamp(0.0, 1.0);
+            let scaled = self.scaled.map_or([1.0, 0.0, 0.0, 0.0], |([x, y], k)| [k, x, y, 0.0]);
             let locked = stroke.style.preserve_alpha;
             let burns = stroke.style.burnt_edges > 0.0 && !stroke.style.preview;
             // a dual brush's: its second's texture read too (the stroke has ended: told here)
@@ -5194,6 +5861,7 @@ impl Canvas {
                                 _ => STROKE_PAINT,
                             },
                             stroke_opacity: opacity,
+                            scaled,
                             ..Default::default()
                         }
                         .with_grain(Some(&stroke.style))
@@ -5218,7 +5886,7 @@ impl Canvas {
                 }
                 (tool, _) => {
                     let offset = uniforms.push(
-                        &LayerUniform { opacity: 1.0, stroke_opacity: opacity, ..Default::default() }
+                        &LayerUniform { opacity: 1.0, stroke_opacity: opacity, scaled, ..Default::default() }
                             .with_grain(Some(&stroke.style))
                             .with_dual(Some(&stroke)),
                     );
@@ -5509,13 +6177,13 @@ impl Canvas {
             }
             self.dirty = self.dirty.union(rect);
         }
-        let solo = doc.solo;
         let replaced = step.doc.map(|before| Box::new(std::mem::replace(doc, *before)));
         if let Some(replaced) = &replaced {
             // no layer it numbered numbered again: its pixels may still be held for redo
             doc.keep_ids_from(replaced);
-            // a layer shown alone is how the artwork is looked at, not a change to undo
-            doc.solo = solo.filter(|s| doc.layer(*s).is_some());
+            // the layer shown alone as it was (showing one alone is a step of its own), if it
+            // is still there
+            doc.solo = doc.solo.filter(|s| doc.layer(*s).is_some());
             self.dirty = self.full();
         }
         let selection = step.selection.map(|before| {
@@ -5590,7 +6258,7 @@ impl Canvas {
         let Some(t) = &self.transforming else { return };
         let Some(layer) = self.layers.get(&t.layer) else { return };
         let (w, h) = (self.width as f32, self.height as f32);
-        let full = [w, h, if t.masked { 1.0 } else { 0.0 }, 0.0];
+        let full = [w, h, if t.masked { 1.0 } else { 0.0 }, if self.filter_keeps_alpha { 1.0 } else { 0.0 }];
         let values = |a: [f32; 4], b: [f32; 4]| FilterUniform { a, b, size: full, c: [0.0; 4] };
         // most adjustments are one pass from the copy into the layer
         let (pass, uniform) = match filter {
@@ -5892,6 +6560,17 @@ impl Canvas {
 
     /// A new step: it joins the history and anything undone can no longer be redone.
     fn push_step(&mut self, mut step: Step) {
+        // part of an edit held quietly: the step made as it is released holds it
+        let held = self.held.as_ref().filter(|_| self.held_quietly).map(|h| h.layer);
+        if let Some(layer) = held
+            && step.doc.is_none()
+            && step.selection.is_none()
+            && step.flip.is_none()
+            && step.pixels.iter().all(|s| s.layer == layer)
+        {
+            self.keep_spare_snapshot(step);
+            return;
+        }
         self.steps_made += 1;
         step.made = self.steps_made;
         if step.name.is_none() {
@@ -6495,6 +7174,8 @@ impl Canvas {
         self.layers.remove(&id);
         self.parked.insert(id, ready.parked);
         self.pictures.insert(id, ready.pictures);
+        // new pixels, as an upload's: saved next (a canvas made from its files forgets this)
+        self.touched(id);
         self.invalidate();
     }
 
@@ -6820,8 +7501,10 @@ impl Canvas {
             overlay_module,
             stamp_layout,
             selection_module,
+            veil_pipeline_layout,
             ..
         } = &*self.pipelines;
+        let kept = self.pipelines.cache.as_ref();
         // the images a predicted tail reads, if they are a brush file's own
         let own_images =
             self.active.filter(|_| !predicted.is_empty()).and_then(|a| self.full_grain_bind(device, &a.style));
@@ -6831,12 +7514,14 @@ impl Canvas {
             overlay,
             selection: selection_pipelines,
             frost,
+            veil: veil_pipelines,
             ..
         } = &mut self.screen;
         let pipeline = display.entry(target.format).or_insert_with(|| {
             // over the surround, which shows through see-through parts (a hidden background)
             blended_pipeline(
                 device,
+                kept,
                 display_lut_layout,
                 display_module,
                 "display",
@@ -6849,12 +7534,15 @@ impl Canvas {
         let to_clip = Affine { a: 2.0 / w, b: 0.0, c: 0.0, d: -2.0 / h, e: -1.0, f: 1.0 };
         let unit_to_canvas = Affine { a: self.width as f32, b: 0.0, c: 0.0, d: self.height as f32, e: 0.0, f: 0.0 };
         let m = unit_to_canvas.then(target.to_screen).then(to_clip);
-        let offset = uniforms.push(&DisplayUniform::new(
-            [m.a, m.b, m.c, m.d],
-            [m.e, m.f, if srgb { 1.0 } else { 0.0 }, if target.grey { 1.0 } else { 0.0 }],
-            target.convert,
-            target.lut.is_some(),
-        ));
+        let offset = uniforms.push(
+            &DisplayUniform::new(
+                [m.a, m.b, m.c, m.d],
+                [m.e, m.f, if srgb { 1.0 } else { 0.0 }, if target.grey { 1.0 } else { 0.0 }],
+                target.convert,
+                target.lut.is_some(),
+            )
+            .smoothed(&m, (w, h)),
+        );
         let surround = target.surround.map(|c| if srgb { srgb_to_linear(c) } else { c });
         let clear =
             wgpu::Color { r: f64::from(surround[0]), g: f64::from(surround[1]), b: f64::from(surround[2]), a: 1.0 };
@@ -6862,6 +7550,7 @@ impl Canvas {
             let pipeline = surround_pipelines.entry(target.format).or_insert_with(|| {
                 sampled_pipeline(
                     device,
+                    kept,
                     surround_pipeline_layout,
                     surround_module,
                     "surround",
@@ -6891,7 +7580,56 @@ impl Canvas {
         pass.set_bind_group(2, target.lut.map_or(&self.identity_lut, |l| &l.bind), &[]);
         pass.draw(0..6, 0..1);
 
-        // the overlay over it, through the same pipeline, its unit square stretched to its rect
+        // part of the canvas drawn again sharper, in its place
+        if let Some(sharp) = self.sharp.as_ref() {
+            let [x, y, w, h] = sharp.rect;
+            let unit_to_rect = Affine { a: w, b: 0.0, c: 0.0, d: h, e: x, f: y };
+            let m = unit_to_rect.then(target.to_screen).then(to_clip);
+            let offset = uniforms.push(&DisplayUniform::new(
+                [m.a, m.b, m.c, m.d],
+                [m.e, m.f, if srgb { 1.0 } else { 0.0 }, if target.grey { 1.0 } else { 0.0 }],
+                target.convert,
+                target.lut.is_some(),
+            ));
+            pass.set_bind_group(0, &sharp.bind, &[]);
+            pass.set_bind_group(1, &self.uniform_bind, &[offset]);
+            pass.draw(0..6, 0..1);
+        }
+
+        // part of the canvas as it was, over it but for its hole
+        if let Some(veil) = self.veil.as_ref() {
+            let pipeline = veil_pipelines.entry(target.format).or_insert_with(|| {
+                blended_pipeline(
+                    device,
+                    kept,
+                    veil_pipeline_layout,
+                    display_module,
+                    "veil",
+                    ("vs_display", "fs_veil"),
+                    target.format,
+                    Some(PREMULTIPLIED_OVER),
+                )
+            });
+            let r = veil.rect;
+            let (x, y, w, h) = (r.x0 as f32, r.y0 as f32, r.width() as f32, r.height() as f32);
+            let unit_to_rect = Affine { a: w, b: 0.0, c: 0.0, d: h, e: x, f: y };
+            let m = unit_to_rect.then(target.to_screen).then(to_clip);
+            let offset = uniforms.push(&DisplayUniform::new(
+                [m.a, m.b, m.c, m.d],
+                [m.e, m.f, if srgb { 1.0 } else { 0.0 }, if target.grey { 1.0 } else { 0.0 }],
+                target.convert,
+                target.lut.is_some(),
+            ));
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, if crisp { &veil.crisp } else { &veil.bind }, &[]);
+            pass.set_bind_group(1, &self.uniform_bind, &[offset]);
+            pass.set_bind_group(2, target.lut.map_or(&self.identity_lut, |l| &l.bind), &[]);
+            pass.set_bind_group(3, &veil.uniform_bind, &[]);
+            pass.draw(0..6, 0..1);
+        }
+
+        // image generation's overlay over them all, through the display pipeline again (the veil
+        // has its own), its unit square stretched to its rect
         if let Some(o) = &self.overlay {
             let r = o.rect;
             let unit_to_rect =
@@ -6903,8 +7641,10 @@ impl Canvas {
                 target.convert,
                 target.lut.is_some(),
             ));
+            pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &o.bind, &[]);
             pass.set_bind_group(1, &self.uniform_bind, &[offset]);
+            pass.set_bind_group(2, target.lut.map_or(&self.identity_lut, |l| &l.bind), &[]);
             pass.draw(0..6, 0..1);
         }
 
@@ -6937,7 +7677,7 @@ impl Canvas {
                         })],
                     }),
                     multiview_mask: None,
-                    cache: None,
+                    cache: kept,
                 })
             });
             let i = inverse;
@@ -6995,7 +7735,7 @@ impl Canvas {
                         })],
                     }),
                     multiview_mask: None,
-                    cache: None,
+                    cache: kept,
                 })
             });
             let c = target.to_screen.then(to_clip);
@@ -7093,11 +7833,13 @@ impl Canvas {
         let srgb = target.format.is_srgb();
         let Pipelines { display_module, display_pipeline_layout, display_lut_layout, backdrop_module, .. } =
             &*self.pipelines;
+        let kept = self.pipelines.cache.as_ref();
         let ScreenPipelines { display, blur, frost, .. } = &mut self.screen;
         let display = display.entry(target.format).or_insert_with(|| {
             // over the surround, which shows through see-through parts (a hidden background)
             blended_pipeline(
                 device,
+                kept,
                 display_lut_layout,
                 display_module,
                 "display",
@@ -7109,6 +7851,7 @@ impl Canvas {
         let blur = blur.entry(target.format).or_insert_with(|| {
             sampled_pipeline(
                 device,
+                kept,
                 display_pipeline_layout,
                 backdrop_module,
                 "blur",
@@ -7141,7 +7884,7 @@ impl Canvas {
                     })],
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: kept,
             })
         });
 
@@ -7152,12 +7895,15 @@ impl Canvas {
         let unit_to_canvas = Affine { a: self.width as f32, b: 0.0, c: 0.0, d: self.height as f32, e: 0.0, f: 0.0 };
         let shrink = Affine { a: 1.0 / k, b: 0.0, c: 0.0, d: 1.0 / k, e: 0.0, f: 0.0 };
         let m = unit_to_canvas.then(target.to_screen).then(shrink).then(to_clip);
-        let offset = uniforms.push(&DisplayUniform::new(
-            [m.a, m.b, m.c, m.d],
-            [m.e, m.f, if srgb { 1.0 } else { 0.0 }, if target.grey { 1.0 } else { 0.0 }],
-            target.convert,
-            target.lut.is_some(),
-        ));
+        let offset = uniforms.push(
+            &DisplayUniform::new(
+                [m.a, m.b, m.c, m.d],
+                [m.e, m.f, if srgb { 1.0 } else { 0.0 }, if target.grey { 1.0 } else { 0.0 }],
+                target.convert,
+                target.lut.is_some(),
+            )
+            .smoothed(&m, (w, h)),
+        );
         let surround = target.surround.map(|c| if srgb { srgb_to_linear(c) } else { c });
         let clear =
             wgpu::Color { r: f64::from(surround[0]), g: f64::from(surround[1]), b: f64::from(surround[2]), a: 1.0 };
@@ -7189,7 +7935,8 @@ impl Canvas {
     }
 
     /// A layer scaled to fit `max_side` pixels (premultiplied). Runs what is queued first, then
-    /// waits for the GPU.
+    /// waits for the GPU (see [`Canvas::start_layer_thumbnail`] for the same with the waits left
+    /// to the caller).
     pub fn layer_thumbnail(
         &mut self,
         gpu: &Gpu,
@@ -7197,20 +7944,62 @@ impl Canvas {
         id: LayerId,
         max_side: u32,
     ) -> Result<Thumbnail, GpuError> {
+        match self.start_layer_thumbnail(gpu, doc, id, max_side)? {
+            LayerThumbnailStep::Ready(t) => Ok(t),
+            LayerThumbnailStep::Coarse { pending, mask } => {
+                let coarse = pending.pixels()?;
+                self.start_layer_thumbnail_fine(gpu, id, &coarse, mask, max_side)?.pixels()
+            }
+        }
+    }
+
+    /// [`Canvas::layer_thumbnail`]'s first step: the picture already (a parked layer's), or a
+    /// coarse copy of the layer on its way back (8 pixels to one, fine enough not to miss a dot),
+    /// for the caller to wait for with whatever guards the canvas let go, then hand to
+    /// [`Canvas::start_layer_thumbnail_fine`].
+    pub fn start_layer_thumbnail(
+        &mut self,
+        gpu: &Gpu,
+        doc: &mut Document,
+        id: LayerId,
+        max_side: u32,
+    ) -> Result<LayerThumbnailStep, GpuError> {
         self.render(gpu, doc, None);
         let mask = doc.layer(id).is_some_and(|l| l.kind == LayerKind::Mask);
         if let Some(p) = self.parked_pictures(id, max_side).filter(|_| !mask) {
-            return Ok(shrink(p.drawn.as_ref().unwrap_or(&p.whole), max_side));
+            return Ok(LayerThumbnailStep::Ready(shrink(p.drawn.as_ref().unwrap_or(&p.whole), max_side)));
         }
         self.restore_all(gpu, [id], false);
+        let layer = self.layers.get(&id).ok_or_else(|| GpuError::Readback(format!("no layer {id:?}")))?;
+        let side = (self.width.max(self.height) / 8).clamp(64, 2048);
+        Ok(LayerThumbnailStep::Coarse { pending: self.start_sample_view(gpu, &layer.view, self.full(), side), mask })
+    }
+
+    /// [`Canvas::layer_thumbnail`]'s second step, with the coarse copy back: the read of the
+    /// region it is painted in (or all of it, if nothing showed), cut to what is painted there
+    /// once it is back.
+    pub fn start_layer_thumbnail_fine(
+        &mut self,
+        gpu: &Gpu,
+        id: LayerId,
+        coarse: &Thumbnail,
+        mask: bool,
+        max_side: u32,
+    ) -> Result<FineThumbnail, GpuError> {
+        // parked again meanwhile, perhaps
+        self.restore_all(gpu, [id], false);
         let full = self.full();
+        let layer = self.layers.get(&id).ok_or_else(|| GpuError::Readback(format!("no layer {id:?}")))?;
         // a mask is white where nothing is painted on it
-        let bounds = if doc.layer(id).is_some_and(|l| l.kind == LayerKind::Mask) { ink_bounds } else { alpha_bounds };
-        // where its pixels are: roughly, on a copy small enough to read back quickly but fine
-        // enough (8 pixels to one) not to miss a dot, then exactly, on the region drawn
-        let coarse = self.sample_layer(gpu, id, full, (self.width.max(self.height) / 8).clamp(64, 2048))?;
-        let Some([x0, y0, x1, y1]) = bounds(&coarse) else { return self.sample_layer(gpu, id, full, max_side) };
-        let (sx, sy) = (self.width as f32 / coarse.width as f32, self.height as f32 / coarse.height as f32);
+        let bounds: fn(&Thumbnail) -> Option<[u32; 4]> = if mask { ink_bounds } else { alpha_bounds };
+        let Some([x0, y0, x1, y1]) = bounds(coarse) else {
+            return Ok(FineThumbnail {
+                pending: self.start_sample_view(gpu, &layer.view, full, max_side),
+                cut_mask: None,
+            });
+        };
+        let (sx, sy) =
+            (self.width as f32 / coarse.width.max(1) as f32, self.height as f32 / coarse.height.max(1) as f32);
         let rect = IRect {
             x0: ((x0 as f32 - 1.0) * sx).floor() as i32,
             y0: ((y0 as f32 - 1.0) * sy).floor() as i32,
@@ -7218,11 +8007,7 @@ impl Canvas {
             y1: ((y1 as f32 + 1.0) * sy).ceil() as i32,
         }
         .intersect(full);
-        let fine = self.sample_layer(gpu, id, rect, max_side)?;
-        Ok(match bounds(&fine) {
-            Some(b) => crop(&fine, b),
-            None => fine,
-        })
+        Ok(FineThumbnail { pending: self.start_sample_view(gpu, &layer.view, rect, max_side), cut_mask: Some(mask) })
     }
 
     /// `rect` of a layer box-filtered to fit `max_side` pixels (never enlarged), read back.
@@ -7346,7 +8131,36 @@ impl Canvas {
         }
         self.invalidate();
         self.render_finished(gpu, &mut shown);
-        let thumbnail = self.sample_view(gpu, &self.composite_view, self.full(), max_side);
+        let thumbnail = self.start_sample_view(gpu, &self.composite_view, self.full(), max_side);
+        self.invalidate();
+        self.render_finished(gpu, doc);
+        thumbnail.pixels()
+    }
+
+    /// [`Canvas::composite_thumbnail_without`] started: the picture's copy queued, its pixels to be
+    /// waited for once whatever guards the canvas is let go (a time-lapse frame, taken after each
+    /// change, would otherwise hold the next touches up while the GPU copies it).
+    pub fn start_composite_thumbnail_without(
+        &mut self,
+        gpu: &Gpu,
+        doc: &mut Document,
+        max_side: u32,
+        left_out: &[LayerId],
+    ) -> PendingThumbnail {
+        if left_out.is_empty() {
+            if !self.busy() {
+                self.render(gpu, doc, None);
+            }
+            return self.start_sample_view(gpu, &self.composite_view, self.full(), max_side);
+        }
+        self.render(gpu, doc, None);
+        let mut shown = doc.clone();
+        for &id in left_out {
+            shown.set_visible(id, false);
+        }
+        self.invalidate();
+        self.render_finished(gpu, &mut shown);
+        let thumbnail = self.start_sample_view(gpu, &self.composite_view, self.full(), max_side);
         self.invalidate();
         self.render_finished(gpu, doc);
         thumbnail
@@ -7360,6 +8174,11 @@ impl Canvas {
         rect: IRect,
         max_side: u32,
     ) -> Result<Thumbnail, GpuError> {
+        self.start_sample_view(gpu, source, rect, max_side).pixels()
+    }
+
+    /// [`Canvas::sample_view`] started: the copy back queued, the pixels waited for later.
+    fn start_sample_view(&self, gpu: &Gpu, source: &wgpu::TextureView, rect: IRect, max_side: u32) -> PendingThumbnail {
         let side = max_side.clamp(1, 2048) as f32;
         let (rw, rh) = (rect.width().max(1) as f32, rect.height().max(1) as f32);
         let scale = (side / rw).min(side / rh).min(1.0);
@@ -7387,8 +8206,7 @@ impl Canvas {
         }
         self.write_uniforms(gpu, &data);
         gpu.queue.submit([encoder.finish()]);
-        let rgba = read_texture(gpu, &small, w, h)?;
-        Ok(Thumbnail { width: w, height: h, rgba })
+        PendingThumbnail { width: w, height: h, read: start_reading(gpu, &small, w, h) }
     }
 
     /// Layer `id` of canvas `from` (on the same device) as this canvas's, its pixels moved by
@@ -7901,7 +8719,12 @@ pub fn textures_bytes(textures: &[wgpu::Texture]) -> u64 {
 }
 
 impl Pipelines {
-    pub(crate) fn new(device: &wgpu::Device, liquify_format: wgpu::TextureFormat) -> Pipelines {
+    pub(crate) fn new(
+        device: &wgpu::Device,
+        liquify_format: wgpu::TextureFormat,
+        cache: Option<wgpu::PipelineCache>,
+    ) -> Pipelines {
+        let kept = cache.as_ref();
         let tex_entry = |binding| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::FRAGMENT,
@@ -7949,10 +8772,10 @@ impl Pipelines {
                 array_entry(1),
                 sampler_entry(2),
                 sampler_entry(3),
-                // the selection, filtered where the stamp samples it
+                // the selection, filtered where the stamp samples it (and where a smudge moves paint)
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::FRAGMENT.union(wgpu::ShaderStages::COMPUTE),
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D2,
@@ -8044,6 +8867,21 @@ impl Pipelines {
         });
         let display_lut_layout =
             layout("display with a table", &[Some(&sampled_layout), Some(&uniform_layout), Some(&lut_layout)]);
+        let veil_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("veil"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: NonZeroU64::new(size_of::<VeilUniform>() as u64),
+                },
+                count: None,
+            }],
+        });
+        let veil_pipeline_layout =
+            layout("veil", &[Some(&sampled_layout), Some(&uniform_layout), Some(&lut_layout), Some(&veil_layout)]);
         // a transform's copy, its sampler and the selection
         let transform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("transform source"),
@@ -8081,7 +8919,7 @@ impl Pipelines {
         });
         let bounds_pipeline = |group: &wgpu::BindGroupLayout, fs| {
             let pipeline_layout = layout("bounds", &[Some(group)]);
-            blended_pipeline(device, &pipeline_layout, &bounds_module, fs, ("vs_full", fs), LAYER_FORMAT, None)
+            blended_pipeline(device, kept, &pipeline_layout, &bounds_module, fs, ("vs_full", fs), LAYER_FORMAT, None)
         };
         let (bounds_rows, bounds_columns) =
             (bounds_pipeline(&bounds_layout, "fs_rows"), bounds_pipeline(&bounds_layout, "fs_columns"));
@@ -8092,7 +8930,7 @@ impl Pipelines {
         let flip_module = module("flip", include_str!("shaders/flip.wgsl"));
         let flip_layout = layout("flip", &[Some(&bounds_layout)]);
         let flip_pipeline =
-            |fs| blended_pipeline(device, &flip_layout, &flip_module, fs, ("vs_full", fs), LAYER_FORMAT, None);
+            |fs| blended_pipeline(device, kept, &flip_layout, &flip_module, fs, ("vs_full", fs), LAYER_FORMAT, None);
         let (flip_across, flip_down) = (flip_pipeline("fs_across"), flip_pipeline("fs_down"));
         let invert = flip_pipeline("fs_invert");
         let crop_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -8114,6 +8952,7 @@ impl Pipelines {
         let crop_module = module("crop", include_str!("shaders/crop.wgsl"));
         let crop = blended_pipeline(
             device,
+            kept,
             &layout("crop", &[Some(&crop_layout)]),
             &crop_module,
             "crop",
@@ -8127,6 +8966,7 @@ impl Pipelines {
             .map(|&fs| {
                 let pipeline = blended_pipeline(
                     device,
+                    kept,
                     &filter_pipeline_layout,
                     &filter_module,
                     fs,
@@ -8140,6 +8980,7 @@ impl Pipelines {
         let liquify_module = module("liquify", include_str!("shaders/liquify.wgsl"));
         let liquify_stamp = blended_pipeline(
             device,
+            kept,
             &layout("liquify stamps", &[Some(&uniform_layout)]),
             &liquify_module,
             "liquify stamps",
@@ -8153,6 +8994,7 @@ impl Pipelines {
         });
         let liquify_step = blended_pipeline(
             device,
+            kept,
             &layout("liquify step", &[Some(&uniform_layout), Some(&liquify_layout)]),
             &liquify_module,
             "liquify step",
@@ -8224,7 +9066,7 @@ impl Pipelines {
                 module: &smudge_module,
                 entry_point: Some(entry),
                 compilation_options: Default::default(),
-                cache: None,
+                cache: kept,
             })
         };
         let smudge_carry = compute("smudge carry", "cs_carry");
@@ -8263,7 +9105,7 @@ impl Pipelines {
                     })],
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: kept,
             })
         };
         let stamp = stamp_pipeline("stamp", PREMULTIPLIED_OVER);
@@ -8307,7 +9149,7 @@ impl Pipelines {
                     })],
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: kept,
             })
         });
         let full = |label, entry, blend| {
@@ -8334,7 +9176,7 @@ impl Pipelines {
                     })],
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: kept,
             })
         };
         Pipelines {
@@ -8346,6 +9188,7 @@ impl Pipelines {
             commit_locked: full("commit locked", "fs_commit_locked", None),
             transform: blended_pipeline(
                 device,
+                kept,
                 &transform_pipeline_layout,
                 &transform_module,
                 "transform",
@@ -8355,6 +9198,7 @@ impl Pipelines {
             ),
             transform_static: sampled_pipeline(
                 device,
+                kept,
                 &transform_pipeline_layout,
                 &transform_module,
                 "transform static",
@@ -8408,10 +9252,11 @@ impl Pipelines {
                     })],
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: kept,
             }),
             thumb: sampled_pipeline(
                 device,
+                kept,
                 &display_pipeline_layout,
                 &display_module,
                 "thumbnail",
@@ -8447,6 +9292,9 @@ impl Pipelines {
             selection_module,
 
             backdrop_module,
+            veil_layout,
+            veil_pipeline_layout,
+            cache,
         }
     }
 }
@@ -8529,6 +9377,7 @@ const FILTER_PASSES: [&str; 17] = [
 /// A full-screen pipeline (no vertex buffers) with its blending.
 fn blended_pipeline(
     device: &wgpu::Device,
+    cache: Option<&wgpu::PipelineCache>,
     layout: &wgpu::PipelineLayout,
     module: &wgpu::ShaderModule,
     label: &str,
@@ -8555,12 +9404,13 @@ fn blended_pipeline(
             targets: &[Some(wgpu::ColorTargetState { format, blend, write_mask: wgpu::ColorWrites::ALL })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache,
     })
 }
 
 fn sampled_pipeline(
     device: &wgpu::Device,
+    cache: Option<&wgpu::PipelineCache>,
     layout: &wgpu::PipelineLayout,
     module: &wgpu::ShaderModule,
     label: &str,
@@ -8568,7 +9418,7 @@ fn sampled_pipeline(
     fs: &str,
     format: wgpu::TextureFormat,
 ) -> wgpu::RenderPipeline {
-    blended_pipeline(device, layout, module, label, (vs, fs), format, None)
+    blended_pipeline(device, cache, layout, module, label, (vs, fs), format, None)
 }
 
 /// One frame's uniforms, a slot per draw.
@@ -8611,9 +9461,10 @@ fn stamps_work(stamps: &[StampInstance], full: IRect, in_place: bool) -> u64 {
     stamps.iter().fold(0, |work, s| work.saturating_add(stamp_work(s, full, in_place)))
 }
 
-/// `ops` with stamps of more work than `most` as several in a row of no more (a stamp is never cut
-/// in two): a stroke redrawn whole would otherwise reach the GPU as one piece.
-fn in_pieces(ops: Vec<Op>, full: IRect, most: u64) -> Vec<Op> {
+/// `ops` with stamps of more work than `most`, or more than `most_stamps` of them, as several in a
+/// row of no more (a stamp is never cut in two): a stroke redrawn whole would otherwise reach the
+/// GPU as one piece.
+fn in_pieces(ops: Vec<Op>, full: IRect, most: u64, most_stamps: u64) -> Vec<Op> {
     let mut pieces = Vec::with_capacity(ops.len());
     for op in ops {
         let Op::Stamps { second, instances, wet, times, style, clear, layer, pencil } = op else {
@@ -8626,7 +9477,7 @@ fn in_pieces(ops: Vec<Op>, full: IRect, most: u64) -> Vec<Op> {
         let (mut count, mut work) = (0usize, 0u64);
         for s in &instances {
             let more = stamp_work(s, full, in_place);
-            if count > 0 && work.saturating_add(more) > most {
+            if count > 0 && (work.saturating_add(more) > most || count as u64 >= most_stamps) {
                 counts.push(count);
                 (count, work) = (0, 0);
             }
@@ -8701,6 +9552,29 @@ fn ink_bounds(t: &Thumbnail) -> Option<[u32; 4]> {
 
 /// The pixels of a thumbnail that `painted` holds for, as [x0, y0, x1, y1); none if none.
 fn painted_bounds(t: &Thumbnail, painted: impl Fn([u8; 4]) -> bool) -> Option<[u32; 4]> {
+    painted_bounds_of(&t.rgba, t.width, painted)
+}
+
+/// [`painted_bounds`] of pixels `width` wide, a row at a time: a row's first and last painted
+/// pixels only widen the box.
+fn painted_bounds_of(rgba: &[u8], width: u32, painted: impl Fn([u8; 4]) -> bool) -> Option<[u32; 4]> {
+    let mut b: Option<[u32; 4]> = None;
+    for (y, row) in rgba.chunks_exact(width.max(1) as usize * 4).enumerate() {
+        let pixels = row.as_chunks::<4>().0;
+        let Some(first) = pixels.iter().position(|p| painted(*p)) else { continue };
+        let last = pixels.iter().rposition(|p| painted(*p)).unwrap_or(first);
+        let (x0, x1, y) = (first as u32, last as u32 + 1, y as u32);
+        b = Some(match b {
+            Some([bx0, by0, bx1, _]) => [bx0.min(x0), by0, bx1.max(x1), y + 1],
+            None => [x0, y, x1, y + 1],
+        });
+    }
+    b
+}
+
+/// The old [`painted_bounds`], a pixel at a time: what [`painted_bounds_of`] must still give.
+#[cfg(test)]
+fn painted_bounds_slowly(t: &Thumbnail, painted: impl Fn([u8; 4]) -> bool) -> Option<[u32; 4]> {
     let mut b: Option<[u32; 4]> = None;
     for (i, px) in t.rgba.as_chunks::<4>().0.iter().enumerate() {
         if painted(*px) {
@@ -8799,10 +9673,11 @@ struct Pictures {
 impl Pictures {
     /// Of a layer's pixels (premultiplied RGBA, `width` x `height`).
     fn of(rgba: &[u8], width: u32, height: u32) -> Pictures {
-        let full = Thumbnail { width, height, rgba: rgba.to_vec() };
-        let whole = shrink(&full, PARKED_PICTURE_SIDE);
-        let painted = alpha_bounds(&full);
-        let drawn = painted.map(|b| shrink(&crop(&full, b), PARKED_PICTURE_SIDE));
+        // read where they are, the layer neither copied nor cut out first (a large one is many
+        // megabytes, and an undo brings one back and parks another)
+        let whole = shrink_part(rgba, width, [0, 0, width, height], PARKED_PICTURE_SIDE);
+        let painted = painted_bounds_of(rgba, width, |[_, _, _, alpha]| alpha > 0);
+        let drawn = painted.map(|b| shrink_part(rgba, width, b, PARKED_PICTURE_SIDE));
         let bounds =
             painted.map(|[x0, y0, x1, y1]| IRect { x0: x0 as i32, y0: y0 as i32, x1: x1 as i32, y1: y1 as i32 });
         Pictures { whole, drawn, bounds }
@@ -8811,6 +9686,70 @@ impl Pictures {
 
 /// A picture box-filtered to fit `side` pixels (never enlarged).
 fn shrink(t: &Thumbnail, side: u32) -> Thumbnail {
+    shrink_part(&t.rgba, t.width, [0, 0, t.width, t.height], side)
+}
+
+/// Part [x0, y0, x1, y1) of a picture `width` wide (its rows in `rgba`), box-filtered to fit `side`
+/// pixels (never enlarged): each pixel the rounded mean of those that fall in it, as [`shrink`]
+/// was before, but which column each source column goes to worked out once, the counts by row
+/// and column, and clear pixels (nothing to add) passed over.
+fn shrink_part(rgba: &[u8], width: u32, [x0, y0, x1, y1]: [u32; 4], side: u32) -> Thumbnail {
+    let (pw, ph) = ((x1.saturating_sub(x0)).max(1), (y1.saturating_sub(y0)).max(1));
+    let scale = (side.max(1) as f32 / pw.max(ph) as f32).min(1.0);
+    let w = ((pw as f32 * scale).round() as u32).clamp(1, pw);
+    let h = ((ph as f32 * scale).round() as u32).clamp(1, ph);
+    let stride = width as usize * 4;
+    let row_of = |y: u32| {
+        let start = (y0 + y) as usize * stride + x0 as usize * 4;
+        rgba.get(start..start + pw as usize * 4).unwrap_or_default()
+    };
+    if (w, h) == (pw, ph) {
+        let mut out = Vec::with_capacity(pw as usize * ph as usize * 4);
+        for y in 0..ph {
+            out.extend_from_slice(row_of(y));
+        }
+        return Thumbnail { width: pw, height: ph, rgba: out };
+    }
+    let columns: Vec<usize> = (0..pw).map(|x| (u64::from(x) * u64::from(w) / u64::from(pw)) as usize).collect();
+    let mut per_column = vec![0u32; w as usize];
+    for &c in &columns {
+        if let Some(n) = per_column.get_mut(c) {
+            *n += 1;
+        }
+    }
+    let mut per_row = vec![0u32; h as usize];
+    let mut sums = vec![0u32; w as usize * h as usize * 4];
+    let line = w as usize * 4;
+    for y in 0..ph {
+        let ty = (u64::from(y) * u64::from(h) / u64::from(ph)) as usize;
+        if let Some(n) = per_row.get_mut(ty) {
+            *n += 1;
+        }
+        let Some(out) = sums.get_mut(ty * line..(ty + 1) * line) else { continue };
+        for (px, &tx) in row_of(y).as_chunks::<4>().0.iter().zip(&columns) {
+            if u32::from_ne_bytes(*px) == 0 {
+                continue;
+            }
+            if let Some(sum) = out.get_mut(tx * 4..tx * 4 + 4) {
+                for (s, v) in sum.iter_mut().zip(px) {
+                    *s += u32::from(*v);
+                }
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(w as usize * h as usize * 4);
+    for (row, rn) in sums.chunks(line).zip(&per_row) {
+        for (sum, cn) in row.as_chunks::<4>().0.iter().zip(&per_column) {
+            let n = (rn * cn).max(1);
+            out.extend(sum.iter().map(|v| ((v + n / 2) / n) as u8));
+        }
+    }
+    Thumbnail { width: w, height: h, rgba: out }
+}
+
+/// The old [`shrink`], a pixel at a time: what [`shrink_part`] must still give.
+#[cfg(test)]
+fn shrink_slowly(t: &Thumbnail, side: u32) -> Thumbnail {
     let (width, height) = (t.width.max(1), t.height.max(1));
     let scale = (side.max(1) as f32 / width.max(height) as f32).min(1.0);
     let w = ((width as f32 * scale).round() as u32).clamp(1, width);
@@ -9250,7 +10189,11 @@ fn brush_images(gpu: &Gpu, label: &str, images: &[GrayImage]) -> wgpu::Texture {
     let n = TEXTURE_SIZE as u32;
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
-        size: wgpu::Extent3d { width: n, height: n, depth_or_array_layers: (images.len() + SOURCE_SLOTS) as u32 },
+        size: wgpu::Extent3d {
+            width: n,
+            height: n,
+            depth_or_array_layers: gpu.array_layers((images.len() + SOURCE_SLOTS) as u32),
+        },
         mip_level_count: n.ilog2() + 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -9629,6 +10572,45 @@ fn start_reading_part(gpu: &Gpu, texture: &wgpu::Texture, rect: IRect) -> Readba
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pictures of every size up to a few dozen, painted in patches with clear between (as a
+    /// layer is), the shrunken ones and the painted bounds as the old pixel-at-a-time ways give.
+    #[test]
+    fn a_parked_layers_pictures_are_made_as_they_were() {
+        let mut seed = 12345u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (seed >> 16) as u8
+        };
+        for (w, h) in [(1, 1), (3, 7), (40, 9), (64, 64), (193, 50), (37, 410), (500, 300)] {
+            let mut rgba = vec![0u8; (w * h * 4) as usize];
+            for y in 0..h {
+                for x in 0..w {
+                    // patches: clear where (x / 5 + y / 3) is odd
+                    if (x / 5 + y / 3) % 2 == 0 && (x + y) % 11 != 0 {
+                        let i = ((y * w + x) * 4) as usize;
+                        let a = next();
+                        rgba[i..i + 4].copy_from_slice(&[next().min(a), next().min(a), next().min(a), a]);
+                    }
+                }
+            }
+            let t = Thumbnail { width: w, height: h, rgba };
+            for side in [1, 5, 16, 64, 192, 1000] {
+                let fast = shrink(&t, side);
+                let slow = shrink_slowly(&t, side);
+                assert_eq!((fast.width, fast.height), (slow.width, slow.height), "{w}x{h} to {side}");
+                assert!(fast.rgba == slow.rgba, "{w}x{h} to {side}: pixels differ");
+            }
+            let alpha = |p: [u8; 4]| p[3] > 0;
+            let bounds = painted_bounds(&t, alpha);
+            assert_eq!(bounds, painted_bounds_slowly(&t, alpha), "{w}x{h} bounds");
+            if let Some(b) = bounds {
+                let fast = shrink_part(&t.rgba, w, b, 64);
+                let slow = shrink_slowly(&crop(&t, b), 64);
+                assert!(fast.rgba == slow.rgba && fast.width == slow.width, "{w}x{h} part");
+            }
+        }
+    }
 
     std::thread_local! {
         /// The label of textures this thread can't make, as past the GPU's memory.

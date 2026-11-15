@@ -48,6 +48,10 @@ struct LayerUniform {
     clip_masked: f32,
     // pixels a side of the image the grain is read from
     grain_side: f32,
+    // how many of this canvas's pixels a pixel of the canvas its strokes are given in takes, and
+    // where this one's top left is in those (x: the scale, yz: the point): grain fixed to the
+    // canvas is read where it is on that canvas
+    scaled: vec4<f32>,
 }
 
 // in stroke_blend: the stroke mixed in by its coverage in squared colour (nearer to light)
@@ -111,7 +115,7 @@ fn stroke_pixel(p: vec2<i32>) -> StrokePixel {
     }
     let built = s.a;
     if (lu.grain >= 0) {
-        let at = vec2<f32>(p) + 0.5;
+        let at = (vec2<f32>(p) + 0.5) / lu.scaled.x + lu.scaled.yz;
         let gc = cos(lu.grain_rotation);
         let gs = sin(lu.grain_rotation);
         let uv = vec2<f32>(at.x * gc - at.y * gs, at.x * gs + at.y * gc) / lu.grain_scale;
@@ -186,14 +190,17 @@ fn with_stroke(c0: vec4<f32>, p: vec2<i32>) -> vec4<f32> {
     if (lu.stroke_mode != 0u) {
         let px = stroke_pixel(p);
         let s = px.s;
-        if (lu.stroke_mode == 1u) {
-            c = burnt(c0, stroke_into(c, s), px.burn);
-        } else if (lu.stroke_mode == 2u) {
+        // where the stroke left nothing (no paint, no burnt edge) the layer is as it was
+        if (s.a <= 0.0 && px.burn <= 0.0) {
+            return c0;
+        }
+        if (lu.stroke_mode == 2u) {
             c = c * (1.0 - s.a);
         } else {
-            // recolour, keeping the layer's alpha
+            // painted (1), or recoloured keeping the layer's alpha (3): the blend written once, as
+            // Direct3D 12's compiler takes a long while over each copy of its modes
             let painted = burnt(c0, stroke_into(c, s), px.burn);
-            c = painted * (c.a / max(painted.a, 1e-6));
+            c = select(painted, painted * (c.a / max(painted.a, 1e-6)), lu.stroke_mode == 3u);
         }
     }
     return c;
@@ -202,15 +209,20 @@ fn with_stroke(c0: vec4<f32>, p: vec2<i32>) -> vec4<f32> {
 // a layer as it composites: stroke, mask, clipping, opacity
 fn layer_color(p: vec2<i32>) -> vec4<f32> {
     var c = textureLoad(layer_tex, p, 0);
-    if (lu.stroke_on_mask < 0.5) {
-        c = with_stroke(c, p);
+    var m = vec4<f32>(1.0);
+    if (lu.masked > 0.5) {
+        m = textureLoad(mask_tex, p, 0);
+    }
+    // the stroke goes into the layer, or into its mask: one place for it (its blend written once)
+    let into_mask = lu.stroke_on_mask > 0.5;
+    let stroked = with_stroke(select(c, m, into_mask), p);
+    if (into_mask) {
+        m = stroked;
+    } else {
+        c = stroked;
     }
     if (lu.masked > 0.5) {
         // the mask shows the layer as much as it is light (and opaque)
-        var m = textureLoad(mask_tex, p, 0);
-        if (lu.stroke_on_mask > 0.5) {
-            m = with_stroke(m, p);
-        }
         c = c * clamp(dot(m.rgb, vec3<f32>(0.299, 0.587, 0.114)), 0.0, 1.0);
     }
     if (lu.clipped != 0u) {
@@ -278,16 +290,19 @@ fn unsquared(c: vec4<f32>) -> vec4<f32> {
 
 // the stroke `s` into the layer `b`: blended by its mode, and with luminance blending mixed in
 // by its coverage in squared colour (the colour it lays down where it covers fully, mixed with
-// the layer's)
+// the layer's). One way out, at the end: Samsung's Xclipse compiler, given a return part way
+// with more after it, drew every pixel of an open stroke's layer wrong (black, or partly covered
+// pixels solid: #153), whichever way the pixel went.
 fn stroke_into(b: vec4<f32>, s: vec4<f32>) -> vec4<f32> {
     let mode = lu.stroke_blend & 255u;
-    if ((lu.stroke_blend & STROKE_LUMINANCE) == 0u || mode == 26u || mode == 29u || s.a <= 0.0) {
-        return blend(b, s, mode);
+    var into = blend(b, s, mode);
+    if ((lu.stroke_blend & STROKE_LUMINANCE) != 0u && mode != 26u && mode != 29u && s.a > 0.0) {
+        let cb = unpremultiply(b);
+        let cs = unpremultiply(s);
+        let mixed = clamp(blend_rgb(cb, cs, mode), vec3<f32>(0.0), vec3<f32>(1.0));
+        let full = vec4<f32>((1.0 - b.a) * cs + b.a * mixed, 1.0);
+        into = unsquared(mix(squared(b), squared(full), s.a));
     }
-    let cb = unpremultiply(b);
-    let cs = unpremultiply(s);
-    let mixed = clamp(blend_rgb(cb, cs, mode), vec3<f32>(0.0), vec3<f32>(1.0));
-    let full = vec4<f32>((1.0 - b.a) * cs + b.a * mixed, 1.0);
-    return unsquared(mix(squared(b), squared(full), s.a));
+    return into;
 }
 

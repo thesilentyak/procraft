@@ -9,6 +9,9 @@ struct DisplayUniform {
     c0: vec4<f32>,
     c1: vec4<f32>,
     c2: vec4<f32>,
+    // how far the quad reaches past the canvas's sides (its 0..1 across and down), then 1 to
+    // smooth the edge over that; all 0 for a quad drawn exactly
+    edge: vec4<f32>,
 }
 
 @group(0) @binding(0) var composite: texture_2d<f32>;
@@ -31,7 +34,8 @@ fn vs_display(@builtin(vertex_index) vi: u32) -> Out {
         vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0),
         vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 1.0),
     );
-    let uv = corners[vi % 6u];
+    // pushed out past each side as far as the edge is smoothed (not at all for a quad drawn exactly)
+    let uv = corners[vi % 6u] * (1.0 + 2.0 * du.edge.xy) - du.edge.xy;
     var o: Out;
     o.pos = vec4<f32>(du.m0.x * uv.x + du.m0.z * uv.y + du.m1.x, du.m0.y * uv.x + du.m0.w * uv.y + du.m1.y, 0.0, 1.0);
     o.uv = uv;
@@ -52,7 +56,18 @@ fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_display(i: Out) -> @location(0) vec4<f32> {
-    let c = textureSample(composite, smp, i.uv);
+    // how much of this target pixel the canvas covers, by how far in from each side its middle
+    // is (in target pixels): a turned canvas's sides show no steps
+    let across = length(vec2<f32>(dpdx(i.uv.x), dpdy(i.uv.x)));
+    let down = length(vec2<f32>(dpdx(i.uv.y), dpdy(i.uv.y)));
+    let inside = min(i.uv, vec2<f32>(1.0) - i.uv) / max(vec2<f32>(across, down), vec2<f32>(1e-9));
+    let covered = clamp(inside + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
+    let cover = select(1.0, covered.x * covered.y, du.edge.z > 0.5);
+    return shown(textureSample(composite, smp, i.uv)) * cover;
+}
+
+// a canvas colour (premultiplied) as the target shows it
+fn shown(c: vec4<f32>) -> vec4<f32> {
     // see-through parts (a hidden background) show what is drawn behind the canvas, the surround
     if (c.a <= 0.0) {
         return vec4<f32>(0.0);
@@ -81,6 +96,59 @@ fn fs_display(i: Out) -> @location(0) vec4<f32> {
         rgb = srgb_to_linear(rgb);
     }
     return vec4<f32>(rgb * c.a, c.a);
+}
+
+// ---- a veil: part of the canvas as it was, over it but for a hole ---------------------------
+// The texture bound as `composite` is the veil's picture, and du maps its 0..1 to clip space.
+
+struct VeilUniform {
+    // the veil's rectangle on the canvas: left, top, width, height (canvas pixels)
+    rect: vec4<f32>,
+    // the colour round the canvas as the target takes it, for the picture's see-through parts;
+    // then how many points the hole's outline has
+    surround: vec4<f32>,
+    // the hole's outline in canvas pixels, two points an entry
+    points: array<vec4<f32>, 32>,
+}
+
+@group(3) @binding(0) var<uniform> vu: VeilUniform;
+
+fn hole_point(k: u32) -> vec2<f32> {
+    let e = vu.points[k / 2u];
+    return select(e.xy, e.zw, (k & 1u) == 1u);
+}
+
+@fragment
+fn fs_veil(i: Out) -> @location(0) vec4<f32> {
+    let c = textureSample(composite, smp, i.uv);
+    let p = vu.rect.xy + i.uv * vu.rect.zw;
+    // the canvas pixels a target pixel spans: the hole's edge is smoothed over one target pixel
+    let across = max(length(dpdx(p)), 1e-4);
+    let n = min(u32(vu.surround.w), 64u);
+    var inside = false;
+    var near = 1e9;
+    for (var k = 0u; k < n; k++) {
+        let a = hole_point(k);
+        let b = hole_point((k + 1u) % n);
+        if ((a.y > p.y) != (b.y > p.y)) {
+            let x = a.x + (p.y - a.y) / (b.y - a.y) * (b.x - a.x);
+            if (p.x < x) {
+                inside = !inside;
+            }
+        }
+        let ab = b - a;
+        let t = clamp(dot(p - a, ab) / max(dot(ab, ab), 1e-12), 0.0, 1.0);
+        near = min(near, length(p - a - ab * t));
+    }
+    // how much of this pixel is outside the hole (all of it with no hole)
+    let cover = select(clamp(select(near, -near, inside) / across + 0.5, 0.0, 1.0), 1.0, n < 3u);
+    if (cover <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    let s = shown(c);
+    // where the picture is see-through, what was round the canvas showed through it
+    let rgb = s.rgb + vu.surround.rgb * (1.0 - s.a);
+    return vec4<f32>(rgb * cover, cover);
 }
 
 // ---- thumbnails: part of a layer box-filtered down to the target ----------------------------
