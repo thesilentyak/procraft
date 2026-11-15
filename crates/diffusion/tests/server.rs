@@ -7,7 +7,8 @@
 use std::time::{Duration, Instant};
 
 use procraft_diffusion::{
-    Address, Comfy, Connection, Error, Family, Feature, Request, Resolution, RunState, ServerState, Worker, plan_for,
+    Address, Comfy, Connection, Control, ControlKind, ControlStep, Error, Extraction, Family, Feature, Picture, Request,
+    Resolution, RunState, ServerState, Worker, plan_for,
 };
 
 fn address() -> Address {
@@ -140,4 +141,67 @@ fn lora_trigger_words_come_from_their_metadata() {
         filled += usize::from(!look.filled.is_empty());
     }
     assert!(filled > 0, "no LoRA on the server has trigger words in its notes");
+}
+
+#[test]
+#[ignore = "needs a ComfyUI server"]
+fn a_depth_trace_comes_back_as_greys_and_guides_a_picture() {
+    let worker = Worker::new();
+    worker.set_address(Some(address()));
+    let server = connected(&worker);
+    assert!(server.ready(Family::Anima, Feature::DepthControl), "not ready for depth");
+    // a plain scene: sky above, ground below growing lighter towards the bottom, a dark block
+    let (w, h) = (512u32, 512u32);
+    let mut rgba = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            let px = if (300..380).contains(&x) && (120..330).contains(&y) {
+                [90, 80, 70, 255]
+            } else if y < 220 {
+                [120, 170, 230, 255]
+            } else {
+                let g = (60 + (y - 220) * 120 / (h - 220)) as u8;
+                [40, g, 30, 255]
+            };
+            rgba.extend_from_slice(&px);
+        }
+    }
+    let picture = Picture::new(w, h, rgba).unwrap();
+    let started = Instant::now();
+    let id = worker.extract(Extraction { kind: ControlKind::Depth, picture, size: (w, h) });
+    let run = wait(&worker, id, |_| false);
+    eprintln!("depth trace took {:?}", started.elapsed());
+    assert_eq!(run.error, None);
+    let map = &run.results.first().expect("a depth map").picture;
+    assert_eq!((map.width, map.height), (w, h));
+    let greys = map.depth_layer();
+    let values: Vec<u8> = greys.chunks(4).map(|px| px[0]).collect();
+    let (least, most) = (values.iter().min().copied().unwrap(), values.iter().max().copied().unwrap());
+    assert!(most - least > 60, "a depth map with depth in it: {least}..{most}");
+    // that map guides a picture (a safe scene), with the depth model
+    let style = server.styles().into_iter().find(|s| s.id == "anima").unwrap();
+    let (strength, end_percent) = Family::Anima.control_settings(ControlKind::Depth, ControlStep::Balanced);
+    let request = Request {
+        prompt: "a stone tower in a grassy valley, blue sky, scenery, no humans".into(),
+        style,
+        strength: 1.0,
+        seed: 7,
+        count: 1,
+        picture: None,
+        selection: None,
+        controls: vec![Control {
+            kind: ControlKind::Depth,
+            strength,
+            end_percent,
+            picture: Picture::depth_control(w, h, &greys).unwrap(),
+        }],
+        size: (1024, 1024),
+        resolution: Resolution::Normal,
+        largest: Some(6.0),
+        nsfw: false,
+    };
+    let id = worker.submit(request);
+    let run = wait(&worker, id, |_| false);
+    assert_eq!(run.error, None);
+    assert_eq!(run.results.len(), 1);
 }

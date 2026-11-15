@@ -5,7 +5,7 @@ mod anima;
 
 use crate::comfy::ServerModels;
 use crate::plan::Plan;
-use crate::{ControlStep, Error, Graph, Request};
+use crate::{ControlKind, ControlStep, Error, Graph, Request};
 
 /// A family of diffusion models that share a text encoder, a VAE and their graphs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -25,6 +25,8 @@ pub(crate) enum ModelKind {
     InpaintControl,
     /// The control model that follows line art and scribbles.
     LineControl,
+    /// The control model that follows a depth map.
+    DepthControl,
 }
 
 impl ModelKind {
@@ -34,7 +36,7 @@ impl ModelKind {
             ModelKind::Checkpoint => "diffusion_models",
             ModelKind::TextEncoder => "text_encoders",
             ModelKind::Vae => "vae",
-            ModelKind::InpaintControl | ModelKind::LineControl => "controlnet",
+            ModelKind::InpaintControl | ModelKind::LineControl | ModelKind::DepthControl => "controlnet",
         }
     }
 
@@ -43,7 +45,7 @@ impl ModelKind {
             ModelKind::Checkpoint => &models.diffusion_models,
             ModelKind::TextEncoder => &models.text_encoders,
             ModelKind::Vae => &models.vaes,
-            ModelKind::InpaintControl | ModelKind::LineControl => &models.controls,
+            ModelKind::InpaintControl | ModelKind::LineControl | ModelKind::DepthControl => &models.controls,
         }
     }
 }
@@ -114,11 +116,11 @@ impl Family {
         }
     }
 
-    /// How closely a control layer is followed at `step`: its strength and how far through
-    /// sampling that applies.
-    pub fn control_settings(self, step: ControlStep) -> (f32, f32) {
+    /// How closely a control layer of `kind` is followed at `step`: its strength and how far
+    /// through sampling that applies.
+    pub fn control_settings(self, kind: ControlKind, step: ControlStep) -> (f32, f32) {
         match self {
-            Family::Anima => anima::control_settings(step),
+            Family::Anima => anima::control_settings(kind, step),
         }
     }
 

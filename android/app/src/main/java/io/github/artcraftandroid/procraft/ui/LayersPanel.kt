@@ -762,6 +762,7 @@ private fun LayerRow(
             l.reference -> subtitle?.let { "$it Reference" } ?: "Reference"
             l.control == io.github.artcraftandroid.procraft.core.LayerControl.LINE_ART -> "Line art control"
             l.control == io.github.artcraftandroid.procraft.core.LayerControl.SCRIBBLE -> "Scribble control"
+            l.control == io.github.artcraftandroid.procraft.core.LayerControl.DEPTH -> "Depth control"
             subtitle != null -> subtitle
             l.assisted -> "Assisted"
             l.private -> "Private"
@@ -1075,7 +1076,7 @@ private fun LayerOptions(open: Boolean, vm: CanvasViewModel, l: LayerInfo, rowY:
             Column(Modifier.width(194.dp).heightIn(min = 64.dp).clip(RoundedCornerShape(24.dp)).then(rememberFrost(24.dp)).background(tint).padding(vertical = 7.dp)) {
                 // Control layer's own choices, in the menu's place once it's tapped
                 if (choosingControl) {
-                    val kinds = listOf(null to "None", io.github.artcraftandroid.procraft.core.LayerControl.LINE_ART to "Line art", io.github.artcraftandroid.procraft.core.LayerControl.SCRIBBLE to "Scribble")
+                    val kinds = listOf(null to "None", io.github.artcraftandroid.procraft.core.LayerControl.LINE_ART to "Line art", io.github.artcraftandroid.procraft.core.LayerControl.SCRIBBLE to "Scribble", io.github.artcraftandroid.procraft.core.LayerControl.DEPTH to "Depth")
                     for ((kind, words) in kinds) Option(words, checked = l.control == kind, enabled = true, onClick = { vm.setLayerControl(l, kind); onDone() })
                 }
                 // the core's rows: each closes the menu, a switch's too (it shows ticked next time)

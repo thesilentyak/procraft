@@ -1458,8 +1458,12 @@ impl Layers {
             self.control_for = None;
             return;
         };
-        let choices =
-            [(None, "None"), (Some(LayerControl::LineArt), "Line art"), (Some(LayerControl::Scribble), "Scribble")];
+        let choices = [
+            (None, "None"),
+            (Some(LayerControl::LineArt), "Line art"),
+            (Some(LayerControl::Scribble), "Scribble"),
+            (Some(LayerControl::Depth), "Depth"),
+        ];
         let size = vec2(238.0, 7.0 * 2.0 + menu::OPTION_HEIGHT * choices.len() as f32);
         let screen = ctx.content_rect();
         let left = (from.left() - size.x - 6.0)
@@ -1874,7 +1878,8 @@ fn set_header(ui: &mut Ui, name: &str, first: bool) {
 }
 
 /// A control layer's badge, left of its blend letter: a pair of clean strokes for line art, a
-/// loose zigzag for scribble.
+/// loose zigzag for scribble, three level lines each shorter than the one below for depth (ground
+/// going into the distance).
 fn control_badge(painter: &egui::Painter, at: Pos2, kind: LayerControl, ink: Color32) {
     let stroke = egui::Stroke::new(1.6, ink);
     match kind {
@@ -1891,6 +1896,11 @@ fn control_badge(painter: &egui::Painter, at: Pos2, kind: LayerControl, ink: Col
                 })
                 .collect();
             painter.add(egui::Shape::line(points, stroke));
+        }
+        LayerControl::Depth => {
+            for (half, y) in [(6.0, 5.0), (4.0, 0.0), (2.0, -5.0)] {
+                painter.line_segment([pos2(at.x - half, at.y + y), pos2(at.x + half, at.y + y)], stroke);
+            }
         }
     }
 }

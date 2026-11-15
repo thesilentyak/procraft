@@ -226,7 +226,14 @@ impl CanvasSession {
                 return None;
             }
             let id = d.add_layer();
-            d.rename(id, if kind == LayerControl::LineArt { "Line art" } else { "Scribble" });
+            d.rename(
+                id,
+                match kind {
+                    LayerControl::LineArt => "Line art",
+                    LayerControl::Scribble => "Scribble",
+                    LayerControl::Depth => "Depth",
+                },
+            );
             d.set_control(id, Some(kind.into()));
             Some(id.0)
         })

@@ -8,7 +8,7 @@ use serde_json::json;
 use super::ModelKind;
 use crate::comfy::ServerModels;
 use crate::plan::Plan;
-use crate::{ControlStep, Error, Family, Graph, Out, Picture, Request, SelectionMode};
+use crate::{ControlKind, ControlStep, Error, Family, Graph, Out, Picture, Request, SelectionMode};
 
 pub(super) const NATIVE_PIXELS: u32 = 1024 * 1024;
 /// How much the second pass of a two-pass picture changes it: enough to add detail, too little to
@@ -26,6 +26,12 @@ pub(super) const LOOSE: (f32, f32) = (0.5, 0.4);
 pub(super) const BALANCED: (f32, f32) = (0.6, 0.6);
 pub(super) const CLOSE: (f32, f32) = (0.7, 0.8);
 pub(super) const STRICT: (f32, f32) = (1.0, 1.0);
+/// The same for a depth layer: line art's numbers, which already moved a tower and a boulder to
+/// where a depth map put them at Balanced (2026-11-15), kept apart to be tuned on their own.
+pub(super) const DEPTH_LOOSE: (f32, f32) = (0.5, 0.4);
+pub(super) const DEPTH_BALANCED: (f32, f32) = (0.6, 0.6);
+pub(super) const DEPTH_CLOSE: (f32, f32) = (0.7, 0.8);
+pub(super) const DEPTH_STRICT: (f32, f32) = (1.0, 1.0);
 /// How much the last colour match pulls a selection's result towards the original: enough to blend
 /// it in, not enough to undo the generated colours.
 pub(super) const COLOR_MATCH: f64 = 0.5;
@@ -40,14 +46,18 @@ pub(super) fn recognises(file: &str) -> bool {
     super::matches("*anima*", file)
 }
 
-/// How closely a step follows a control layer: its strength and how far through sampling that
-/// applies.
-pub(super) fn control_settings(step: ControlStep) -> (f32, f32) {
-    match step {
-        ControlStep::Loose => LOOSE,
-        ControlStep::Balanced => BALANCED,
-        ControlStep::Close => CLOSE,
-        ControlStep::Strict => STRICT,
+/// How closely a step follows a control layer of `kind`: its strength and how far through
+/// sampling that applies.
+pub(super) fn control_settings(kind: ControlKind, step: ControlStep) -> (f32, f32) {
+    match (kind, step) {
+        (ControlKind::Depth, ControlStep::Loose) => DEPTH_LOOSE,
+        (ControlKind::Depth, ControlStep::Balanced) => DEPTH_BALANCED,
+        (ControlKind::Depth, ControlStep::Close) => DEPTH_CLOSE,
+        (ControlKind::Depth, ControlStep::Strict) => DEPTH_STRICT,
+        (_, ControlStep::Loose) => LOOSE,
+        (_, ControlStep::Balanced) => BALANCED,
+        (_, ControlStep::Close) => CLOSE,
+        (_, ControlStep::Strict) => STRICT,
     }
 }
 
@@ -59,6 +69,7 @@ pub(super) fn patterns(kind: ModelKind) -> &'static [&'static str] {
         ModelKind::Vae => &["qwen_image_vae*"],
         ModelKind::InpaintControl => &["anima*lllite*inpaint*", "anima*inpaint*lllite*"],
         ModelKind::LineControl => &["anima*lllite*any*"],
+        ModelKind::DepthControl => &["anima*lllite*depth*"],
     }
 }
 
@@ -69,6 +80,7 @@ pub(super) fn describe(kind: ModelKind) -> &'static str {
         ModelKind::Vae => "qwen_image_vae.safetensors",
         ModelKind::InpaintControl => "anima-lllite-inpainting-v2.safetensors",
         ModelKind::LineControl => "anima-lllite-any-test-like-v2.safetensors",
+        ModelKind::DepthControl => "anima-lllite-depth-1.safetensors",
     }
 }
 
@@ -116,8 +128,11 @@ pub(super) fn graph(request: &Request, plan: Plan, seed: u64, models: &ServerMod
         for control in &request.controls {
             let png = control.picture.resized(width, height)?.to_png()?;
             let image = g.add("ETN_LoadImageBase64", [("image", json!(procraft_engine::base64::encode(&png)))]);
-            let load =
-                g.add("ETN_control_load", [("model", model.into()), ("weights", json!(file(ModelKind::LineControl)?))]);
+            let weights = match control.kind {
+                ControlKind::Depth => file(ModelKind::DepthControl)?,
+                ControlKind::LineArt | ControlKind::Scribble => file(ModelKind::LineControl)?,
+            };
+            let load = g.add("ETN_control_load", [("model", model.into()), ("weights", json!(weights))]);
             let apply = g.add(
                 "ETN_control_apply",
                 [
@@ -304,6 +319,7 @@ mod tests {
             controls: vec![
                 "anima-lllite-inpainting-v2.safetensors".into(),
                 "anima-lllite-any-test-like-v2.safetensors".into(),
+                "anima-lllite-depth-1.safetensors".into(),
             ],
             ..ServerModels::default()
         }
@@ -463,7 +479,7 @@ mod tests {
     }
 
     fn controlled(mut request: Request, kind: ControlKind, step: ControlStep) -> Request {
-        let (strength, end_percent) = control_settings(step);
+        let (strength, end_percent) = control_settings(kind, step);
         request.controls = vec![crate::Control {
             kind,
             strength,
@@ -475,17 +491,38 @@ mod tests {
 
     #[test]
     fn the_four_steps_are_tuned_as_designed() {
-        assert_eq!(control_settings(ControlStep::Loose), (0.5, 0.4));
-        assert_eq!(control_settings(ControlStep::Balanced), (0.6, 0.6));
-        assert_eq!(control_settings(ControlStep::Close), (0.7, 0.8));
-        assert_eq!(control_settings(ControlStep::Strict), (1.0, 1.0));
+        for kind in [ControlKind::LineArt, ControlKind::Scribble, ControlKind::Depth] {
+            assert_eq!(control_settings(kind, ControlStep::Loose), (0.5, 0.4));
+            assert_eq!(control_settings(kind, ControlStep::Balanced), (0.6, 0.6));
+            assert_eq!(control_settings(kind, ControlStep::Close), (0.7, 0.8));
+            assert_eq!(control_settings(kind, ControlStep::Strict), (1.0, 1.0));
+        }
         assert_eq!(ControlStep::default(), ControlStep::Balanced);
+    }
+
+    #[test]
+    fn a_depth_layer_is_followed_with_the_depth_model() {
+        let request = controlled(request(1.0), ControlKind::Depth, ControlStep::Balanced);
+        let built = graph(&request, one_pass(64, 32), 42, &models()).unwrap();
+        let json = built.to_json();
+        let loads = built.nodes_of("ETN_control_load");
+        assert_eq!(loads.len(), 1);
+        assert_eq!(json[&loads[0]]["inputs"]["weights"], "anima-lllite-depth-1.safetensors");
+        let applies = built.nodes_of("ETN_control_apply");
+        assert_eq!(json[&applies[0]]["inputs"]["strength"], json!(0.6f32));
+        // without the depth file, the depth layer can't be followed: the file is named
+        let mut without = models();
+        without.controls.retain(|f| !f.contains("depth"));
+        let Err(Error::Missing(missing)) = graph(&request, one_pass(64, 32), 42, &without) else {
+            panic!("a depth layer without the depth model should say what's missing")
+        };
+        assert!(format!("{missing:?}").contains("anima-lllite-depth-1.safetensors"));
     }
 
     #[test]
     fn control_layers_are_chained_on_the_model_before_sampling() {
         let mut request = controlled(request(1.0), ControlKind::LineArt, ControlStep::Close);
-        let (strength, end_percent) = control_settings(ControlStep::Loose);
+        let (strength, end_percent) = control_settings(ControlKind::Scribble, ControlStep::Loose);
         request.controls.push(crate::Control {
             kind: ControlKind::Scribble,
             strength,

@@ -128,6 +128,7 @@ impl From<LayerControl> for RequestControlKind {
         match kind {
             LayerControl::LineArt => RequestControlKind::LineArt,
             LayerControl::Scribble => RequestControlKind::Scribble,
+            LayerControl::Depth => RequestControlKind::Depth,
         }
     }
 }
@@ -150,6 +151,7 @@ pub enum GenerationFeature {
     Selections,
     ControlLayers,
     ControlFromPicture,
+    DepthControl,
 }
 
 impl From<Feature> for GenerationFeature {
@@ -160,6 +162,7 @@ impl From<Feature> for GenerationFeature {
             Feature::Selections => GenerationFeature::Selections,
             Feature::ControlLayers => GenerationFeature::ControlLayers,
             Feature::ControlFromPicture => GenerationFeature::ControlFromPicture,
+            Feature::DepthControl => GenerationFeature::DepthControl,
         }
     }
 }
@@ -650,6 +653,23 @@ impl Generation {
         self.worker.server().ready(procraft_diffusion::Family::Anima, Feature::ControlFromPicture)
     }
 
+    /// What depth control layers lack on the server, in a few words ("needs
+    /// anima-lllite-depth-1.safetensors", "needs comfyui_controlnet_aux"); none when it's ready
+    /// (or not connected, when nothing is known yet).
+    pub fn depth_missing(&self) -> Option<String> {
+        let server = self.worker.server();
+        if server.connection != Connection::Connected {
+            return None;
+        }
+        let family = procraft_diffusion::Family::Anima;
+        let readiness = server.readiness.iter().find(|(f, _)| *f == family).map(|(_, r)| r)?;
+        let missing = readiness.missing(Feature::DepthControl);
+        missing.first().map(|first| match first {
+            procraft_diffusion::Missing::AddOn(name) => format!("needs {name}"),
+            procraft_diffusion::Missing::Model { what, .. } => format!("needs {what}"),
+        })
+    }
+
     /// What `resolution` makes of `session`'s area (the selection's context box when there is a
     /// selection): its target, passes and generated size.
     pub fn size_for(&self, session: &CanvasSession, resolution: GenerationResolution, style: String) -> SizeInfo {
@@ -775,8 +795,11 @@ impl Generation {
             request_selection = Some(RequestSelection { mask: part.clone(), mode: mode.into() });
             mask = Some(part);
         }
-        let controls = run_controls(session, &run.controls, area)?;
-        if !controls.is_empty() && !server.ready(style.family, Feature::ControlLayers) {
+        let depth_ready = server.ready(style.family, Feature::DepthControl);
+        let controls = run_controls(session, &run.controls, area, depth_ready)?;
+        if controls.iter().any(|c| c.kind != RequestControlKind::Depth)
+            && !server.ready(style.family, Feature::ControlLayers)
+        {
             return Err(GenerationError::NotReady {
                 reason: format!("the server isn't ready to {}", Feature::ControlLayers.label()),
             });
@@ -824,7 +847,11 @@ impl Generation {
             return Err(GenerationError::NotReady { reason: "not connected to a server".to_owned() });
         }
         let family = procraft_diffusion::Family::Anima;
-        if !server.ready(family, Feature::ControlFromPicture) {
+        if kind == LayerControl::Depth {
+            if let Some(reason) = self.depth_missing() {
+                return Err(GenerationError::NotReady { reason });
+            }
+        } else if !server.ready(family, Feature::ControlFromPicture) {
             let missing: Vec<String> = server
                 .readiness
                 .iter()
@@ -1584,13 +1611,16 @@ fn selection_bounds(session: &CanvasSession) -> Option<([u32; 4], (u32, u32))> {
     Some((bounds, (state.doc.width(), state.doc.height())))
 }
 
-/// The visible control layers' pictures over `area`, each followed as closely as its setting says
-/// (Balanced when the run has none for it). A layer with nothing drawn in `area` is left out: a
-/// blank guide would only steer the picture towards empty space.
+/// The control layers' pictures over `area` (hidden ones too: hiding one only hides it from view),
+/// each followed as closely as its setting says (Balanced when the run has none for it). A layer
+/// with nothing drawn in `area` is left out: a blank guide would only steer the picture towards
+/// empty space. So are depth layers when the server can't follow them (`depth_ready` false),
+/// rather than failing the run.
 fn run_controls(
     session: &CanvasSession,
     settings: &[ControlSetting],
     area: IRect,
+    depth_ready: bool,
 ) -> Result<Vec<RequestControl>, GenerationError> {
     let layers: Vec<(LayerId, LayerControl)> = {
         let st = session.shared.lock();
@@ -1598,9 +1628,12 @@ fn run_controls(
     };
     let mut controls = Vec::new();
     for (id, kind) in layers {
+        if kind == LayerControl::Depth && !depth_ready {
+            continue;
+        }
         let step = settings.iter().find(|s| s.layer == id.0).map_or_else(ControlStep::default, |s| s.step);
-        let (strength, end_percent) = procraft_diffusion::Family::Anima.control_settings(step.into());
-        let Some(picture) = session.control_picture(id, area)? else { continue };
+        let (strength, end_percent) = procraft_diffusion::Family::Anima.control_settings(kind.into(), step.into());
+        let Some(picture) = session.control_picture(id, kind, area)? else { continue };
         controls.push(RequestControl { kind: kind.into(), strength, end_percent, picture });
     }
     Ok(controls)
@@ -1632,7 +1665,8 @@ fn trace_into(
     let shared = shared.and_then(std::sync::Weak::upgrade).ok_or_else(|| "the canvas is closed".to_owned())?;
     // on the artwork's shared state itself: a CanvasSession made here would detach the window
     // when dropped, and the canvas would stop drawing
-    replace_control_pixels(&shared, extract.layer, area, lines.lines_alpha(), mask)
+    let pixels = if extract.kind == LayerControl::Depth { lines.depth_layer() } else { lines.lines_alpha() };
+    replace_control_pixels(&shared, extract.layer, area, pixels, mask)
         .ok_or_else(|| "The control layer is gone".to_owned())
 }
 
@@ -1837,9 +1871,15 @@ impl CanvasSession {
         Ok(ForGeneration { width, height, picture: Some(picture), from_srgb })
     }
 
-    /// Layer `id`'s pixels over `area`, flattened onto white and turned into white lines on black
-    /// (a control image), at the area's size; none when nothing is drawn there.
-    fn control_picture(&self, id: LayerId, area: IRect) -> Result<Option<Picture>, GenerationError> {
+    /// Layer `id`'s pixels over `area` as a control image of `kind`, at the area's size: lines
+    /// flattened onto white and turned into white lines on black, or depth flattened onto black
+    /// and kept as greys; none when nothing is drawn there.
+    fn control_picture(
+        &self,
+        id: LayerId,
+        kind: LayerControl,
+        area: IRect,
+    ) -> Result<Option<Picture>, GenerationError> {
         let mut guard = self.shared.lock_finished();
         let st = &mut *guard;
         st.finish_stroke();
@@ -1859,7 +1899,11 @@ impl CanvasSession {
         if pixels.as_chunks::<4>().0.iter().all(|px| px[3] == 0) {
             return Ok(None);
         }
-        Picture::control(area.width(), area.height(), &pixels).map(Some).map_err(|e| unreadable(e.to_string()))
+        let picture = match kind {
+            LayerControl::Depth => Picture::depth_control(area.width(), area.height(), &pixels),
+            LayerControl::LineArt | LayerControl::Scribble => Picture::control(area.width(), area.height(), &pixels),
+        };
+        picture.map(Some).map_err(|e| unreadable(e.to_string()))
     }
 
     /// The picture for a control layer from the picture: `area`'s part of the canvas without its
@@ -1949,19 +1993,20 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!((listed[0].id, listed[0].kind, listed[0].visible), (id, LayerControl::LineArt, true));
         assert!(listed[0].thumbnail.width > 0 && listed[0].thumbnail.height > 0);
-        // hidden, it is ignored by a run; shown, it is followed at Balanced by default
+        // hidden, it still guides (hiding only hides it from view, as in Krita), followed at
+        // Balanced by default
         assert!(s.set_layer_visible(id, false));
         assert!(!generation.control_layers(&s)[0].visible);
-        assert!(run_controls(&s, &[], IRect::from_size(32, 32)).unwrap().is_empty());
+        assert_eq!(run_controls(&s, &[], IRect::from_size(32, 32), true).unwrap().len(), 1);
         assert!(s.set_layer_visible(id, true));
-        let defaults = run_controls(&s, &[], IRect::from_size(32, 32)).unwrap();
+        let defaults = run_controls(&s, &[], IRect::from_size(32, 32), true).unwrap();
         assert_eq!((defaults.len(), defaults[0].strength, defaults[0].end_percent), (1, 0.6, 0.6));
         // a setting replaces the default
         let close = [ControlSetting { layer: id, step: ControlStep::Close }];
-        let close = run_controls(&s, &close, IRect::from_size(32, 32)).unwrap();
+        let close = run_controls(&s, &close, IRect::from_size(32, 32), true).unwrap();
         assert_eq!((close[0].strength, close[0].end_percent), (0.7, 0.8));
         let strict = [ControlSetting { layer: id, step: ControlStep::Strict }];
-        let strict = run_controls(&s, &strict, IRect::from_size(32, 32)).unwrap();
+        let strict = run_controls(&s, &strict, IRect::from_size(32, 32), true).unwrap();
         assert_eq!((strict[0].strength, strict[0].end_percent), (1.0, 1.0));
         // turned off, it is not listed or used
         assert!(s.set_layer_control(id, None));
@@ -1997,6 +2042,30 @@ mod tests {
     }
 
     #[test]
+    fn a_depth_layer_is_sent_as_greys_and_left_out_when_the_server_cannot_follow_it() {
+        let Some(s) = session(64) else { return };
+        let id = s.add_control_layer(LayerControl::Depth);
+        assert!(id != 0);
+        assert_eq!(s.shared.lock().doc.layer(LayerId(id)).unwrap().name, "Depth");
+        // a traced map lands as opaque greys, one undo step
+        let map = Picture::new(4, 4, [200u8, 200, 200, 255].repeat(16)).unwrap().depth_layer();
+        let area = IRect::from_size(4, 4);
+        assert_eq!(replace_control_pixels(&s.shared, LayerId(id), area, map, None), Some(id));
+        assert_eq!(at(&composite(&s), 64, 0, 0), [200, 200, 200, 255], "opaque greys on the canvas");
+        // sent as its greys, what's clear counting as far (black)
+        let controls = run_controls(&s, &[], IRect::from_size(8, 8), true).unwrap();
+        assert_eq!(controls.len(), 1);
+        assert_eq!(controls[0].kind, RequestControlKind::Depth);
+        let rgba = &controls[0].picture.rgba;
+        assert_eq!(&rgba[..4], &[200, 200, 200, 255], "a grey stays a grey");
+        assert_eq!(&rgba[rgba.len() - 4..], &[0, 0, 0, 255], "nothing drawn is far");
+        // a server without the depth model leaves it out rather than failing
+        assert!(run_controls(&s, &[], IRect::from_size(8, 8), false).unwrap().is_empty());
+        s.undo();
+        assert!(run_controls(&s, &[], IRect::from_size(8, 8), true).unwrap().is_empty(), "undone: empty again");
+    }
+
+    #[test]
     fn a_new_control_layer_is_empty_above_the_current_one_and_one_undo_step() {
         let Some(s) = session(64) else { return };
         let lower = s.shared.lock().doc.current();
@@ -2015,7 +2084,7 @@ mod tests {
             );
         }
         // empty, it isn't sent with a run
-        assert!(run_controls(&s, &[], IRect::from_size(64, 64)).unwrap().is_empty());
+        assert!(run_controls(&s, &[], IRect::from_size(64, 64), true).unwrap().is_empty());
         s.undo();
         assert!(s.shared.lock().doc.layer(LayerId(id)).is_none(), "one undo takes it away");
     }

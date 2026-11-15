@@ -24,7 +24,9 @@ when something gets a name, and change it here first when a name changes.
 | **Suggestions** (the **suggestion strip**) | The chips under the prompt: tags for the word being typed, or recent prompts when it's empty. | — |
 | **Recent prompts** | The last 20 prompts, offered when the prompt is empty. | — |
 | **Control part** | The popover's Control section: a row per control layer, then the add buttons. | "Control" |
-| **Control layer** | A layer the picture follows rather than shows. Two kinds. | "Line art", "Scribble" |
+| **Control layer** | A layer the picture follows rather than shows. Three kinds (Depth from M9). Hidden, it still guides. | "Line art", "Scribble", "Depth" |
+| **Depth** (a control layer's kind) | Greys that set what's near (white) and far (black); transparent counts as far. | "Depth", "Depth control", "lighter is nearer" |
+| **Depth reader** (docs only) | The server's model that traces depth from a picture: Depth Anything V2 Large. Never named in the app. | — |
 | **Trace button** | On each control row: fills that layer with lines traced from what's visible. | a line with a sparkle |
 | **Steps** | How closely a control layer is followed. | "Loose", "Balanced", "Close", "Strict" |
 | **Strength** | How much a run changes: 100 % makes a new picture; less refines what's there. | "Strength", "New image" |

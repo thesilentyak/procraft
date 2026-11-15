@@ -1,6 +1,7 @@
-//! Control lines from a picture, made on the server: the visible picture through one of its line
-//! extractors, back as white lines on black. Extraction needs no model family. The extractors
-//! come from the `comfyui_controlnet_aux` add-on.
+//! Control layers from a picture, made on the server: the visible picture through one of its line
+//! extractors, back as white lines on black, or through its depth reader, back as greys (white
+//! near). Extraction needs no model family. The extractors come from the `comfyui_controlnet_aux`
+//! add-on.
 
 use serde_json::{Value, json};
 
@@ -28,6 +29,8 @@ fn extractor(kind: ControlKind) -> &'static [(&'static str, &'static [(&'static 
     match kind {
         ControlKind::LineArt => &[("AnimeLineArtPreprocessor", &[])],
         ControlKind::Scribble => &[("PiDiNetPreprocessor", &[("safe", "enable")]), ("ScribblePreprocessor", &[])],
+        // Depth Anything V2 Large: the depth model was trained on its maps
+        ControlKind::Depth => &[("DepthAnythingV2Preprocessor", &[("ckpt_name", "depth_anything_v2_vitl.pth")])],
     }
 }
 
@@ -98,5 +101,17 @@ mod tests {
         assert_eq!(json[&scribble[0]]["inputs"]["image"][0], json!(pidinet[0]), "it takes PiDiNet's edges");
         let sent = g.nodes_of("ETN_SendImageWebSocket");
         assert_eq!(json[&sent[0]]["inputs"]["images"][0], json!(scribble[0]), "and its strokes are sent");
+    }
+
+    #[test]
+    fn depth_is_read_with_depth_anything_large() {
+        let g = graph(ControlKind::Depth, &picture(1024, 700)).unwrap();
+        let json = g.to_json();
+        let readers = g.nodes_of("DepthAnythingV2Preprocessor");
+        assert_eq!(readers.len(), 1);
+        assert_eq!(json[&readers[0]]["inputs"]["ckpt_name"], "depth_anything_v2_vitl.pth");
+        assert_eq!(json[&readers[0]]["inputs"]["resolution"], 704);
+        let sent = g.nodes_of("ETN_SendImageWebSocket");
+        assert_eq!(json[&sent[0]]["inputs"]["images"], json!([&readers[0], 0]));
     }
 }

@@ -18,11 +18,19 @@ pub enum Feature {
     ControlLayers,
     /// Making a control layer from a picture, with the server's line extractor.
     ControlFromPicture,
+    /// Depth control layers: followed with the depth model, traced with the depth reader.
+    DepthControl,
 }
 
 impl Feature {
-    pub const ALL: [Feature; 5] =
-        [Feature::Generate, Feature::Refine, Feature::Selections, Feature::ControlLayers, Feature::ControlFromPicture];
+    pub const ALL: [Feature; 6] = [
+        Feature::Generate,
+        Feature::Refine,
+        Feature::Selections,
+        Feature::ControlLayers,
+        Feature::ControlFromPicture,
+        Feature::DepthControl,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -31,6 +39,7 @@ impl Feature {
             Feature::Selections => "Selections",
             Feature::ControlLayers => "Control layers",
             Feature::ControlFromPicture => "Control layers from a picture",
+            Feature::DepthControl => "Depth control",
         }
     }
 
@@ -59,6 +68,13 @@ impl Feature {
                 "PiDiNetPreprocessor",
                 "ScribblePreprocessor",
             ],
+            Feature::DepthControl => &[
+                "ETN_SendImageWebSocket",
+                "ETN_LoadImageBase64",
+                "ETN_control_load",
+                "ETN_control_apply",
+                "DepthAnythingV2Preprocessor",
+            ],
         }
     }
 
@@ -68,6 +84,7 @@ impl Feature {
             Feature::Generate | Feature::Refine | Feature::ControlFromPicture => &[],
             Feature::Selections => &[ModelKind::InpaintControl],
             Feature::ControlLayers => &[ModelKind::LineControl],
+            Feature::DepthControl => &[ModelKind::DepthControl],
         }
     }
 }
@@ -84,7 +101,10 @@ pub fn all_nodes() -> Vec<&'static str> {
 pub fn add_on(node: &str) -> &'static str {
     if node.starts_with("INPAINT_") {
         "comfyui-inpaint-nodes"
-    } else if matches!(node, "AnimeLineArtPreprocessor" | "PiDiNetPreprocessor" | "ScribblePreprocessor") {
+    } else if matches!(
+        node,
+        "AnimeLineArtPreprocessor" | "PiDiNetPreprocessor" | "ScribblePreprocessor" | "DepthAnythingV2Preprocessor"
+    ) {
         "comfyui_controlnet_aux"
     } else {
         "comfyui-tooling-nodes"
@@ -169,10 +189,27 @@ mod tests {
     fn a_full_server_is_ready_for_everything() {
         let models = server(
             &all_nodes(),
-            &["anima-lllite-inpainting-v2.safetensors", "anima-lllite-any-test-like-v2.safetensors"],
+            &[
+                "anima-lllite-inpainting-v2.safetensors",
+                "anima-lllite-any-test-like-v2.safetensors",
+                "anima-lllite-depth-1.safetensors",
+            ],
         );
         let r = Readiness::check(Family::Anima, &models);
         assert!(Feature::ALL.iter().all(|&f| r.ready(f)), "{r:?}");
+    }
+
+    #[test]
+    fn a_server_without_the_depth_model_loses_only_depth() {
+        let models = server(
+            &all_nodes(),
+            &["anima-lllite-inpainting-v2.safetensors", "anima-lllite-any-test-like-v2.safetensors"],
+        );
+        let r = Readiness::check(Family::Anima, &models);
+        assert!(r.ready(Feature::ControlLayers) && r.ready(Feature::ControlFromPicture));
+        let depth: Vec<String> = r.missing(Feature::DepthControl).iter().map(ToString::to_string).collect();
+        assert_eq!(depth, ["anima-lllite-depth-1.safetensors in models/controlnet"]);
+        assert_eq!(add_on("DepthAnythingV2Preprocessor"), "comfyui_controlnet_aux");
     }
 
     #[test]

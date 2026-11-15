@@ -153,6 +153,38 @@ impl Picture {
         Picture::new(width, height, rgba)
     }
 
+    /// A depth control image from a depth layer's pixels (`premultiplied` RGBA8, `width ×
+    /// height`): the layer flattened onto black, so what's transparent counts as furthest, and its
+    /// luminance kept as it is (white nearest), which is what the depth model expects.
+    pub fn depth_control(width: u32, height: u32, premultiplied: &[u8]) -> Result<Picture, Error> {
+        if width == 0 || height == 0 || premultiplied.len() as u64 != u64::from(width) * u64::from(height) * 4 {
+            return Err(Error::picture(format!(
+                "{} bytes aren't {width} × {height} depth pixels",
+                premultiplied.len()
+            )));
+        }
+        let mut rgba = Vec::with_capacity(premultiplied.len());
+        for &[r, g, b, _] in premultiplied.as_chunks::<4>().0 {
+            // over black, a premultiplied pixel is its own colour
+            let luma = (299 * u32::from(r) + 587 * u32::from(g) + 114 * u32::from(b) + 500) / 1000;
+            let grey = u8::try_from(luma).unwrap_or(255);
+            rgba.extend_from_slice(&[grey, grey, grey, 255]);
+        }
+        Picture::new(width, height, rgba)
+    }
+
+    /// A depth reader's picture (white near, black far) as a layer's pixels (premultiplied RGBA8):
+    /// opaque greys, each the pixel's luminance.
+    pub fn depth_layer(&self) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity(self.rgba.len());
+        for &[r, g, b, _] in self.rgba.as_chunks::<4>().0 {
+            let luma = (299 * u32::from(r) + 587 * u32::from(g) + 114 * u32::from(b) + 500) / 1000;
+            let grey = u8::try_from(luma).unwrap_or(255);
+            rgba.extend_from_slice(&[grey, grey, grey, 255]);
+        }
+        rgba
+    }
+
     /// An extractor's picture (white lines on black) as a layer's pixels (premultiplied RGBA8):
     /// black where the lines are and clear where they aren't, its alpha the pixel's luminance.
     pub fn lines_alpha(&self) -> Vec<u8> {
@@ -244,5 +276,22 @@ mod tests {
             vec![0, 0, 0, 255, 0, 0, 0, 0, 0, 0, 0, 128, 0, 0, 0, 150],
             "white is opaque black, black clear, grey half; colour weighs as luminance"
         );
+    }
+
+    #[test]
+    fn a_depth_layer_counts_what_is_clear_as_far() {
+        // a white pixel, a half-covered white pixel (premultiplied), a clear one and a mid grey
+        let layer = [255u8, 255, 255, 255, 128, 128, 128, 128, 0, 0, 0, 0, 100, 100, 100, 255];
+        let control = Picture::depth_control(2, 2, &layer).unwrap();
+        let greys: Vec<u8> = control.rgba.chunks(4).map(|px| px[0]).collect();
+        assert_eq!(greys, [255, 128, 0, 100]);
+        assert!(control.rgba.chunks(4).all(|px| px[3] == 255));
+        assert!(Picture::depth_control(2, 2, &layer[..8]).is_err());
+    }
+
+    #[test]
+    fn a_traced_depth_map_lands_as_opaque_greys() {
+        let map = Picture::new(2, 1, vec![255, 255, 255, 255, 30, 30, 30, 255]).unwrap();
+        assert_eq!(map.depth_layer(), [255, 255, 255, 255, 30, 30, 30, 255]);
     }
 }

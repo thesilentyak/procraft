@@ -274,6 +274,8 @@ pub enum ControlKind {
     LineArt,
     /// Rough strokes, followed loosely.
     Scribble,
+    /// Greys for how near things are: white nearest, black (or nothing) furthest.
+    Depth,
 }
 
 /// A layer whose pixels guide generation: its kind (its strength is the run's, not the layer's).
@@ -735,9 +737,10 @@ impl Document {
         true
     }
 
-    /// The visible layers whose pixels guide generation, bottom first.
+    /// The layers whose pixels guide generation, bottom first: hidden ones too (hiding one only
+    /// hides it from view, as in Krita).
     pub fn control_layers(&self) -> impl Iterator<Item = &Layer> + '_ {
-        self.layers.iter().filter(|l| l.control.is_some() && l.visible)
+        self.layers.iter().filter(|l| l.control.is_some())
     }
 
     /// Whether layer `id` is left out of the picture while another is shown alone (solo): all

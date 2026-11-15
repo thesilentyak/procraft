@@ -154,8 +154,46 @@ pub const ANIMA: ModelSet = ModelSet {
             sha256: "8863424f04a2445815a827b22cbda557a085d2752e05fab54a2b303821a9e3b2",
             url: "https://huggingface.co/kohya-ss/Anima-LLLite/resolve/main/anima-lllite-any-test-like-v2.safetensors",
         },
+        ModelFile {
+            folder: "controlnet",
+            name: "anima-lllite-depth-1.safetensors",
+            size: 7864128,
+            sha256: "81357e51cd59874b4fbdda1eb3117aa73eafe36cc7efb9cf80a152d6bc8d0602",
+            url: "https://huggingface.co/kohya-ss/Anima-LLLite/resolve/main/anima-lllite-depth-1.safetensors",
+        },
     ],
 };
+
+/// The tracers' own models, downloaded with a family's files so that no trace waits for one:
+/// `comfyui_controlnet_aux` looks for each under its `ckpts/` folder, by Hugging Face repository,
+/// and only downloads what isn't there. Their folders are under `ComfyUI/`, not `models/`, and are
+/// the add-on's own choice: check them again when its pin changes.
+pub const TRACERS: &[ModelFile] = &[
+    ModelFile {
+        folder: "custom_nodes/comfyui_controlnet_aux/ckpts/depth-anything/Depth-Anything-V2-Large",
+        name: "depth_anything_v2_vitl.pth",
+        size: 1341395338,
+        sha256: "a7ea19fa0ed99244e67b624c72b8580b7e9553043245905be58796a608eb9345",
+        url: "https://huggingface.co/depth-anything/Depth-Anything-V2-Large/resolve/main/depth_anything_v2_vitl.pth",
+    },
+    ModelFile {
+        folder: "custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators",
+        name: "netG.pth",
+        size: 217631959,
+        sha256: "ccabdcc3f5cf3c07cf65d58776acb21df7dfda825cdc70c9766a93fd62bfc488",
+        url: "https://huggingface.co/lllyasviel/Annotators/resolve/main/netG.pth",
+    },
+    ModelFile {
+        folder: "custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators",
+        name: "table5_pidinet.pth",
+        size: 2871148,
+        sha256: "80860ac267258b5f27486e0ef152a211d0b08120f62aeb185a050acc30da486c",
+        url: "https://huggingface.co/lllyasviel/Annotators/resolve/main/table5_pidinet.pth",
+    },
+];
+
+/// The tracers' licence line, shown with a family's: the depth reader is non-commercial too.
+pub const TRACERS_LICENCE: &str = "Depth Anything V2 Large (the depth reader): CC BY-NC 4.0, non-commercial";
 
 #[cfg(test)]
 mod tests {

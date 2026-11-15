@@ -71,6 +71,15 @@ fn check_folder(dir: &Path, verify: bool) -> Result<bool, String> {
         }
     }
 
+    // the tracers' models: without one, its first trace downloads it (not a reason to fail)
+    for file in pins::TRACERS {
+        let path = dir.join("ComfyUI").join(file.folder).join(file.name);
+        match fs::metadata(&path) {
+            Ok(metadata) if metadata.len() == file.size => println!("✓ tracer model {}", file.name),
+            _ => println!("ℹ tracer model {}: missing, fetched by the first trace that needs it", file.name),
+        }
+    }
+
     let models = check_models(dir, verify);
     let mut ready = true;
     for family in Family::ALL {
@@ -168,7 +177,7 @@ struct Kind {
     patterns: &'static [&'static str],
 }
 
-const ANIMA_KINDS: [Kind; 5] = [
+const ANIMA_KINDS: [Kind; 6] = [
     Kind { label: "checkpoint", folder: "diffusion_models", patterns: &["*anima*"] },
     Kind { label: "text encoder", folder: "text_encoders", patterns: &["qwen_3_06b*"] },
     Kind { label: "VAE", folder: "vae", patterns: &["qwen_image_vae*"] },
@@ -178,6 +187,7 @@ const ANIMA_KINDS: [Kind; 5] = [
         patterns: &["anima*lllite*inpaint*", "anima*inpaint*lllite*"],
     },
     Kind { label: "line control", folder: "controlnet", patterns: &["anima*lllite*any*"] },
+    Kind { label: "depth control", folder: "controlnet", patterns: &["anima*lllite*depth*"] },
 ];
 
 impl Kind {
@@ -348,6 +358,7 @@ mod tests {
             ("vae", "qwen_image_vae_custom.safetensors"),
             ("controlnet", "anima-lllite-inpainting-custom.safetensors"),
             ("controlnet", "anima-lllite-any-custom.safetensors"),
+            ("controlnet", "anima-lllite-depth-custom.safetensors"),
         ];
         for (folder, name) in files {
             let folder = dir.join("ComfyUI/models").join(folder);

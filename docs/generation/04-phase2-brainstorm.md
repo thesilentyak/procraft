@@ -142,3 +142,124 @@ trigger = "@dragonball"
 
 The brainstorm for style editing is settled. Its proposal, `05-styles-proposal.md`, and its design,
 `06-styles-design.md`, are final; next is M6.
+
+## Depth and pose
+
+*Started 2026-11-08. Two more kinds of control layer, beside Line art and Scribble.*
+
+### Where it starts
+
+- **Control layers today**: Line art and Scribble, added from the popover's Control part, each
+  followed at one of four steps (Loose, Balanced, Close, Strict). Each row's **trace button** makes
+  the layer from what's visible on the canvas, with a preprocessor on the server. The layer is an
+  ordinary layer, so it can be painted on.
+- **How they're applied**: Anima's LLLite control models, through the tooling add-on's nodes
+  (`comfyui-tooling-nodes`). Line art and Scribble both use `anima-lllite-any-test-like-v2`.
+- **The preprocessors are already installed**: `comfyui_controlnet_aux` has
+  `DepthAnythingV2Preprocessor` (depth) and `DWPreprocessor` (pose: body, hands and face). Each
+  downloads its own small model the first time it's used.
+- **What a depth layer is**: a grey picture, **white near and black far**. A depth layer fixes
+  the picture's shapes and space (a road going into the distance, a rock in front of a tree)
+  without fixing its lines or colours.
+- **What a pose layer is**: a coloured stick figure on black, one colour per limb, with dots for
+  the face and hands (DWPose's own drawing). It fixes where a figure's head, arms and legs go.
+- **Krita** (behaviour only): Depth and Pose are kinds of control layer there too, made from the
+  picture with the same "from the image" button. Its Pose layer is a **vector layer**: the figure's
+  joints can be dragged afterwards and new figures added.
+
+### What models there are (researched 2026-11-08)
+
+Two for each. All four carry Anima's non-commercial licence, like Anima itself; we never ship
+them, so nothing changes there.
+
+**Depth**
+
+| | kohya `anima-lllite-depth-1` | TaihoC Anima-ControlNet-VACE-Depth |
+|---|---|---|
+| What it is | an LLLite: a small add-on to the model's attention, 8 MB | a VACE ControlNet: copies of some of the model's blocks, 596 MB |
+| Trained on | Anima **Preview3**, 2,000 pictures; works on 1.0 "with somewhat reduced quality" | Anima **1.0**, 20,000 steps at 1024², a mix of depth sources |
+| Runs with | what we already use (the tooling add-on's control nodes, as Line art) | one person's fork of ComfyUI-Advanced-ControlNet, on a side branch, its Anima nodes undocumented (7 stars) |
+| Input | white near, black far (Depth Anything V2) | Depth Anything V2 suggested |
+| Said of it | "intentionally moderate"; one user: "works 50/50" | users: "much better than LLLite", "works so great"; no numbers |
+
+**Pose**
+
+| | kohya `anima-lllite-pose-1` | Claquasse Anima Control Pose Preview-2 |
+|---|---|---|
+| What it is | an LLLite, 23 MB | a control-LoRA: the skeleton goes in beside the picture, plus a LoRA on the model, 75 MB |
+| Trained on | Anima **Preview3**, 1,544 pairs | Anima **1.0**, more than 3,900 pairs, at 512, 768 and 1024 |
+| Runs with | what we already use | two node folders copied from its Hugging Face page (no GitHub), plus the usual LoRA loader; its photo detector adds Python packages and a 330 MB download, but we'd only need the apply node if we draw the skeleton ourselves |
+| Input | DWPose's drawing: coloured limbs, white face points, hand points | a "thin" skeleton, hands and face left out |
+| Said of it | by its author: "noticeably weaker", a soft hint, not a lock | measured by its author: a held-out pose followed **83 %** of the time at 1024 (37 % with it off); misses dynamic poses (running, sitting) and mushes busy hands; strength 0–2; "experimental", Preview-3 coming |
+
+In short: the kohya pair costs nothing to add and is what Krita uses, but was made for an older
+Anima and is weak, pose especially. The newer pair is made for Anima 1.0 and is said to be
+clearly better, but each brings someone else's add-on that the companion would have to install
+for everyone, and both are one person's experimental work.
+
+### Questions
+
+1. **Which models.** To be settled by **trying them on the dev ComfyUI** with test pictures
+   (below), since only the newer pose model has any numbers. The plan: the kohya pair first
+   (nothing to install); then Claquasse's pose model (its apply node only), since pose is where
+   the gap looks widest and an editable figure is worth building only for a control that holds;
+   the VACE depth only if kohya's depth disappoints, its fork being the riskiest add-on.
+2. **How a depth layer is made.** Traced from what's visible (the trace button, as Line art), and,
+   since it's an ordinary layer, **painted on in greys** (lighter is nearer). **Picked**, with a
+   short hint in the row ("lighter is nearer").
+3. **How a pose layer is made: decided 2026-11-08, as Krita**: an editable figure, joints dragged
+   with a finger, figures added and removed, as well as traced from what's visible. Since the app
+   keeps the joints, not a picture, it draws the skeleton itself in whichever style the chosen
+   model wants (DWPose's colours for kohya's, the thin one for Claquasse's).
+4. **Test pictures for pose: decided 2026-11-08**: **a robot** ("a red robot standing, full body,
+   simple background"), the **base model, not Turbo**, the results cleared afterwards and not
+   looked at beyond what the test needs. The pose to follow is a plain stick figure.
+5. **Where they're added**: the Control part's add menu gains **Depth** and **Pose** beside Line
+   art and Scribble, with the same four steps (each kind tuned on its own). **Picked.**
+
+### Checked again after ProCraft 0.0.5 and 0.0.6 (2026-11-15)
+
+The two merges change nothing on the server side, so the models and the test plan stand. They add
+two things the pose layer's design can lean on:
+
+- **A layer can keep data of its own beside its pixels** (`PluginLayer`: saved as
+  `layers/<id>.layerdata`, and brought back with the pixels on undo). It's made for plugins' kinds
+  of layer, such as the new vector layers, whose items are brush strokes, not joints, so a pose
+  layer wouldn't be a plugin layer. But a pose layer can keep its figures the same way: the joints
+  as its data, the skeleton drawn from them into its pixels.
+- **Nodes dragged on the canvas**: QuickShape's curves now show their anchors and handles to drag,
+  on both apps. The pose figure's joints can look and handle the same way.
+
+### The tests (2026-11-15)
+
+On the dev ComfyUI: the base model, 1024 × 1024, 30 steps, two seeds each, against the same seeds
+with no control. The control pictures were drawn by a script, not traced, so no preprocessor was
+needed: a depth map (a near boulder low on the left, a tower in the middle distance on the right,
+ground growing nearer towards the bottom), and a stick figure on the left third with its arms up in
+a Y and its legs wide, drawn in each model's own style (DWPose's colours for kohya's, the thin one
+for Claquasse's). Claquasse's model was added as a LoRA (`models/loras/`) with its apply node in
+`custom_nodes/anima_control_lora`.
+
+| Model | Result |
+|---|---|
+| kohya depth-1, Balanced (0.6, to 60 %) | **follows the map**: the tower moves to where the map has it, and the boulder down to the left; the picture stays as good as with none |
+| kohya depth-1, Close and Strict | the same, a little closer (the boulder's size and place) |
+| kohya pose-1, Balanced and Strict | **no visible effect**: arms down, legs together, as with none |
+| Claquasse Preview-2, strength 1.0 | **the legs wide** as drawn; the arms not raised (the robot held a spear across instead) |
+| Claquasse Preview-2, strength 1.5 | legs wide and **arms raised** on one seed, half raised on the other, with a stranger body |
+
+Neither pose model put the figure on the left third, where it was drawn: both centred it.
+
+What it means for question 1: **kohya's depth model is good enough** (no need to try the VACE one
+and its fork), and **kohya's pose model is not worth a button**. Claquasse's pose model is the only
+one that does something, though it holds a pose only partly, and needs its apply node installed by
+the companion. An open question for the proposal: whether a partial pose control is worth building
+the editable figure for now, or whether pose waits for Claquasse's Preview-3.
+
+**Decided 2026-11-15: depth now, pose later.** Depth goes ahead with kohya's depth-1. Pose waits
+for Claquasse's Preview-3, tested the same way when it comes; the editable figure (question 3) is
+still how it'll be made. Claquasse's Preview-2 and its apply node stay on the dev ComfyUI for that.
+
+### Next
+
+The depth proposal, `07-depth-proposal.md`.

@@ -205,13 +205,13 @@ the tab bringing it back after a restart, ··· and "Clear all results…" with
 
 - **Making one** *(reworked 2026-11-05, Krita's way; sketches in `mockups/control-trace.html`,
   option A)*: two ways, one per place.
-  - **In the popover**: a **Control** part is always there, ending in **+ Line art** and
-    **+ Scribble**. Each adds an **empty** control layer of that kind, named "Line art" /
-    "Scribble", just above the current one and made current, ready to draw on; one undo step
-    ("New control layer").
+  - **In the popover**: a **Control** part is always there, ending in **+ Line art**,
+    **+ Scribble** and (since M9) **+ Depth**. Each adds an **empty** control layer of that kind,
+    named "Line art" / "Scribble" / "Depth", just above the current one and made current, ready to
+    draw on; one undo step ("New control layer"). Depth: `08-depth-design.md`.
   - **In the Layers panel**: the layer's options menu has a row **"Control layer"** (beside
-    Reference and Drawing Assist) opening a small menu: **None** · **Line art** · **Scribble**, for
-    a layer already drawn.
+    Reference and Drawing Assist) opening a small menu: **None** · **Line art** · **Scribble** ·
+    **Depth**, for a layer already drawn.
   - Line art: clean lines. Scribble: rough strokes.
 - **Trace** *(replaces the "…from picture" menu rows of 2026-11-05)*: each control row in the
   popover has a small **trace** button (a drawn line with a four-point sparkle, beside ×). It sends
@@ -248,9 +248,10 @@ the tab bringing it back after a restart, ··· and "Clear all results…" with
   remembered while the app runs.
 - **What is sent**: the control layer's own pixels (not the picture). Control layers are **left out
   of the picture** that is sent for refine and selections, so their lines don't get painted in as
-  colour. Hidden control layers are ignored.
-- **Saved with the artwork** (a layer property; §B10). Hidden control layers keep their row (dimmed)
-  in the popover, so their step is kept while they're off.
+  colour. *(Changed in M9, 2026-11-15, as Krita:)* **hidden control layers still guide**: the eye
+  only hides one from view; × (or Control layer › None) stops it guiding.
+- **Saved with the artwork** (a layer property; §B10). Hidden control layers keep their row in the
+  popover, not dimmed (they still guide), their caption ending "· hidden", on both apps.
 - Named **"Control layer"**, the term ComfyUI users know (§D3); it also stays clear of ProCraft's
   own "Guide" and "Reference".
 

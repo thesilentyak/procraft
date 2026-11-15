@@ -481,8 +481,9 @@ object GenerationUi {
                 }
             }
             // control layers: one row each (trace, × to make it a plain layer again, how closely to
-            // follow it), then + Line art and + Scribble to add an empty one to draw on or trace into
-            val controls = vm.session?.let { s -> g.controlLayers(s).filter { it.visible } } ?: emptyList()
+            // follow it), hidden ones too (they still guide), then + Line art, + Scribble and + Depth
+            // to add an empty one to draw on or trace into
+            val controls = vm.session?.let { s -> g.controlLayers(s) } ?: emptyList()
             Label("CONTROL")
             for (c in controls) {
                 val step = controlSteps[c.id] ?: io.github.artcraftandroid.procraft.core.ControlStep.BALANCED
@@ -492,7 +493,12 @@ object GenerationUi {
                     Spacer(Modifier.width(10.dp))
                     Column(Modifier.weight(1f)) {
                         Text(c.name, color = Ink, fontSize = 14.sp, maxLines = 1)
-                        Text(if (c.kind == io.github.artcraftandroid.procraft.core.LayerControl.LINE_ART) "Line art" else "Scribble", color = Dim, fontSize = 12.sp)
+                        val kind = when (c.kind) {
+                            io.github.artcraftandroid.procraft.core.LayerControl.LINE_ART -> "Line art"
+                            io.github.artcraftandroid.procraft.core.LayerControl.SCRIBBLE -> "Scribble"
+                            io.github.artcraftandroid.procraft.core.LayerControl.DEPTH -> if (c.visible) "Depth · lighter is nearer" else "Depth"
+                        }
+                        Text(if (c.visible) kind else "$kind · hidden", color = Dim, fontSize = 12.sp, maxLines = 1)
                     }
                     // trace the picture into it; a ring while it goes
                     Box(
@@ -515,19 +521,23 @@ object GenerationUi {
                     }
                 }
             }
+            // + Depth greyed while the server can't follow depth, a tap saying what it needs
+            val depthMissing = g.depthMissing()
             Row(Modifier.padding(horizontal = 16.dp).fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                for ((kind, words) in listOf(io.github.artcraftandroid.procraft.core.LayerControl.LINE_ART to "Line art", io.github.artcraftandroid.procraft.core.LayerControl.SCRIBBLE to "Scribble")) {
+                for ((kind, words) in listOf(io.github.artcraftandroid.procraft.core.LayerControl.LINE_ART to "Line art", io.github.artcraftandroid.procraft.core.LayerControl.SCRIBBLE to "Scribble", io.github.artcraftandroid.procraft.core.LayerControl.DEPTH to "Depth")) {
+                    val missing = if (kind == io.github.artcraftandroid.procraft.core.LayerControl.DEPTH) depthMissing else null
                     Row(
                         Modifier.weight(1f).height(40.dp).clip(RoundedCornerShape(12.dp)).background(RowFill).tap {
-                            vm.session?.let { s -> if (s.addControlLayer(kind) == 0uL) error = "No room for another layer" }
+                            if (missing != null) error = missing
+                            else vm.session?.let { s -> if (s.addControlLayer(kind) == 0uL) error = "No room for another layer" }
                             vm.refresh()
                         },
                         horizontalArrangement = Arrangement.Center,
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Text("+", color = Pc.Accent, fontSize = 18.sp)
+                        Text("+", color = if (missing != null) Dim else Pc.Accent, fontSize = 18.sp)
                         Spacer(Modifier.width(6.dp))
-                        Text(words, color = Ink, fontSize = 14.sp)
+                        Text(words, color = if (missing != null) Dim else Ink, fontSize = 14.sp, maxLines = 1)
                     }
                 }
             }
@@ -996,7 +1006,7 @@ object GenerationUi {
                         ProgressRing(run.progress, Modifier.size(34.dp))
                     }
                     if (run.extracting) {
-                        val what = if (run.extractKind == io.github.artcraftandroid.procraft.core.LayerControl.SCRIBBLE) "scribble" else "line art"
+                        val what = when (run.extractKind) { io.github.artcraftandroid.procraft.core.LayerControl.SCRIBBLE -> "scribble"; io.github.artcraftandroid.procraft.core.LayerControl.DEPTH -> "depth"; else -> "line art" }
                         Text("Tracing $what…", color = Dim, fontSize = 13.sp, maxLines = 1)
                     }
                 }
@@ -1068,7 +1078,7 @@ object GenerationUi {
         if (state.results.isEmpty() && run == null) return
         val words = when {
             run == null -> "Results · ${state.results.size}"
-            run.extracting -> "Tracing ${if (run.extractKind == io.github.artcraftandroid.procraft.core.LayerControl.SCRIBBLE) "scribble" else "line art"}…"
+            run.extracting -> "Tracing ${when (run.extractKind) { io.github.artcraftandroid.procraft.core.LayerControl.SCRIBBLE -> "scribble"; io.github.artcraftandroid.procraft.core.LayerControl.DEPTH -> "depth"; else -> "line art" }}…"
             else -> "Generating · ${(run.progress * 100).toInt()}%"
         }
         val picture = (state.shown ?: state.results.lastOrNull()?.id)?.let { bitmaps[it] }

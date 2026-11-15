@@ -77,6 +77,8 @@ ProCraft's own design language. It goes upstream later.
   `mockups/phase1.html`. The design's Part D has the milestones and the decisions log. Phase 2:
   `04-phase2-brainstorm.md`, then `05-styles-proposal.md` and `06-styles-design.md` (style
   editing, the first part; both final, the design kept up to date as built).
+  Depth control: `07-depth-proposal.md` (final) and `08-depth-design.md` (M9; pose waits for a
+  stronger model, see `04`'s "Depth and pose").
   `names.md` lists what each part is called (in the app, the docs and the code): add a name there
   first.
 - `crates/diffusion/`: the ComfyUI client and everything model-specific, with no GPU and no UI.
@@ -174,8 +176,10 @@ Package `io.github.hekel1989.procraftdiffusion.debug` (the old ProCraft debug ap
 - **M8** (trigger words filled from the LoRA's notes with tag chips, Export, Import, the desktop's
   Styles folder row, the preview prompt kept; 06-design §C2): built 2026-11-06, checked on the
   tablet and the desktop. Style editing (M6–M8) is done.
-- **Next:** the rest of Phase 2 (`04-phase2-brainstorm.md`'s feature table), to be designed
-  first.
+- **M9** (depth control: + Depth, Depth Anything V2 Large tracing, kohya's depth model; hidden
+  control layers keep guiding, as Krita; the companion fetches the tracers' models; 08-design):
+  built 2026-11-15, checked on the tablet and the desktop. Pose waits for a stronger model.
+- **Next:** the rest of Phase 2 (`04-phase2-brainstorm.md`'s feature table), each designed first.
 - **Results tray** (§A4, built 2026-11-06): the results bar became a tray that tucks into a tab at
   the bottom centre (⌄, a tap on the canvas, Esc) instead of closing; ↻ Again, ··· with "Use the
   seed" and "Clear all results…". While it's up the canvas treats it as an open panel.

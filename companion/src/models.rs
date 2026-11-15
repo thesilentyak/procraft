@@ -16,11 +16,18 @@ pub fn anima(dir: &Path, accept_licence: bool) -> Result<(), String> {
     let set = &pins::ANIMA;
     println!("{}", set.licence);
     println!("{}", set.link);
+    println!("{}", pins::TRACERS_LICENCE);
     if !accept_licence && !ask()? {
         return Err("the licence was not accepted".to_owned());
     }
     for file in set.files {
         let folder = dir.join("ComfyUI/models").join(file.folder);
+        fs::create_dir_all(&folder).map_err(|e| format!("{}: {e}", folder.display()))?;
+        download::download(file.url, &folder.join(file.name), file.size, file.sha256)?;
+    }
+    // the tracers' models, where their add-on looks, so no trace waits for a download
+    for file in pins::TRACERS {
+        let folder = dir.join("ComfyUI").join(file.folder);
         fs::create_dir_all(&folder).map_err(|e| format!("{}: {e}", folder.display()))?;
         download::download(file.url, &folder.join(file.name), file.size, file.sha256)?;
     }

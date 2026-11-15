@@ -601,7 +601,8 @@ impl GenerationUi {
                         Color32::WHITE,
                     );
                 }
-                let ink = if control.visible { argb(INK) } else { argb(DIM) };
+                // a hidden control layer still guides, so its row isn't dimmed
+                let ink = argb(INK);
                 text(
                     ui.painter(),
                     pos2(thumb.right() + 10.0, row.top() + 16.0),
@@ -611,16 +612,19 @@ impl GenerationUi {
                     Weight::Medium,
                     ink,
                 );
-                let kind = match control.kind {
-                    LayerControl::LineArt => "Line art",
-                    LayerControl::Scribble => "Scribble",
+                let kind = match (control.kind, control.visible) {
+                    (LayerControl::LineArt, true) => "Line art",
+                    (LayerControl::Scribble, true) => "Scribble",
+                    (LayerControl::Depth, true) => "Depth · lighter is nearer",
+                    (LayerControl::LineArt, false) => "Line art · hidden",
+                    (LayerControl::Scribble, false) => "Scribble · hidden",
+                    (LayerControl::Depth, false) => "Depth · hidden",
                 };
-                let kind = if control.visible { kind.to_owned() } else { format!("{kind} · hidden") };
                 text(
                     ui.painter(),
                     pos2(thumb.right() + 10.0, row.top() + 32.0),
                     Align2::LEFT_CENTER,
-                    &kind,
+                    kind,
                     11.0,
                     Weight::Regular,
                     argb(DIM),
@@ -683,24 +687,26 @@ impl GenerationUi {
                 self.state.error = Some(e.to_string());
             }
             y += 4.0;
-            let half = (right - left - 8.0) / 2.0;
-            for (i, (kind, words)) in
-                [(LayerControl::LineArt, "Line art"), (LayerControl::Scribble, "Scribble")].into_iter().enumerate()
+            let third = (right - left - 16.0) / 3.0;
+            let depth_missing = self.generation.depth_missing();
+            for (i, (kind, words)) in [
+                (LayerControl::LineArt, "Line art"),
+                (LayerControl::Scribble, "Scribble"),
+                (LayerControl::Depth, "Depth"),
+            ]
+            .into_iter()
+            .enumerate()
             {
-                let x = left + i as f32 * (half + 8.0);
-                let add = Rect::from_min_size(pos2(x, y), vec2(half, ADD_ROW));
+                // + Depth greyed while the server can't follow depth, saying what it needs
+                let missing = if kind == LayerControl::Depth { depth_missing.clone() } else { None };
+                let x = left + i as f32 * (third + 8.0);
+                let add = Rect::from_min_size(pos2(x, y), vec2(third, ADD_ROW));
                 ui.painter().rect_filled(add, 10.0, argb(ROW));
                 let words_w = text_width(ui.painter(), words, 14.0, Weight::Regular);
                 let start = add.center().x - (words_w + 16.0) / 2.0;
-                text(
-                    ui.painter(),
-                    pos2(start, add.center().y),
-                    Align2::LEFT_CENTER,
-                    "+",
-                    17.0,
-                    Weight::Regular,
-                    argb(pc::ACCENT),
-                );
+                let (plus, ink) =
+                    if missing.is_some() { (argb(DIM), argb(DIM)) } else { (argb(pc::ACCENT), argb(INK)) };
+                text(ui.painter(), pos2(start, add.center().y), Align2::LEFT_CENTER, "+", 17.0, Weight::Regular, plus);
                 text(
                     ui.painter(),
                     pos2(start + 16.0, add.center().y),
@@ -708,12 +714,14 @@ impl GenerationUi {
                     words,
                     14.0,
                     Weight::Regular,
-                    argb(INK),
+                    ink,
                 );
-                if ui.interact(add, ui.scope_id().with(("add control", i)), Sense::click()).clicked()
-                    && session.add_control_layer(kind) == 0
-                {
-                    self.state.error = Some("No room for another layer".to_owned());
+                if ui.interact(add, ui.scope_id().with(("add control", i)), Sense::click()).clicked() {
+                    if let Some(missing) = missing {
+                        self.state.error = Some(missing);
+                    } else if session.add_control_layer(kind) == 0 {
+                        self.state.error = Some("No room for another layer".to_owned());
+                    }
                 }
             }
             y += ADD_ROW + 6.0;
@@ -1820,6 +1828,7 @@ fn export_style(file: &str) -> Result<(), String> {
 fn extract_name(kind: Option<LayerControl>) -> &'static str {
     match kind {
         Some(LayerControl::Scribble) => "scribble",
+        Some(LayerControl::Depth) => "depth",
         _ => "line art",
     }
 }

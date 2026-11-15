@@ -75,6 +75,8 @@ pub enum LayerControl {
     LineArt,
     /// Rough strokes, followed loosely.
     Scribble,
+    /// Greys for how near things are: white nearest, black (or nothing) furthest.
+    Depth,
 }
 
 impl From<procraft_engine::document::ControlKind> for LayerControl {
@@ -82,6 +84,7 @@ impl From<procraft_engine::document::ControlKind> for LayerControl {
         match kind {
             procraft_engine::document::ControlKind::LineArt => LayerControl::LineArt,
             procraft_engine::document::ControlKind::Scribble => LayerControl::Scribble,
+            procraft_engine::document::ControlKind::Depth => LayerControl::Depth,
         }
     }
 }
@@ -91,6 +94,7 @@ impl From<LayerControl> for procraft_engine::document::ControlKind {
         match kind {
             LayerControl::LineArt => procraft_engine::document::ControlKind::LineArt,
             LayerControl::Scribble => procraft_engine::document::ControlKind::Scribble,
+            LayerControl::Depth => procraft_engine::document::ControlKind::Depth,
         }
     }
 }

@@ -21,6 +21,8 @@ pub enum SelectionMode {
 pub enum ControlKind {
     LineArt,
     Scribble,
+    /// Greys for how near things are: white nearest, black furthest.
+    Depth,
 }
 
 /// How closely a control layer is followed: from a loose shaping of the picture's start to lines
