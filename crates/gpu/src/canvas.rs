@@ -1788,6 +1788,8 @@ struct PixelGridUniform {
 /// The pixel grid's lines: a mid grey, seen on dark pixels and light, at this alpha at full strength.
 const PIXEL_GRID_GREY: f32 = 0.5;
 const PIXEL_GRID_ALPHA: f32 = 0.45;
+/// The checkerboard under a pixel art canvas's clear pixels: squares this many canvas pixels across.
+const PIXEL_CHECKER: f32 = 8.0;
 
 /// Where the surround picture lies (target pixels), the surround's colour (sRGB) and whether the
 /// target encodes sRGB itself.
@@ -3283,6 +3285,7 @@ struct ScreenPipelines {
     frost: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     veil: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     pixel_grid: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
+    pixel_backdrop: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
 }
 
 pub struct Canvas {
@@ -3417,8 +3420,11 @@ pub struct Canvas {
     crisp_bind: wgpu::BindGroup,
     /// A picture shown over the canvas in the window only (see [`Canvas::set_overlay`]).
     overlay: Option<Overlay>,
+    /// A pixel art canvas: its clear pixels show a checkerboard lined up with them (see
+    /// [`Canvas::set_pixel_art`]).
+    pixel_art: bool,
     /// How strongly a pixel art canvas's pixel grid shows in the window (see
-    /// [`Canvas::set_pixel_grid`]); 0 none.
+    /// [`Canvas::set_pixel_art`]); 0 none.
     pixel_grid: f32,
     /// How much the layers but the current one are dimmed on the screen (0 to 1; 0 not at all, see
     /// [`Canvas::set_dim_others`]), and what the screen shows while they are.
@@ -3917,6 +3923,7 @@ impl Canvas {
             display_bind,
             crisp_bind,
             overlay: None,
+            pixel_art: false,
             pixel_grid: 0.0,
             dim_others: 0.0,
             trace: None,
@@ -6658,10 +6665,12 @@ impl Canvas {
         self.selection.is_some()
     }
 
-    /// Shows a line along every pixel's edge over the canvas, in the window only, `strength` (0 to
-    /// 1) strong; 0 none. A pixel art canvas's grid, shown when zoomed in close.
-    pub fn set_pixel_grid(&mut self, strength: f32) {
-        self.pixel_grid = if strength.is_finite() { strength.clamp(0.0, 1.0) } else { 0.0 };
+    /// Shows the canvas as pixel art does, in the window only: with `on`, a checkerboard lined up
+    /// with its pixels under them (in place of what's round the canvas showing through clear
+    /// pixels), and a line along every pixel's edge over them, `grid` (0 to 1) strong, 0 none.
+    pub fn set_pixel_art(&mut self, on: bool, grid: f32) {
+        self.pixel_art = on;
+        self.pixel_grid = if on && grid.is_finite() { grid.clamp(0.0, 1.0) } else { 0.0 };
     }
 
     /// Shows `rgba` (premultiplied RGBA8 in the canvas's colours, `rect`'s size) over the canvas
@@ -11625,6 +11634,7 @@ impl Canvas {
             frost,
             veil: veil_pipelines,
             pixel_grid: pixel_grid_pipelines,
+            pixel_backdrop: pixel_backdrop_pipelines,
             ..
         } = &mut self.screen;
         let pipeline = display.entry(target.format).or_insert_with(|| {
@@ -11704,6 +11714,32 @@ impl Canvas {
         }
         if let Some((grid_pipeline, offset)) = grid {
             pass.set_pipeline(grid_pipeline);
+            pass.set_bind_group(0, &self.uniform_bind, &[offset]);
+            pass.draw(0..3, 0..1);
+        }
+        // a pixel art canvas's checkerboard, under its clear pixels in place of what's round it
+        let pixel_inverse = target.to_screen.inverse().filter(|_| self.pixel_art);
+        let pixel_uniform = |inv: Affine| PixelGridUniform {
+            m0: [inv.a, inv.b, inv.c, inv.d],
+            m1: [inv.e, inv.f, self.width as f32, self.height as f32],
+            v0: [target.to_screen.scale_factor(), 1.0, PIXEL_CHECKER, if srgb { 1.0 } else { 0.0 }],
+            colour: [0.0; 4],
+        };
+        if let Some(inv) = pixel_inverse {
+            let backdrop = pixel_backdrop_pipelines.entry(target.format).or_insert_with(|| {
+                blended_pipeline(
+                    device,
+                    kept,
+                    surround_pipeline_layout,
+                    pixel_grid_module,
+                    "pixel backdrop",
+                    ("vs_pixel_grid", "fs_pixel_backdrop"),
+                    target.format,
+                    None,
+                )
+            });
+            let offset = uniforms.push(&pixel_uniform(inv));
+            pass.set_pipeline(backdrop);
             pass.set_bind_group(0, &self.uniform_bind, &[offset]);
             pass.draw(0..3, 0..1);
         }
@@ -11799,7 +11835,7 @@ impl Canvas {
         }
 
         // a pixel art canvas's pixel grid, over the pixels and under the selection's look
-        if let Some(inv) = target.to_screen.inverse().filter(|_| self.pixel_grid > 0.0) {
+        if let Some(inv) = pixel_inverse.filter(|_| self.pixel_grid > 0.0) {
             let pipeline = pixel_grid_pipelines.entry(target.format).or_insert_with(|| {
                 blended_pipeline(
                     device,
@@ -11814,12 +11850,7 @@ impl Canvas {
             });
             let alpha = PIXEL_GRID_ALPHA * self.pixel_grid;
             let grey = if srgb { srgb_to_linear(PIXEL_GRID_GREY) } else { PIXEL_GRID_GREY } * alpha;
-            let offset = uniforms.push(&PixelGridUniform {
-                m0: [inv.a, inv.b, inv.c, inv.d],
-                m1: [inv.e, inv.f, self.width as f32, self.height as f32],
-                v0: [target.to_screen.scale_factor(), 1.0, 0.0, 0.0],
-                colour: [grey, grey, grey, alpha],
-            });
+            let offset = uniforms.push(&PixelGridUniform { colour: [grey, grey, grey, alpha], ..pixel_uniform(inv) });
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &self.uniform_bind, &[offset]);
             pass.draw(0..3, 0..1);
