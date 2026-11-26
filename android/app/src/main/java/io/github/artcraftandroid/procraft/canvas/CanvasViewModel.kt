@@ -4166,6 +4166,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         s.setReduceMotion(!android.animation.ValueAnimator.areAnimatorsEnabled())
         readDropThreshold(s)
         s.setPixelFillContiguous(pixelContiguous)
+        pixelArtOpen = s.isPixelArt()
+        pixelPalette = s.pixelPalette().map { it.toInt() }
         applyPlugins(s)
         // the controls kept with this artwork, as it keeps them
         readPlugins()
@@ -8927,6 +8929,42 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     /** A pixel art canvas's fill takes only what's joined to where it lands (Contiguous), else every pixel of that colour. */
     var pixelContiguous by mutableStateOf(true)
         private set
+
+    /** The artwork open is pixel art: the side bar has its palette square. */
+    var pixelArtOpen by mutableStateOf(false)
+        private set
+
+    /** A pixel art canvas's palette (0xRRGGBB), and whether its strip is unfolded beside the side bar. */
+    var pixelPalette by mutableStateOf<List<Int>>(emptyList())
+        private set
+    var paletteOpen by mutableStateOf(false)
+
+    /** The palette set to [colours] (each once, at most 256), kept with the artwork. */
+    fun setPixelPalette(colours: List<Int>) {
+        val s = session ?: return
+        pixelPalette = s.setPixelPalette(colours.map { it.toUInt() }).map { it.toInt() }
+    }
+
+    /** The hex colour codes on the clipboard (as Lospec gives them) as the palette; a message if there are none. */
+    fun pastePixelPalette() {
+        val clip = getApplication<Application>().getSystemService(android.content.ClipboardManager::class.java)
+        val text = clip?.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(getApplication())?.toString().orEmpty()
+        val colours = io.github.artcraftandroid.procraft.core.pixelPaletteFromText(text).map { it.toInt() }
+        if (colours.isEmpty()) {
+            message = "Copy some hex colour codes first (such as #1a1c2c), then paste them."
+            return
+        }
+        setPixelPalette(colours)
+    }
+
+    /** The colours on the canvas as the palette (all of them, up to 64). */
+    fun pixelPaletteFromPicture() {
+        val s = session ?: return
+        viewModelScope.launch {
+            val colours = withContext(Dispatchers.Default) { s.pixelPaletteFromPicture().map { it.toInt() } }
+            if (colours.isEmpty()) message = "There are no colours on the canvas yet." else setPixelPalette(colours)
+        }
+    }
 
     /** The last fill dropped on a pixel art canvas: where (window pixels), its colour (0xRRGGBB) and threshold. */
     @Volatile private var lastPixelDrop: Triple<Offset, Int, Float>? = null

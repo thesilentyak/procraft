@@ -276,7 +276,7 @@ pub use pickers::{
     disc_picture, disc_to_square, disc_to_square_point, harmony_wheel, p3_hsv_of, p3_hsv_to_rgb, rgb_to_p3_hsv,
     square_to_disc, square_to_disc_point, triangle_picture, triangle_point, triangle_sv,
 };
-pub use pixel_art::{pixel_art_export_scales, pixel_art_most_edge, pixel_art_sizes};
+pub use pixel_art::{pixel_art_export_scales, pixel_art_most_edge, pixel_art_sizes, pixel_palette_from_text};
 pub use plugin_canvas::{BadgeLine, PluginBadge, PluginCanvas, PluginExport, PluginKind, plugin_kind_badge};
 pub use plugin_file::read_plugin_file;
 pub use plugin_filter::PluginFilterShown;

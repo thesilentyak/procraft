@@ -298,6 +298,8 @@ private fun ScreensShown(vm: CanvasViewModel, keptClear: Clearance) {
                         } else {
                             Modifier
                         }
+                        // on a pixel art canvas, its palette square under it, the palette unfolding beside it
+                        SideBarWithPalette(vm, right = vm.rightHanded && sideMoved == null) {
                         SideBar(
                             vm,
                             // (a press on its glass never the canvas's, wherever it is and however it is turned)
@@ -326,6 +328,7 @@ private fun ScreensShown(vm: CanvasViewModel, keptClear: Clearance) {
                             },
                             glassEdges = sideMoved?.let { vm.barTouching(io.github.artcraftandroid.procraft.core.LayoutBar.SIDE_BAR) },
                         )
+                        }
                     }
                 }
             }

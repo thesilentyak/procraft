@@ -12,6 +12,53 @@ pub const SIZES: [u32; 5] = [16, 32, 64, 128, 256];
 /// The scales PNG export offers: each pixel a square of that many.
 pub const EXPORT_SCALES: [u32; 5] = [1, 2, 4, 8, 16];
 
+/// The most colours a pixel art palette keeps.
+pub const MOST_COLOURS: usize = 256;
+
+/// The palette a new pixel art canvas starts with: sixteen colours (0xRRGGBB), dark to light and
+/// round the hues, the set many small games are drawn in.
+pub const STARTING_PALETTE: [u32; 16] = [
+    0x000000, 0x1D2B53, 0x7E2553, 0x008751, 0xAB5236, 0x5F574F, 0xC2C3C7, 0xFFF1E8, 0xFF004D, 0xFFA300, 0xFFEC27,
+    0x00E436, 0x29ADFF, 0x83769C, 0xFF77A8, 0xFFCCAA,
+];
+
+/// The colours (0xRRGGBB, in order, each once, at most [`MOST_COLOURS`]) written in `text` as hex
+/// codes: `#1a2b3c`, `1a2b3c` or `#abc`, separated by anything else, as Lospec and art programs give
+/// them (paint.net's `FF1a2b3c` too).
+pub fn parse_palette(text: &str) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::new();
+    for word in text.split(|c: char| !c.is_ascii_alphanumeric()) {
+        let hex = match word.len() {
+            3 => word.chars().flat_map(|c| [c, c]).collect::<String>(),
+            6 => word.to_owned(),
+            8 if word.get(..2).is_some_and(|a| a.eq_ignore_ascii_case("ff")) => {
+                word.get(2..).unwrap_or_default().to_owned()
+            }
+            _ => continue,
+        };
+        if let Ok(colour) = u32::from_str_radix(&hex, 16)
+            && hex.len() == 6
+            && !out.contains(&colour)
+            && out.len() < MOST_COLOURS
+        {
+            out.push(colour);
+        }
+    }
+    out
+}
+
+/// `colours` each once, in order, at most [`MOST_COLOURS`], every one within 0xRRGGBB.
+pub fn tidy_palette(colours: &[u32]) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::new();
+    for &c in colours {
+        let c = c & 0xFF_FFFF;
+        if !out.contains(&c) && out.len() < MOST_COLOURS {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// `rgba` (`width` × `height`, four bytes a pixel, rows from the top) with each pixel a `scale` ×
 /// `scale` square of its colour. None when the result would be past `u32` or `usize` sizes, or
 /// `rgba` isn't that size.
@@ -288,6 +335,15 @@ fn inked(was: [u8; 4], ink: Ink, alpha_lock: bool) -> [u8; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn palettes_read_hex_codes_as_lospec_gives_them() {
+        assert_eq!(parse_palette("#1a1c2c\n#5d275d, b13e53 ef7d57"), vec![0x1A1C2C, 0x5D275D, 0xB13E53, 0xEF7D57]);
+        assert_eq!(parse_palette("#abc #ABC"), vec![0xAABBCC], "short codes, each once");
+        assert_eq!(parse_palette("FF1a2b3c ;paint.net"), vec![0x1A2B3C]);
+        assert_eq!(parse_palette("not a colour 12345 #12"), Vec::<u32>::new());
+        assert_eq!(tidy_palette(&[0xFF_000000 | 0x123456, 0x123456, 0xABCDEF]), vec![0x123456, 0xABCDEF]);
+    }
 
     #[test]
     fn the_pencil_is_one_to_eight_pixels() {

@@ -67,9 +67,57 @@ impl CanvasSession {
         }
         st.doc.pixel_art = true;
         st.doc.background_visible = false;
+        // its colours are the hex codes and the PNG's pixels: sRGB, as game engines read them
+        st.doc.profile = procraft_engine::profile::Profile::Srgb;
+        st.doc.icc = None;
+        st.doc.pixel_palette = pixel::STARTING_PALETTE.to_vec();
         true
     }
 
+    /// A pixel art canvas's palette (0xRRGGBB, in order): its palette strip's swatches.
+    pub fn pixel_palette(&self) -> Vec<u32> {
+        self.shared.lock().doc.pixel_palette.clone()
+    }
+
+    /// Sets a pixel art canvas's palette (0xRRGGBB, in order, each kept once, at most 256), kept
+    /// with the artwork. What it is now.
+    pub fn set_pixel_palette(&self, colours: Vec<u32>) -> Vec<u32> {
+        let mut st = self.shared.lock();
+        let tidy = pixel::tidy_palette(&colours);
+        if st.doc.pixel_palette != tidy {
+            st.doc.pixel_palette = tidy;
+            st.revision += 1;
+        }
+        st.doc.pixel_palette.clone()
+    }
+
+    /// The colours on the canvas as a palette: all of them for a picture of up to 64 colours,
+    /// else 64 standing for them, by hue (greys first). Empty before it can be read.
+    pub fn pixel_palette_from_picture(&self) -> Vec<u32> {
+        let Ok((_, _, straight, _)) = self.finished_picture() else { return Vec::new() };
+        let pixels: Vec<u32> = straight
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[3] >= 128)
+            .map(|&[r, g, b, _]| u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b))
+            .collect();
+        procraft_engine::palette::main_colours(&pixels, PALETTE_FROM_PICTURE)
+    }
+}
+
+/// The most colours From the picture gives a palette.
+const PALETTE_FROM_PICTURE: usize = 64;
+
+/// The colours (0xRRGGBB, in order, each once, at most 256) written in `text` as hex codes, as
+/// Lospec and art programs give them.
+#[uniffi::export]
+pub fn pixel_palette_from_text(text: String) -> Vec<u32> {
+    pixel::parse_palette(&text)
+}
+
+#[uniffi::export]
+impl CanvasSession {
     /// Whether this is a pixel art canvas.
     pub fn is_pixel_art(&self) -> bool {
         self.shared.lock().doc.pixel_art
@@ -367,6 +415,9 @@ mod tests {
         assert!(s.make_pixel_art());
         assert!(s.is_pixel_art());
         assert!(!s.shared.lock().doc.background_visible);
+        assert_eq!(s.shared.lock().doc.profile, procraft_engine::profile::Profile::Srgb, "sRGB, as game engines read");
+        assert_eq!(s.pixel_palette().len(), 16, "a palette to start with");
+        assert_eq!(s.set_pixel_palette(vec![0x123456, 0x123456, 0xFF_ABCDEF]), vec![0x123456, 0xABCDEF]);
         let big = CanvasSession::new(2048, 64);
         assert!(!big.make_pixel_art(), "too large for pixel art");
     }

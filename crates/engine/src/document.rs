@@ -758,6 +758,9 @@ pub struct Document {
     /// squares at every zoom (see `crate::pixel`). A file without it is a plain artwork.
     #[serde(default, deserialize_with = "or_default", skip_serializing_if = "std::ops::Not::not")]
     pub pixel_art: bool,
+    /// A pixel art canvas's palette (0xRRGGBB, in order), its palette strip's swatches.
+    #[serde(default, deserialize_with = "or_default", skip_serializing_if = "Vec::is_empty")]
+    pub pixel_palette: Vec<u32>,
 }
 
 /// Whether a canvas was made with the screen upright (see [`Document::made_turns`]).
@@ -848,6 +851,7 @@ impl Document {
             text_style: None,
             made_turns: 0,
             pixel_art: false,
+            pixel_palette: Vec::new(),
         };
         doc.add_layer();
         doc
