@@ -73,3 +73,14 @@ when something gets a name, and change it here first when a name changes.
 | **Largest picture** | The most megapixels a picture is made at, from the GPU's memory unless changed. | "Largest picture" |
 | **Companion** | The CLI that installs and runs a ComfyUI for the app (M5). | `procraft-companion` |
 | **Dev ComfyUI** | The ComfyUI on this machine used for development (port 8189). Not a user-facing name. | — |
+
+## Workflows from ComfyUI (`09-workflows-proposal.md`, `10-workflows-design.md`)
+
+| Name | What it is | Shown as |
+|---|---|---|
+| **Workflow** | A ComfyUI workflow with Krita marker nodes, run from the Generate popover instead of a style. | the "Workflow" badge |
+| **Live workflow** | The newest workflow the PC's ComfyUI tab sent; its card follows every change there. | "ComfyUI (live)" |
+| **Kept workflow** | A workflow saved as a file in the styles folder's Workflows folder: kept from the live one, or imported. | its file's name |
+| **Marker nodes** (docs only) | The add-on's nodes that mark where the app's inputs go and results come out: Krita Canvas, Krita Selection, Krita Output, Parameter, Krita Image Layer, Krita Mask Layer. | — |
+| **Parameters** (the **Parameters part**) | The popover's part with a row per Parameter or layer node of the chosen workflow. | "Parameters" |
+| **Keep** | Saves the live workflow as a kept one, under a name. | "Keep…" |

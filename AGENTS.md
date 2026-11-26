@@ -13,6 +13,10 @@ ProCraft's own design language. It goes upstream later.
   (`docs/generation/01–03`). Phase 2 and later need the same: today they are only a direction
   (proposal §8, brainstorm's feature table), with no design.
 - **Keep it simple**: no overcomplication. Prefer the plain solution that works.
+- **In this fork (`thesilentyak/procraft`)**, the user isn't very technical and wants **maximum
+  functionality without a lot of options to choose from**: sensible defaults chosen for him, the
+  rare settings folded away, and the steps done for him wherever possible. Its own plan:
+  `docs/generation/09-workflows-proposal.md` and `10-workflows-design.md` (workflows from ComfyUI).
 - **The user decides genuine choices.** Offer two or three options with a recommendation; explain
   any question in plain words, with a concrete example. When the answer is obvious, pick it and
   say so.

@@ -6,6 +6,8 @@ name: Build APK
 on:
   push:
     branches: [main-diffusion]
+    # documents alone don't change the app
+    paths-ignore: ["docs/**", "**/*.md"]
   workflow_dispatch:
 
 permissions:
