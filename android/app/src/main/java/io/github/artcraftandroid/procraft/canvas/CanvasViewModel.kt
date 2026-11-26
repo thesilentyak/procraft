@@ -8928,10 +8928,28 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     var pixelContiguous by mutableStateOf(true)
         private set
 
-    /** Turns [pixelContiguous] on or off, for the fills from now on. */
+    /** The last fill dropped on a pixel art canvas: where (window pixels), its colour (0xRRGGBB) and threshold. */
+    @Volatile private var lastPixelDrop: Triple<Offset, Int, Float>? = null
+
+    /**
+     * Turns [pixelContiguous] on or off, for the fills from now on; while ColorDrop's band still
+     * shows the fill just dropped, that fill is made again the new way (undone, and dropped again
+     * where it was with its colour and threshold), so the switch shows what it does at once.
+     */
     fun choosePixelContiguous(on: Boolean) {
         pixelContiguous = on
-        session?.setPixelFillContiguous(on)
+        val s = session ?: return
+        s.setPixelFillContiguous(on)
+        val (at, colour, threshold) = lastPixelDrop ?: return
+        if (dropBand == DropBand.NONE || drops.pending > 0) return
+        undo()
+        viewModelScope.launch {
+            withContext(Dispatchers.Default) {
+                val (r, g, b) = Triple(((colour shr 16) and 0xFF) / 255f, ((colour shr 8) and 0xFF) / 255f, (colour and 0xFF) / 255f)
+                if (s.pourDrop(at.x, at.y, r, g, b, threshold)) s.pourEnd(true, null)
+            }
+            refresh()
+        }
     }
 
     /** The threshold the colour fills with (0..1), kept from one drop to the next. */
@@ -8970,14 +8988,24 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                     if (s.whyUnpainted() != null) return DropPours.Dropped.BLOCKED
                     val (r, g, b) = Triple(((colour shr 16) and 0xFF) / 255f, ((colour shr 8) and 0xFF) / 255f, (colour and 0xFF) / 255f)
                     // made at once, and shown spreading in from where it landed
-                    return if (s.pourDrop(at.x, at.y, r, g, b, threshold)) DropPours.Dropped.POURED else DropPours.Dropped.NOTHING
+                    val poured = s.pourDrop(at.x, at.y, r, g, b, threshold)
+                    // a pixel art canvas's, for its Contiguous switch to make again
+                    lastPixelDrop = if (poured && s.isPixelArt()) Triple(at, colour, threshold) else null
+                    return if (poured) DropPours.Dropped.POURED else DropPours.Dropped.NOTHING
                 }
 
-                override fun pour(at: Offset, r: Float, g: Float, b: Float, threshold: Float): Boolean =
-                    session?.pourBegin(at.x, at.y, r, g, b, threshold) == true
+                override fun pour(at: Offset, r: Float, g: Float, b: Float, threshold: Float): Boolean {
+                    val s = session ?: return false
+                    val poured = s.pourBegin(at.x, at.y, r, g, b, threshold)
+                    // a pixel art canvas's, for its Contiguous switch to make again
+                    val colour = ((r * 255f).roundToInt() shl 16) or ((g * 255f).roundToInt() shl 8) or (b * 255f).roundToInt()
+                    lastPixelDrop = if (poured && s.isPixelArt()) Triple(at, colour, threshold) else null
+                    return poured
+                }
 
                 override fun threshold(threshold: Float) {
                     session?.pourThreshold(threshold)
+                    lastPixelDrop = lastPixelDrop?.let { Triple(it.first, it.second, threshold) }
                 }
 
                 override fun end(keep: Boolean) {
