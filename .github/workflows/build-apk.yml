@@ -45,8 +45,15 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - name: Build
         working-directory: android
-        # no release keystore here, so the build is signed with the runner's debug key. The plugin
-        # repositories sometimes fail to answer on GitHub's runners: one more try after a pause.
+        # signed with the fork's own debug key (dev/fork-debug.keystore, password "android", public
+        # like any debug key): every build is the same app to Android, so a new one installs over
+        # the last without losing its artworks. The plugin repositories sometimes fail to answer on
+        # GitHub's runners: one more try after a pause.
+        env:
+          PROCRAFT_KEYSTORE: ${{ github.workspace }}/dev/fork-debug.keystore
+          PROCRAFT_KEYSTORE_PASSWORD: android
+          PROCRAFT_KEY_ALIAS: procraftdebug
+          PROCRAFT_KEY_PASSWORD: android
         run: |
           ./gradlew --no-daemon :app:assembleRelease -Pprocraft.abis=arm64-v8a || {
             sleep 60
