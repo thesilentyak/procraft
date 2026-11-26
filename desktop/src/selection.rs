@@ -50,6 +50,8 @@ pub struct Selection {
     /// Whether there is a selection; Color Fill on; the feather's amount; the popover open; the
     /// selections kept and their pictures.
     has: bool,
+    /// A pixel art canvas: its selections have hard edges, nothing to feather.
+    pixel_art: bool,
     /// On a plugin's layer, the box round the strokes the selection takes (four corners, x then y,
     /// canvas pixels); empty otherwise. And the artwork's revision and whether anything was selected
     /// when it was read.
@@ -100,6 +102,7 @@ impl Default for Selection {
             sliding: None,
             drag: None,
             has: false,
+            pixel_art: false,
             taken: Vec::new(),
             taken_at: None,
             color_fill: false,
@@ -121,6 +124,7 @@ impl Selection {
         self.removes = false;
         self.on = true;
         self.has = session.has_selection();
+        self.pixel_art = session.is_pixel_art();
         self.touches(session);
         self.look(session);
     }
@@ -250,7 +254,9 @@ impl Selection {
             Button::new(&icons::SELECT_REMOVE, "Remove", 44.0).active(removable && self.removes).enabled(removable),
             Button::new(&icons::INVERT, "Invert", 44.0).enabled(has),
             Button::new(&icons::SELECT_COPY_PASTE, "Copy & Paste", 44.0).enabled(has || drawing),
-            Button::new(&icons::FEATHER, "Feather", 44.0).active(self.popup == Popup::Feather).enabled(has || drawing),
+            Button::new(&icons::FEATHER, "Feather", 44.0)
+                .active(self.popup == Popup::Feather)
+                .enabled((has || drawing) && !self.pixel_art),
             Button::new(&icons::SAVE_LOAD, "Save & Load", 44.0)
                 .active(self.popup == Popup::Saved)
                 .enabled(has || drawing),

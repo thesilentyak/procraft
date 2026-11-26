@@ -11,6 +11,7 @@ use procraft_engine::pixel;
 use procraft_engine::document::LayerId;
 use procraft_engine::geom::{IRect, Vec2};
 use procraft_engine::pixel::{Ink, Perfect, Stroke};
+use procraft_engine::quickshape::Shape;
 
 use crate::project::{write_atomically, write_png};
 use crate::{CanvasSession, MobileError, PenSample, PointerKind, State, ToolKind};
@@ -105,11 +106,20 @@ pub(crate) enum Touch {
 pub(crate) struct PixelStroke {
     layer: LayerId,
     stroke: Stroke,
+    width: u32,
     footprint: Vec<(i32, i32)>,
     /// A one-pixel line's path, kept pixel-perfect.
     perfect: Option<Perfect>,
     last: Option<(i32, i32)>,
+    /// Where the pen went (canvas points), for QuickShape.
+    drawn: Vec<Vec2>,
+    /// The shape it snapped to when held, and where the pen was then and is now: drawn in pixels
+    /// in place of the line, turning and growing as the pen moves on.
+    shape: Option<(Shape, Vec2, Vec2)>,
 }
+
+/// Points round an ellipse a pixel art selection's outline goes through.
+const ELLIPSE_POINTS: usize = 96;
 
 impl State {
     /// On a pixel art canvas, the paint and erase tools set whole pixels themselves: true if this
@@ -123,23 +133,31 @@ impl State {
             }
         }
         let Some(mut on) = self.pixel_stroke.take() else { return false };
-        let points: Vec<(i32, i32)> = self
-            .to_canvas(samples)
-            .iter()
-            .filter(|s| s.pos.x.is_finite() && s.pos.y.is_finite())
-            .map(|s| (s.pos.x.floor() as i32, s.pos.y.floor() as i32))
-            .collect();
+        let points: Vec<Vec2> =
+            self.to_canvas(samples).iter().map(|s| s.pos).filter(|p| p.x.is_finite() && p.y.is_finite()).collect();
         if touch != Touch::Off {
-            for p in points {
-                let from = on.last.unwrap_or(p);
-                for q in procraft_engine::pixel::line(from, p).into_iter().skip(usize::from(on.last.is_some())) {
-                    self.pixel_draw(&mut on, q);
+            match on.shape.as_mut() {
+                // snapped: the shape follows the pen
+                Some(shape) => {
+                    if let Some(&to) = points.last() {
+                        shape.2 = to;
+                        self.pixel_shape_draw(&mut on);
+                    }
                 }
-                on.last = Some(p);
+                None => {
+                    for &at in &points {
+                        let p = (at.x.floor() as i32, at.y.floor() as i32);
+                        let from = on.last.unwrap_or(p);
+                        for q in procraft_engine::pixel::line(from, p).into_iter().skip(usize::from(on.last.is_some()))
+                        {
+                            self.pixel_draw(&mut on, q);
+                        }
+                        on.last = Some(p);
+                    }
+                    on.drawn.extend(points);
+                }
             }
-            if let Some((rect, part)) = on.stroke.take_changed() {
-                self.rewrite_layer(on.layer, IRect::new(rect[0], rect[1], rect[2], rect[3]), part);
-            }
+            self.pixel_write(&mut on);
         }
         match touch {
             Touch::Down(_) | Touch::Moved => self.pixel_stroke = Some(on),
@@ -186,10 +204,81 @@ impl State {
         Some(PixelStroke {
             layer: id,
             stroke,
+            width,
             footprint: pixel::footprint(width),
             perfect: (width == 1).then(Perfect::default),
             last: None,
+            drawn: Vec::new(),
+            shape: None,
         })
+    }
+
+    /// What the stroke changed since it was last written, written to its layer.
+    fn pixel_write(&mut self, on: &mut PixelStroke) {
+        if let Some((rect, part)) = on.stroke.take_changed() {
+            self.rewrite_layer(on.layer, IRect::new(rect[0], rect[1], rect[2], rect[3]), part);
+        }
+    }
+
+    /// The pixel pencil held still: its line snaps to the shape it looks like, drawn again in
+    /// pixels. True while a pixel stroke is under way (snapped or not), so QuickShape leaves it be.
+    pub(crate) fn pixel_shape_hold(&mut self) -> bool {
+        let Some(mut on) = self.pixel_stroke.take() else { return false };
+        if on.shape.is_none() {
+            let line = self.without_end_hook(on.drawn.clone());
+            if let (Some(first), Some(&at)) = (self.recognised(&line).into_iter().next(), on.drawn.last()) {
+                on.shape = Some((first, at, at));
+                self.pixel_shape_draw(&mut on);
+                self.pixel_write(&mut on);
+            }
+        }
+        self.pixel_stroke = Some(on);
+        true
+    }
+
+    /// The snapped shape, moved with the pen, drawn in pixels in place of all the stroke drew.
+    fn pixel_shape_draw(&self, on: &mut PixelStroke) {
+        let Some((snapped, from, to)) = on.shape.as_ref() else { return };
+        let outline = snapped.moved_with(snapped.pivot(), *from, *to).outline();
+        on.stroke.reset();
+        on.perfect = (on.width == 1).then(Perfect::default);
+        let mut last: Option<(i32, i32)> = None;
+        for at in outline.iter().filter(|p| p.x.is_finite() && p.y.is_finite()) {
+            let p = (at.x.floor() as i32, at.y.floor() as i32);
+            let from = last.unwrap_or(p);
+            for q in procraft_engine::pixel::line(from, p).into_iter().skip(usize::from(last.is_some())) {
+                self.pixel_draw(on, q);
+            }
+            last = Some(p);
+        }
+    }
+
+    /// On a pixel art canvas, the rectangle (or with `ellipse`, the ellipse in it) between window
+    /// points `a` and `b` as a selection takes it: upright on the canvas, its corners on pixel
+    /// corners, at least a pixel each way. None on other canvases.
+    pub(crate) fn pixel_box(&self, ellipse: bool, a: Vec2, b: Vec2) -> Option<Vec<Vec2>> {
+        if !self.doc.pixel_art {
+            return None;
+        }
+        let view = self.view?;
+        let (a, b) = (view.screen_to_canvas(a)?, view.screen_to_canvas(b)?);
+        let (w, h) = (self.doc.width() as f32, self.doc.height() as f32);
+        let x0 = a.x.min(b.x).round().clamp(0.0, w);
+        let y0 = a.y.min(b.y).round().clamp(0.0, h);
+        let x1 = a.x.max(b.x).round().clamp(0.0, w).max((x0 + 1.0).min(w));
+        let y1 = a.y.max(b.y).round().clamp(0.0, h).max((y0 + 1.0).min(h));
+        if !ellipse {
+            return Some(vec![Vec2::new(x0, y0), Vec2::new(x1, y0), Vec2::new(x1, y1), Vec2::new(x0, y1)]);
+        }
+        let (c, r) = (Vec2::new((x0 + x1) / 2.0, (y0 + y1) / 2.0), Vec2::new((x1 - x0) / 2.0, (y1 - y0) / 2.0));
+        Some(
+            (0..ELLIPSE_POINTS)
+                .map(|i| {
+                    let t = i as f32 / ELLIPSE_POINTS as f32 * std::f32::consts::TAU;
+                    Vec2::new(c.x + r.x * t.cos(), c.y + r.y * t.sin())
+                })
+                .collect(),
+        )
     }
 
     /// The pencil at pixel `p`: its footprint set there and where the symmetry copies it, a

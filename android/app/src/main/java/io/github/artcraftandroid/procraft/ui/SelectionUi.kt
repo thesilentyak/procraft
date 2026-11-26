@@ -102,7 +102,8 @@ fun SelectionToolbar(vm: CanvasViewModel, screenWidth: Dp, modifier: Modifier = 
         ToolbarButton(PcIcons.SelectRemove, "Remove", active = removable && vm.selectionRemoves, enabled = removable, width = w, iconSize = 44.dp) { vm.chooseSelectionRemoves(true) }
         ToolbarButton(PcIcons.Invert, "Invert", enabled = has, width = w, iconSize = 44.dp) { vm.invertSelection() }
         ToolbarButton(PcIcons.SelectCopyPaste, "Copy & Paste", enabled = has || drawing, width = w, iconSize = 44.dp, labelSize = long) { vm.copySelectionToLayer() }
-        ToolbarButton(PcIcons.Feather, "Feather", active = vm.selectionPopup == SelectionPopup.FEATHER, enabled = has || drawing, width = w, iconSize = 44.dp) {
+        // a pixel art canvas's selections have hard edges: nothing to feather
+        ToolbarButton(PcIcons.Feather, "Feather", active = vm.selectionPopup == SelectionPopup.FEATHER, enabled = (has || drawing) && vm.session?.isPixelArt() != true, width = w, iconSize = 44.dp) {
             vm.openSelectionPopup(SelectionPopup.FEATHER)
         }
         ToolbarButton(PcIcons.SaveLoad, "Save & Load", active = vm.selectionPopup == SelectionPopup.SAVED, enabled = has || drawing, width = w, iconSize = 44.dp, labelSize = long) {

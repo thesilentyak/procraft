@@ -374,12 +374,14 @@ impl State {
     /// Redraws the layer with the content where the transform has it now, from the pixels it
     /// began with (however many changes it has had, each pixel is filtered once).
     fn show_transform(&mut self) {
+        // a pixel art canvas's pixels stay whole pixels
+        let interpolation = if self.doc.pixel_art { Interpolation::Nearest } else { self.interpolation };
         let (Some(t), Some(canvas)) = (self.transform.as_ref(), self.canvas.as_mut()) else { return };
         if let Some(mesh) = t.warp() {
-            canvas.set_transform_mesh(&warp::triangles(&mesh, t.source(), MESH_STEPS), self.interpolation.into());
+            canvas.set_transform_mesh(&warp::triangles(&mesh, t.source(), MESH_STEPS), interpolation.into());
         } else if let Some(to_source) = Homography::quad_to_quad(t.placed(), t.source()) {
             // each layer pixel looks up where it came from: a move lands on whole pixels
-            canvas.set_transform(to_source.to_f32(), self.interpolation.into());
+            canvas.set_transform(to_source.to_f32(), interpolation.into());
         }
     }
 

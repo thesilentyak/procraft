@@ -104,6 +104,8 @@ pub struct Transform {
     shown: Option<TransformBox>,
     kind: TransformKind,
     interpolation: Interpolation,
+    /// A pixel art canvas: always nearest, its pixels kept whole.
+    pixel_art: bool,
     guides: GuideSettings,
     advanced: bool,
     popup: Popup,
@@ -121,6 +123,7 @@ impl Default for Transform {
             shown: None,
             kind: TransformKind::Freeform,
             interpolation: Interpolation::Bilinear,
+            pixel_art: false,
             guides: GuideSettings::default(),
             advanced: false,
             popup: Popup::None,
@@ -135,6 +138,7 @@ impl Transform {
     /// Starts transforming the current layer (the caller has checked it takes changes). Returns
     /// what to say when there is nothing there to move.
     pub fn begin(&mut self, session: &CanvasSession) -> Result<(), String> {
+        self.pixel_art = session.is_pixel_art();
         session.transform_set_interpolation(self.interpolation);
         session.transform_set_guides(self.guides);
         let Some(shown) = session.transform_begin() else { return Err(session.transform_refusal()) };
@@ -366,8 +370,13 @@ impl Transform {
             Button::new(&icons::FLIP_VERTICAL, "Flip Vertical", 50.0),
             Button::new(&icons::ROTATE45, "Rotate 45\u{b0}", 44.0),
             Button::new(&icons::FIT_TO_CANVAS, "Fit to Canvas", 35.0),
-            Button::new(&icons::INTERPOLATION, interpolation_name(self.interpolation, true), 44.0)
-                .active(self.popup == Popup::Interpolation),
+            Button::new(
+                &icons::INTERPOLATION,
+                interpolation_name(if self.pixel_art { Interpolation::Nearest } else { self.interpolation }, true),
+                44.0,
+            )
+            .active(self.popup == Popup::Interpolation)
+            .enabled(!self.pixel_art),
             Button::new(&icons::TRANSFORM_RESET, "Reset", 44.0),
         ];
         let tapped = floating_toolbar(ctx, look, "transform toolbar", BUTTON_ROOMY, &kinds, &buttons, 43.0)?;

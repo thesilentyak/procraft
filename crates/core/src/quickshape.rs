@@ -263,7 +263,7 @@ const END_HOOK_POINTS: f32 = 30.0;
 
 impl State {
     /// `line` (canvas pixels) without a hook at its end, as a shape is fitted to.
-    fn without_end_hook(&self, line: Vec<Vec2>) -> Vec<Vec2> {
+    pub(crate) fn without_end_hook(&self, line: Vec<Vec2>) -> Vec<Vec2> {
         let zoom = self.view.map_or(1.0, |v| v.zoom()).max(1e-6);
         let reach = end_hook_reach(&line, END_HOOK_POINTS * self.display_scale / zoom);
         without_end_hook(&line, reach).to_vec()
@@ -475,7 +475,7 @@ impl State {
     }
 
     /// What a stroke snapped to: the shapes it looks like, a curve first where a plugin offers one.
-    fn recognised(&self, line: &[Vec2]) -> Vec<Shape> {
+    pub(crate) fn recognised(&self, line: &[Vec2]) -> Vec<Shape> {
         let mut found = recognise(line);
         let best = found.first().map_or(-1, |s| shape_number(s.kind));
         if let Some(curve) = self.plugin_curve(line, best) {
@@ -722,6 +722,11 @@ impl CanvasSession {
     pub fn quickshape_hold(&self) -> Option<QuickShapeInfo> {
         let mut guard = self.shared.lock();
         let st = &mut *guard;
+        // a pixel art canvas's pencil snaps its own line, drawn again in pixels
+        if st.pixel_shape_hold() {
+            self.shared.frame(st);
+            return None;
+        }
         if st.stroke.is_none() || st.shape.is_some() {
             return None;
         }

@@ -293,7 +293,9 @@ fun TransformToolbar(vm: CanvasViewModel, screenWidth: Dp, modifier: Modifier = 
             ToolbarButton(PcIcons.FlipVertical, "Flip Vertical", width = w, iconSize = 50.dp) { vm.transformAction(TransformAction.FLIP_VERTICAL) }
             ToolbarButton(PcIcons.Rotate45, "Rotate 45°", width = w, iconSize = 44.dp) { vm.transformAction(TransformAction.ROTATE45) }
             ToolbarButton(PcIcons.FitToCanvas, "Fit to Canvas", width = w, iconSize = 35.dp) { vm.transformAction(TransformAction.FIT_TO_CANVAS) }
-            ToolbarButton(PcIcons.Interpolation, interpolationName(vm.interpolation, short = true), active = popup == TransformPopup.INTERPOLATION, width = w, iconSize = 44.dp) {
+            // a pixel art canvas's pixels stay whole: always nearest
+            val pixelArt = vm.session?.isPixelArt() == true
+            ToolbarButton(PcIcons.Interpolation, interpolationName(if (pixelArt) Interpolation.NEAREST else vm.interpolation, short = true), active = popup == TransformPopup.INTERPOLATION, enabled = !pixelArt, width = w, iconSize = 44.dp) {
                 vm.transformPopup = if (popup == TransformPopup.INTERPOLATION) TransformPopup.NONE else TransformPopup.INTERPOLATION
             }
             ToolbarButton(PcIcons.TransformReset, "Reset", width = w, iconSize = 44.dp) { vm.transformAction(TransformAction.RESET) }

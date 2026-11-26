@@ -185,8 +185,12 @@ impl State {
 
     /// Joins `shape` to the selection; `record` makes it an undo step (otherwise it is only shown,
     /// as while a colour threshold is dragged).
-    pub(crate) fn join(&mut self, shape: Mask, how: SelectionJoin, record: bool) {
+    pub(crate) fn join(&mut self, mut shape: Mask, how: SelectionJoin, record: bool) {
         self.feather_base = None;
+        // a pixel art canvas's pixels are selected or not
+        if self.doc.pixel_art {
+            procraft_engine::pixel::harden(&mut shape.data);
+        }
         let before = self.selection.clone();
         match (self.selection.as_mut(), how) {
             (Some(m), _) => m.combine(&shape, how.into()),
@@ -258,6 +262,11 @@ impl CanvasSession {
     /// (`x1`, `y1`) joins the selection. Drawn on the window, so it turns with the view.
     pub fn select_shape(&self, ellipse: bool, x0: f32, y0: f32, x1: f32, y1: f32, join: SelectionJoin) {
         let (a, b) = (Vec2::new(x0, y0), Vec2::new(x1, y1));
+        // on a pixel art canvas, its corners on pixel corners, upright on the canvas
+        if let Some(points) = self.shared.lock().pixel_box(ellipse, a, b) {
+            self.select_canvas_polygon(points, join);
+            return;
+        }
         let window: Vec<Vec2> = if ellipse {
             let (c, r) = (a.lerp(b, 0.5), (b - a) * 0.5);
             (0..ELLIPSE_POINTS)
@@ -372,6 +381,10 @@ impl CanvasSession {
         let (base, mut room) = {
             let mut guard = self.shared.lock();
             let st = &mut *guard;
+            // a pixel art canvas's selections have hard edges
+            if st.doc.pixel_art {
+                return;
+            }
             // the selection as it was before the first, kept once
             if st.feather_base.is_none() {
                 st.feather_base = st.selection.clone().map(|m| (m, Vec::new()));
@@ -547,6 +560,19 @@ impl CanvasSession {
 }
 
 impl CanvasSession {
+    /// The polygon through canvas points `points` joins the selection, its path shown dashed while
+    /// the tool is open.
+    fn select_canvas_polygon(&self, points: Vec<Vec2>, join: SelectionJoin) {
+        let tool_open = self.selection_tool_open();
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        st.join(Mask::polygon(st.doc.width(), st.doc.height(), &points), join, true);
+        if tool_open && st.selection.is_some() {
+            st.selection_outlines.push(points);
+        }
+        self.shared.frame(st);
+    }
+
     fn select_window_polygon(&self, window: &[Vec2], join: SelectionJoin) {
         // (read before the canvas is held: the touches are held first where both are)
         let tool_open = self.selection_tool_open();

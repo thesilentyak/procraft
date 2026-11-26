@@ -5,7 +5,7 @@ are outlined, each to be designed before it's built. Written to go to ProCraft a
 it changes ProCraft's own files, but each change is a few lines switched by one mark, with the work
 in new files of its own.
 
-Status: draft for the user to agree.
+Status: agreed with the user 2026-11-26; P1, P2 and P4 built (2026-11-26), P3 and P5 to come.
 
 ## A. Principles
 
@@ -171,3 +171,7 @@ Issue text, for the user to post:
 | 2026-11-26 | A pixel art canvas inside ProCraft, not a separate editor or a plugin (plugins' own artworks can't use layers, animation or generation, and their brushes are laid smoothed) |
 | 2026-11-26 | Pixels set on the CPU and written with `write_layer_part`, not stamped by the brush engine |
 | 2026-11-26 | Pixel-perfect always on for size 1; pressure doesn't change pixel strokes by default |
+| 2026-11-26 | Clear pixels show a checkerboard of 8-pixel squares lined up with the pixels (the surround's own grid showed through beside the pixel grid, looking doubled) |
+| 2026-11-26 | The pencil's shape follows its width alone for now (squares to 2, discs from 3); a square brush's own shape can come later |
+| 2026-11-26 | QuickShape on the pixel pencil: the held line snaps as it does elsewhere, and the shape's outline is drawn again as pixel lines, following the pen until it lifts (no edit handles afterwards) |
+| 2026-11-26 | Rectangle and ellipse selections are upright on the canvas with their corners on pixel corners, whatever the view's turn |

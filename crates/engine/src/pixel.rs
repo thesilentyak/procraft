@@ -120,6 +120,14 @@ impl Perfect {
     }
 }
 
+/// `mask` (0 to 255 a pixel) made all or nothing: a pixel at least half selected wholly in, the
+/// rest out, as a pixel art canvas's selections are.
+pub fn harden(mask: &mut [u8]) {
+    for v in mask {
+        *v = if *v >= 128 { 255 } else { 0 };
+    }
+}
+
 /// How the pixel pencil changes a pixel.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Ink {
@@ -211,6 +219,15 @@ impl Stroke {
             *d = false;
         }
         self.grow(p);
+    }
+
+    /// Puts every pixel the stroke set back as it was (a shape drawn again in place of the line).
+    pub fn reset(&mut self) {
+        let w = self.width.max(1) as usize;
+        let set: Vec<usize> = self.done.iter().enumerate().filter(|(_, d)| **d).map(|(i, _)| i).collect();
+        for i in set {
+            self.unset(((i % w) as i32, (i / w) as i32));
+        }
     }
 
     /// The rectangle (x0, y0, x1, y1, ends past) changed since this was last asked, and its pixels
@@ -329,6 +346,22 @@ mod tests {
         // taken back out, as it was
         s.unset((1, 1));
         assert_eq!(s.take_changed().unwrap().1, vec![0, 0, 0, 0]);
+        assert!(!s.any());
+    }
+
+    #[test]
+    fn masks_harden_at_half_and_strokes_reset() {
+        let mut m = vec![0, 127, 128, 255];
+        harden(&mut m);
+        assert_eq!(m, vec![0, 0, 255, 255]);
+        let mut s = Stroke::new(3, 1, vec![0; 12], Ink::Paint([1.0; 3], 1.0), false, None).unwrap();
+        s.set((0, 0));
+        s.set((2, 0));
+        let _ = s.take_changed();
+        s.reset();
+        let (rect, part) = s.take_changed().unwrap();
+        assert_eq!(rect, [0, 0, 3, 1]);
+        assert_eq!(part, vec![0; 12]);
         assert!(!s.any());
     }
 
