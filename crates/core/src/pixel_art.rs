@@ -75,6 +75,17 @@ impl CanvasSession {
         self.shared.lock().doc.pixel_art
     }
 
+    /// Whether a pixel art canvas's fill takes only what's joined to where it lands (on, as it
+    /// starts) or every pixel of that colour on the layer (off), as Aseprite's Contiguous.
+    pub fn pixel_fill_contiguous(&self) -> bool {
+        self.shared.lock().pixel_contiguous
+    }
+
+    /// Sets [`CanvasSession::pixel_fill_contiguous`], for the fills from now on.
+    pub fn set_pixel_fill_contiguous(&self, on: bool) {
+        self.shared.lock().pixel_contiguous = on;
+    }
+
     /// Writes the flattened picture as a PNG to `path`, each pixel a `scale` × `scale` square, as
     /// a pixel art canvas exports (straight alpha, with the canvas's profile).
     pub fn export_png_scaled(&self, path: String, scale: u32) -> Result<(), MobileError> {

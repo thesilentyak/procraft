@@ -34,6 +34,7 @@ impl CanvasSession {
         let grid = st.surround_grid(Vec2::ZERO - corner);
         let surround = st.surround();
         let crisp_from = crate::pixel_art::crisp_from(&st.doc, st.display_scale);
+        let pixel_art = st.doc.pixel_art;
         let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else { return None };
         crate::surround::put_on(canvas, gpu, st.surround_picture.as_deref());
         let format = wgpu::TextureFormat::Rgba8Unorm;
@@ -81,6 +82,14 @@ impl CanvasSession {
                 let pixel = canvas.read_layer_part(gpu, st.doc.current(), rect).ok()?;
                 let [r, g, b, a] = [pixel.first()?, pixel.get(1)?, pixel.get(2)?, pixel.get(3)?].map(|c| u32::from(*c));
                 let un = |c: u32| ((c * 255 + a / 2) / a.max(1)).min(255);
+                (a > 0).then(|| un(r) << 16 | un(g) << 8 | un(b))
+            })
+        } else if pixel_art {
+            // a pixel art canvas's own colour there, exactly: none where it's clear (the colour
+            // stays as it was), and a see-through pixel's colour as it is where it's solid
+            at.and_then(|p| canvas.read_composite_pixel(gpu, p.x as u32, p.y as u32)).and_then(|[r, g, b, a]| {
+                let a = u32::from(a);
+                let un = |c: u8| ((u32::from(c) * 255 + a / 2) / a.max(1)).min(255);
                 (a > 0).then(|| un(r) << 16 | un(g) << 8 | un(b))
             })
         } else {

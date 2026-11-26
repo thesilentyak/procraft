@@ -108,6 +108,16 @@ impl Flood {
         self.mask_bounded(threshold).0
     }
 
+    /// Every pixel of the picture whose colour is within `threshold` (0..1) of the seed's, joined
+    /// to it or not, wholly or not at all (no fade past it): a pixel art fill that isn't
+    /// contiguous, recolouring each pixel of that colour.
+    pub fn everywhere(&self, threshold: f32) -> Mask {
+        let weights = weights(threshold);
+        let data =
+            self.distance.iter().map(|&d| if weights.get(usize::from(d)) == Some(&255) { 255 } else { 0 }).collect();
+        Mask { width: self.width, height: self.height, data }
+    }
+
     /// [`Flood::mask`], with a rectangle (x, y, width, height) holding all it takes where that is
     /// known without going over every pixel (a fill flooded on this thread): the rest of the mask
     /// is none. A small fill on a large canvas is then worked on where it is.

@@ -4164,6 +4164,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         s.setInterfaceSize(interfaceShown)
         // the system's animations off: a dropped colour's fill shows at once
         s.setReduceMotion(!android.animation.ValueAnimator.areAnimatorsEnabled())
+        readDropThreshold(s)
+        s.setPixelFillContiguous(pixelContiguous)
         applyPlugins(s)
         // the controls kept with this artwork, as it keeps them
         readPlugins()
@@ -8922,9 +8924,27 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         p, io.github.artcraftandroid.procraft.ui.Pc.barShown.value * density, sideBarBounds, barsHidden, covering.values,
     )
 
+    /** A pixel art canvas's fill takes only what's joined to where it lands (Contiguous), else every pixel of that colour. */
+    var pixelContiguous by mutableStateOf(true)
+        private set
+
+    /** Turns [pixelContiguous] on or off, for the fills from now on. */
+    fun setPixelContiguous(on: Boolean) {
+        pixelContiguous = on
+        session?.setPixelFillContiguous(on)
+    }
+
     /** The threshold the colour fills with (0..1), kept from one drop to the next. */
     var dropThreshold by mutableFloatStateOf(transformPrefs.getFloat(DROP_THRESHOLD, 0.5f))
         private set
+
+    /** Where the drop threshold is kept: a pixel art canvas's apart, starting at 0 (exact colours). */
+    private fun dropThresholdKey(): String = if (session?.isPixelArt() == true) DROP_PIXEL_THRESHOLD else DROP_THRESHOLD
+
+    /** The kept drop threshold for the artwork now open: a pixel art canvas's, or the others'. */
+    private fun readDropThreshold(s: CanvasSession) {
+        dropThreshold = if (s.isPixelArt()) transformPrefs.getFloat(DROP_PIXEL_THRESHOLD, 0f) else transformPrefs.getFloat(DROP_THRESHOLD, 0.5f)
+    }
 
     /** Whether the threshold is being slid: its row shows under the band. */
     var dropSliding by mutableStateOf(false)
@@ -9070,7 +9090,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         if (made == ColorDropFlow.Fill.POURED) droppedBand()
         drops.release(tried, dropSwatch ?: colorRgb(), dropThreshold, blocked = { currentTakesChanges(paint = true) }) { kept ->
             if (kept) {
-                if (dropSliding) transformPrefs.edit().putFloat(DROP_THRESHOLD, dropThreshold).apply()
+                if (dropSliding) transformPrefs.edit().putFloat(dropThresholdKey(), dropThreshold).apply()
                 dropSliding = false
                 if (made != ColorDropFlow.Fill.POURED) droppedBand()
                 drops.afterFills { refresh() }
@@ -9161,7 +9181,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     /** The touches' fill was let go of (kept, or taken back by a second finger): a slid threshold is kept for the next. */
     fun filled() {
-        if (dropSliding) transformPrefs.edit().putFloat(DROP_THRESHOLD, dropThreshold).apply()
+        if (dropSliding) transformPrefs.edit().putFloat(dropThresholdKey(), dropThreshold).apply()
         dropSliding = false
         // what the fill changed read once it is made (the main thread doesn't wait for it)
         drops.afterFills { refresh() }
@@ -10517,6 +10537,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         private const val COLOR_FILL = "selectionColorFill"
         private const val SELECTION_THRESHOLD = "selectionThreshold"
         private const val DROP_THRESHOLD = "dropThreshold"
+        private const val DROP_PIXEL_THRESHOLD = "dropPixelThreshold"
 
         /** How long a widget's tap waits for the window to be measured before opening anyway. */
         private const val WINDOW_WAIT_MS = 3000L

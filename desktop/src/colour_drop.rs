@@ -82,6 +82,10 @@ pub struct ColourDrop {
     swatch: Option<u32>,
     /// The threshold the colour fills with (0..1), kept from one drop to the next.
     threshold: f32,
+    /// The threshold kept for the other kind of canvas (a pixel art canvas's apart, starting at 0
+    /// for exact colours), and whether `threshold` is now a pixel art canvas's.
+    other_threshold: f32,
+    pixel_threshold: bool,
     /// The threshold is being slid: its row shows under the band.
     sliding: bool,
     /// The dragged colour came to rest and its slid threshold began filling (or was refused).
@@ -101,6 +105,8 @@ impl Default for ColourDrop {
             dot: None,
             swatch: None,
             threshold: 0.5,
+            other_threshold: 0.0,
+            pixel_threshold: false,
             sliding: false,
             poured: false,
             refused: false,
@@ -318,6 +324,11 @@ impl ColourDrop {
     /// Draws the band hanging from `top` and the dragged colour's dot; keeps the touches filling
     /// with the colour (`current`, unless a swatch was dropped) while filling goes on.
     pub fn show(&mut self, ctx: &egui::Context, session: &CanvasSession, current: u32, top: f32) {
+        // a pixel art canvas fills with its own threshold, the others with theirs
+        if session.is_pixel_art() != self.pixel_threshold {
+            std::mem::swap(&mut self.threshold, &mut self.other_threshold);
+            self.pixel_threshold = !self.pixel_threshold;
+        }
         // a press whose colour went away (a swatch taken out, a panel closed) ends with the pointer
         if self.press.is_some() && !ctx.input(|i| i.pointer.primary_down()) {
             let at = ctx.input(|i| i.pointer.interact_pos());

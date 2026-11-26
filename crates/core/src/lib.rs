@@ -662,6 +662,9 @@ pub(crate) struct State {
     pub(crate) plugin_artwork: Option<plugin_artwork::PluginArtwork>,
     /// A pixel art canvas's pencil or eraser stroke in progress.
     pixel_stroke: Option<pixel_art::PixelStroke>,
+    /// A pixel art canvas's fill takes only what's joined to where it lands (else every pixel of
+    /// that colour on the layer).
+    pixel_contiguous: bool,
     /// Opened from a folder holding a plugin's artwork: its kind and its data, until the app opens
     /// it with its plugin.
     pub(crate) plugin_opened: Option<plugin_artwork::PluginOpened>,
@@ -2265,6 +2268,7 @@ impl CanvasSession {
             picker_program: None,
             plugin_artwork: None,
             pixel_stroke: None,
+            pixel_contiguous: true,
             plugin_opened: None,
             sound_heard: None,
             sound_hover: None,

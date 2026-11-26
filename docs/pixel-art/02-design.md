@@ -5,7 +5,7 @@ are outlined, each to be designed before it's built. Written to go to ProCraft a
 it changes ProCraft's own files, but each change is a few lines switched by one mark, with the work
 in new files of its own.
 
-Status: agreed with the user 2026-11-26; P1, P2 and P4 built (2026-11-26), P3 and P5 to come.
+Status: agreed with the user 2026-11-26; P1 to P4 built (2026-11-26), P5 to come.
 
 ## A. Principles
 
@@ -175,3 +175,5 @@ Issue text, for the user to post:
 | 2026-11-26 | The pencil's shape follows its width alone for now (squares to 2, discs from 3); a square brush's own shape can come later |
 | 2026-11-26 | QuickShape on the pixel pencil: the held line snaps as it does elsewhere, and the shape's outline is drawn again as pixel lines, following the pen until it lifts (no edit handles afterwards) |
 | 2026-11-26 | Rectangle and ellipse selections are upright on the canvas with their corners on pixel corners, whatever the view's turn |
+| 2026-11-26 | A pixel art canvas keeps its own ColorDrop threshold, starting at 0% (others start at 50%); its fill takes only pixels wholly within it, never across a diagonal; Contiguous sits in ColorDrop's band (Android), on as it starts, off filling every pixel of that colour on the layer |
+| 2026-11-26 | The eyedropper on a pixel art canvas reads the visible picture's pixel exactly: a see-through pixel's colour as where it's solid, a clear one leaving the colour as it was |

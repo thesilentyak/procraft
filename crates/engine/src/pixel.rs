@@ -350,6 +350,16 @@ mod tests {
     }
 
     #[test]
+    fn a_fill_that_isnt_contiguous_takes_every_pixel_of_the_colour() {
+        let (red, blue) = ([255u8, 0, 0, 255], [0u8, 0, 255, 255]);
+        let pixels = [red, blue, red].concat();
+        let flood = crate::fill::Flood::new(3, 1, &pixels, (0, 0)).unwrap();
+        // joined: the blue between stops it
+        assert_eq!(flood.mask(0.0).data, vec![255, 0, 0]);
+        assert_eq!(flood.everywhere(0.0).data, vec![255, 0, 255]);
+    }
+
+    #[test]
     fn masks_harden_at_half_and_strokes_reset() {
         let mut m = vec![0, 127, 128, 255];
         harden(&mut m);

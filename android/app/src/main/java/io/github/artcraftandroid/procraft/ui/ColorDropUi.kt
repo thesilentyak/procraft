@@ -202,6 +202,11 @@ fun DropBandUi(vm: CanvasViewModel) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("ColorDrop", color = ink, fontSize = 16.5.sp, fontWeight = FontWeight.Bold, maxLines = 1)
                     Spacer(Modifier.width(13.dp))
+                    // a pixel art canvas's fill: only what's joined, or every pixel of that colour
+                    if (vm.session?.isPixelArt() == true) {
+                        PixelContiguous(vm, blue, ink)
+                        Spacer(Modifier.width(8.dp))
+                    }
                     if (what == DropBand.FILLING) {
                         // the tick ends filling
                         Box(Modifier.size(20.dp).clip(CircleShape).background(blue).press { vm.endFilling() }) {

@@ -1,6 +1,7 @@
 package io.github.artcraftandroid.procraft.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -123,3 +124,22 @@ fun pixelArtScales(vm: io.github.artcraftandroid.procraft.canvas.CanvasViewModel
     } else {
         emptyList()
     }
+
+/**
+ * ColorDrop's Contiguous switch on a pixel art canvas: on (blue), a fill takes only what's joined to
+ * where it lands; off (outlined), every pixel of that colour on the layer. For the fills from now on.
+ */
+@Composable
+fun PixelContiguous(vm: io.github.artcraftandroid.procraft.canvas.CanvasViewModel, blue: androidx.compose.ui.graphics.Color, ink: androidx.compose.ui.graphics.Color) {
+    val on = vm.pixelContiguous
+    Box(
+        Modifier.height(20.dp).clip(RoundedCornerShape(10.dp))
+            .background(if (on) blue else androidx.compose.ui.graphics.Color.Transparent)
+            .then(if (on) Modifier else Modifier.border(1.dp, ink, RoundedCornerShape(10.dp)))
+            .clickable { vm.setPixelContiguous(!on) }
+            .padding(horizontal = 10.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(if (on) "Contiguous" else "All of this colour", color = if (on) androidx.compose.ui.graphics.Color.White else ink, fontSize = 11.7.sp, maxLines = 1)
+    }
+}

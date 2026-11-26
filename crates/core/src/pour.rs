@@ -112,6 +112,10 @@ pub(crate) struct Pour {
     closed: Option<Mask>,
     /// Being finished by a plugin: nothing more changes it.
     finishing: Option<Arc<Finishing>>,
+    /// On a pixel art canvas, whether it fills only what's joined to where it landed (else every
+    /// pixel of that colour on the layer): either way wholly or not at all, no fade and nothing
+    /// taken on under soft edges.
+    pixel: Option<bool>,
 }
 
 impl Pour {
@@ -137,8 +141,18 @@ impl Pour {
                     (m, within)
                 }
             };
+            // a pixel art canvas's fill is exact: only what's wholly within the threshold, and
+            // everywhere on the layer when not contiguous
+            if let Some(contiguous) = self.pixel {
+                if contiguous {
+                    m.data.iter_mut().for_each(|v| *v = if *v == 255 { 255 } else { 0 });
+                } else {
+                    m = flood.everywhere(threshold);
+                    within = None;
+                }
+            }
             // poured into what is see-through, it goes on under the line it stopped at
-            if flood.colour[3] == 0 {
+            if flood.colour[3] == 0 && self.pixel.is_none() {
                 let pixels = self.elsewhere.as_deref().unwrap_or(&self.before);
                 match within {
                     Some(bounds) => {
@@ -781,7 +795,8 @@ impl CanvasSession {
         // first only the part of the canvas about the point (a fill that comes near its edge reads
         // the rest)
         let full = [0, 0, w, h];
-        let area = if all_layers || whole_at_once() { full } else { pour_area(seed, (w, h)) };
+        // (a pixel art canvas is small, and a fill that isn't contiguous reaches all of it)
+        let area = if all_layers || whole_at_once() || st.doc.pixel_art { full } else { pour_area(seed, (w, h)) };
         let read = |st: &mut State, id: LayerId| {
             if area == full { st.layer_pixels(id) } else { st.layer_part(id, area_rect(area)) }
         };
@@ -824,6 +839,7 @@ impl CanvasSession {
             shown_mask: None,
             closed: None,
             finishing: None,
+            pixel: st.doc.pixel_art.then_some(st.pixel_contiguous),
         };
         match flood {
             Some(flood) if !all_layers => pour.flood = flood,
