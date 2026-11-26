@@ -8940,7 +8940,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     var paletteOpen by mutableStateOf(false)
 
     /** The palette set to [colours] (each once, at most 256), kept with the artwork. */
-    fun setPixelPalette(colours: List<Int>) {
+    fun choosePixelPalette(colours: List<Int>) {
         val s = session ?: return
         pixelPalette = s.setPixelPalette(colours.map { it.toUInt() }).map { it.toInt() }
     }
@@ -8954,7 +8954,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             message = "Copy some hex colour codes first (such as #1a1c2c), then paste them."
             return
         }
-        setPixelPalette(colours)
+        choosePixelPalette(colours)
     }
 
     /** The colours on the canvas as the palette (all of them, up to 64). */
@@ -8962,7 +8962,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         val s = session ?: return
         viewModelScope.launch {
             val colours = withContext(Dispatchers.Default) { s.pixelPaletteFromPicture().map { it.toInt() } }
-            if (colours.isEmpty()) message = "There are no colours on the canvas yet." else setPixelPalette(colours)
+            if (colours.isEmpty()) message = "There are no colours on the canvas yet." else choosePixelPalette(colours)
         }
     }
 

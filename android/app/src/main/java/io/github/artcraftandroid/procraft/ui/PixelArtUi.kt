@@ -214,7 +214,7 @@ private fun PaletteStrip(vm: io.github.artcraftandroid.procraft.canvas.CanvasVie
                             androidx.compose.material3.DropdownMenu(expanded = held == c, onDismissRequest = { held = null }) {
                                 androidx.compose.material3.DropdownMenuItem(text = { Text("Remove") }, onClick = {
                                     held = null
-                                    vm.setPixelPalette(vm.pixelPalette - c)
+                                    vm.choosePixelPalette(vm.pixelPalette - c)
                                 })
                             }
                         }
@@ -223,13 +223,13 @@ private fun PaletteStrip(vm: io.github.artcraftandroid.procraft.canvas.CanvasVie
             }
         }
         Row(Modifier.padding(top = 6.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            StripButton("+") { vm.setPixelPalette(vm.pixelPalette + current) }
+            StripButton("+") { vm.choosePixelPalette(vm.pixelPalette + current) }
             Box {
                 StripButton("⋯") { menu = true }
                 androidx.compose.material3.DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                     androidx.compose.material3.DropdownMenuItem(text = { Text("Paste hex codes") }, onClick = { menu = false; vm.pastePixelPalette() })
                     androidx.compose.material3.DropdownMenuItem(text = { Text("From the picture") }, onClick = { menu = false; vm.pixelPaletteFromPicture() })
-                    androidx.compose.material3.DropdownMenuItem(text = { Text("Clear") }, onClick = { menu = false; vm.setPixelPalette(emptyList()) })
+                    androidx.compose.material3.DropdownMenuItem(text = { Text("Clear") }, onClick = { menu = false; vm.choosePixelPalette(emptyList()) })
                 }
             }
         }
