@@ -183,11 +183,87 @@ def rd_flow():
     return nodes
 
 
+def pixel_edit():
+    """Pixel art edit: MiniMax H3 edits the canvas (or its selection's part), blown up with hard
+    edges to about 2048 pixels across first, and SpriteFusion's Pixel Snapper (its node pack in
+    custom_nodes) puts the result back on the canvas's own pixel grid with a limited palette, the
+    plain background round the sprite taken out."""
+    unet = "minimax_h3_image_pruned_int8_convrot.safetensors"
+    te = "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
+    vae = "minimax_h3_image_vae_fp16.safetensors"
+    nodes = []
+
+    def node(nid, cls, widgets, links, outputs, widget_links=(), api_widgets=None, title=None, pos=(0, 0)):
+        nodes.append(dict(id=nid, cls=cls, widgets=widgets, links=links, outputs=outputs,
+                          widget_links=set(widget_links), api=api_widgets or {}, title=title, pos=pos))
+
+    node(1, "ETN_KritaCanvas", [], {}, [("image", "IMAGE"), ("width", "INT"), ("height", "INT"), ("seed", "INT"), ("mask", "MASK")],
+         title="Canvas (from the app)", pos=(0, 600))
+    node(2, "ETN_Parameter", ["Prompt", "prompt (positive)", "", -1e10, 1e10], {}, [("value", "*")],
+         api_widgets={"name": "Prompt", "type": "prompt (positive)", "default": "", "min": -1e10, "max": 1e10},
+         title="Prompt (from the app)", pos=(0, 420))
+    node(3, "ETN_Parameter", ["Palette", "text", "", -1e10, 1e10], {}, [("value", "*")],
+         api_widgets={"name": "Palette", "type": "text", "default": "", "min": -1e10, "max": 1e10},
+         title="Palette: hex colours, or empty (from the app)", pos=(1900, 700))
+    node(4, "ETN_Parameter", ["Transparent background", "toggle", "true", -1e10, 1e10], {}, [("value", "*")],
+         api_widgets={"name": "Transparent background", "type": "toggle", "default": "true", "min": -1e10, "max": 1e10},
+         title="Transparent background (from the app)", pos=(1900, 900))
+    node(5, "ETN_KritaSelection", ["automatic", 16], {}, [("mask", "MASK"), ("active", "BOOLEAN"), ("offset x", "INT"), ("offset y", "INT")],
+         api_widgets={"context": "automatic", "padding": 16}, title="Selection (from the app)", pos=(0, 800))
+    node(6, "ComfyMathExpression", ["max(1, floor(2048 / max(a, b)))"], {"values.a": (1, 1), "values.b": (1, 2)},
+         [("FLOAT", "FLOAT"), ("INT", "INT"), ("BOOL", "BOOLEAN")],
+         api_widgets={"expression": "max(1, floor(2048 / max(a, b)))"}, title="How much to blow it up", pos=(340, 600))
+    node(7, "ImageScaleBy", ["nearest-exact", 1.0], {"image": (1, 0), "scale_by": (6, 0)}, [("IMAGE", "IMAGE")],
+         widget_links=["scale_by"], api_widgets={"upscale_method": "nearest-exact"}, title="Hard-edged, big enough for MiniMax",
+         pos=(700, 600))
+    node(8, "UNETLoader", [unet, "default"], {}, [("MODEL", "MODEL")],
+         api_widgets={"unet_name": unet, "weight_dtype": "default"}, pos=(0, 0))
+    node(9, "CLIPLoader", [te, "minimax", "default"], {}, [("CLIP", "CLIP")],
+         api_widgets={"clip_name": te, "type": "minimax", "device": "default"}, pos=(0, 140))
+    node(10, "VAELoader", [vae], {}, [("VAE", "VAE")], api_widgets={"vae_name": vae}, pos=(0, 300))
+    prefix = "Edit <Picture 1>, keeping it pixel art on a plain background: "
+    node(11, "StringConcatenate", [prefix, "", ""], {"string_b": (2, 0)}, [("STRING", "STRING")],
+         widget_links=["string_b"], api_widgets={"string_a": prefix, "delimiter": ""}, pos=(340, 420))
+    node(12, "MiniMaxH3ImageConditioning", ["", 0, 0], {"clip": (9, 0), "vae": (10, 0), "prompt": (11, 0), "images.image_1": (7, 0)},
+         [("positive", "CONDITIONING"), ("LATENT", "LATENT")], widget_links=["prompt"],
+         api_widgets={"width": 0, "height": 0}, pos=(1050, 140))
+    node(13, "ConditioningZeroOut", [], {"conditioning": (12, 0)}, [("CONDITIONING", "CONDITIONING")], pos=(1400, 300))
+    node(14, "KSampler", [0, "fixed", 6, 1, "euler", "simple", 1],
+         {"model": (8, 0), "positive": (12, 0), "negative": (13, 0), "latent_image": (12, 1), "seed": (1, 3)},
+         [("LATENT", "LATENT")], widget_links=["seed"],
+         api_widgets={"steps": 6, "cfg": 1, "sampler_name": "euler", "scheduler": "simple", "denoise": 1}, pos=(1650, 140))
+    node(15, "VAEDecode", [], {"samples": (14, 0), "vae": (10, 0)}, [("IMAGE", "IMAGE")], pos=(2000, 140))
+    node(16, "GetImageSize", [], {"image": (15, 0)}, [("width", "INT"), ("height", "INT"), ("batch_size", "INT")],
+         pos=(2000, 300))
+    node(17, "ComfyMathExpression", ["a / b"], {"values.a": (16, 0), "values.b": (1, 1)},
+         [("FLOAT", "FLOAT"), ("INT", "INT"), ("BOOL", "BOOLEAN")], api_widgets={"expression": "a / b"},
+         title="The size of one canvas pixel in it", pos=(2300, 300))
+    node(18, "SpriteFusionPixelSnapper",
+         [24, 0.0, "exact_size", 1, 64, 64, "connected_chroma_key", "auto", 32, "majority", "", "uniform"],
+         {"image": (15, 0), "pixel_size": (17, 0), "exact_width": (1, 1), "exact_height": (1, 2), "custom_palette": (3, 0)},
+         [("image", "IMAGE"), ("grid_width", "INT"), ("grid_height", "INT"), ("mask", "MASK"), ("key_color_used", "STRING")],
+         widget_links=["pixel_size", "exact_width", "exact_height", "custom_palette"],
+         api_widgets={"colors": 24, "output_mode": "exact_size", "output_scale": 1, "transparency": "connected_chroma_key",
+                      "key_color": "auto", "key_tolerance": 32, "cell_method": "majority", "grid_mode": "uniform"},
+         title="Back onto the canvas's pixels", pos=(2600, 140))
+    node(19, "SolidMask", [0.0, 512, 512], {"width": (1, 1), "height": (1, 2)}, [("MASK", "MASK")],
+         widget_links=["width", "height"], api_widgets={"value": 0.0}, title="Nothing transparent", pos=(2600, 600))
+    node(20, "ComfySwitchNode", [True], {"switch": (4, 0), "on_true": (18, 3), "on_false": (19, 0)}, [("output", "MASK")],
+         widget_links=["switch"], pos=(2950, 400))
+    node(21, "JoinImageWithAlpha", [], {"image": (18, 0), "alpha": (20, 0)}, [("IMAGE", "IMAGE")], pos=(3250, 140))
+    node(22, "ETN_KritaOutput", [0, 0, "Pixel edit", "default", False], {"images": (21, 0)}, [],
+         api_widgets={"x": 0, "y": 0, "name": "Pixel edit", "batch_mode": "default", "resize_canvas": False},
+         title="Back to the app", pos=(3550, 140))
+    return nodes
+
+
 def widget_inputs(n):
     # the inputs that are widgets given a link
     types = {"text": "STRING", "seed": "INT", "denoise": "FLOAT", "prompt": "STRING", "width": "INT",
              "height": "INT", "string_b": "STRING", "request": "STRING", "background": "COMBO",
-             "palette": "STRING", "caption": "STRING", "target_width": "INT", "target_height": "INT"}
+             "palette": "STRING", "caption": "STRING", "target_width": "INT", "target_height": "INT",
+             "scale_by": "FLOAT", "pixel_size": "FLOAT", "exact_width": "INT", "exact_height": "INT",
+             "custom_palette": "STRING", "switch": "BOOLEAN"}
     return [(w, types.get(w, "*")) for w in n["widget_links"]]
 
 
@@ -257,6 +333,7 @@ if __name__ == "__main__":
         (minimax(False), "ProCraft - MiniMax new picture"),
         (minimax(True), "ProCraft - MiniMax edit"),
         (rd_flow(), "ProCraft - Pixel art (RD Flow 64)"),
+        (pixel_edit(), "ProCraft - Pixel art edit (MiniMax)"),
     ]
     for nodes, name in made:
         json.dump(to_ui(nodes, name), open(f"{where}/{name}.json", "w"), indent=2)

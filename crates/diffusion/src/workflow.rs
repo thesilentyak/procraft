@@ -761,6 +761,27 @@ mod tests {
     }
 
     #[test]
+    fn the_pixel_edit_starter_reads_and_prepares() {
+        let w = Workflow::parse("Pixel edit", include_str!("../tests/workflows/pixel-art-edit.json")).unwrap();
+        let params = w.parameters(&Map::new());
+        let names: Vec<_> = params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Palette", "Prompt", "Transparent background"]);
+        assert_eq!(params[2].kind, ParamKind::Toggle);
+        let prepared = w
+            .prepare(&params, &inputs(&[("Prompt", ParamValue::Text("give it a sword".into()))]), &Map::new())
+            .unwrap();
+        assert_eq!(input(&prepared, "StringConcatenate", "string_b"), "give it a sword");
+        assert_eq!(input(&prepared, "ComfySwitchNode", "switch"), true);
+        // the canvas's size: the snapper's grid, the mask and the sums
+        assert_eq!(input(&prepared, "SpriteFusionPixelSnapper", "exact_width"), 64);
+        assert_eq!(input(&prepared, "SpriteFusionPixelSnapper", "exact_height"), 48);
+        assert_eq!(input(&prepared, "ComfyMathExpression", "values.a"), 64);
+        let picture = input(&prepared, "ImageScaleBy", "image");
+        assert_eq!(prepared.graph.class(picture[0].as_str().unwrap()), Some("ETN_LoadImageBase64"));
+        assert_eq!(prepared.outputs[0].name, "Pixel edit");
+    }
+
+    #[test]
     fn seeds_fit_a_node_s_range() {
         let spec = json!(["INT", {"min": 10, "max": 19}]);
         assert_eq!(fit_seed(15, Some(&spec)), 15);
