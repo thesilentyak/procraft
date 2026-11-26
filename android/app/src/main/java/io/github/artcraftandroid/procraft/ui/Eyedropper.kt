@@ -33,7 +33,9 @@ import kotlin.math.roundToInt
 
 private val LoupeOuter = 69.dp
 private val LoupeInner = 53.5.dp
-private val LoupeLift = 41.dp
+
+/** Where the loupe's middle is for [pick] (window pixels, [density] of them a dp): [PickState.lift] above its point. */
+internal fun loupeMiddle(pick: PickState, density: Float) = IntOffset(pick.x.roundToInt(), pick.y.roundToInt() - (pick.lift * density).roundToInt())
 
 /** The bar under the top bar while the eyedropper is open (on the canvas, or the reference window). */
 @Composable
@@ -44,16 +46,16 @@ fun PickingBar(modifier: Modifier = Modifier, fromReference: Boolean = false) {
 }
 
 /**
- * The eyedropper's loupe, centred [LoupeLift] above the finger: a ring whose top half is the colour
- * under the finger and bottom half the current colour, around what is shown there at twice the size.
+ * The eyedropper's loupe, centred [PickState.lift] above the point it picks (40 above a finger, on
+ * a pen's tip): a ring whose top half is the colour under the point and bottom half the current
+ * colour, around what is shown there at twice the size.
  */
 @Composable
 fun Loupe(pick: PickState, current: Color, modifier: Modifier) {
     val density = LocalDensity.current
     val side = with(density) { (LoupeOuter * 2 + 12.dp).roundToPx() }
-    val cx = pick.x.roundToInt()
-    val cy = pick.y.roundToInt() - with(density) { LoupeLift.roundToPx() }
-    Canvas(modifier.offset { IntOffset(cx - side / 2, cy - side / 2) }.size(with(density) { side.toDp() })) {
+    val middle = loupeMiddle(pick, density.density)
+    Canvas(modifier.offset { IntOffset(middle.x - side / 2, middle.y - side / 2) }.size(with(density) { side.toDp() })) {
         val c = center
         val outer = LoupeOuter.toPx()
         val inner = LoupeInner.toPx()

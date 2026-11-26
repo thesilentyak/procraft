@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 use egui::{Align2, Color32, Id, Order, Pos2, Rect, ScrollArea, Sense, Shape, Stroke, UiBuilder, pos2, vec2};
 use procraft_core::{
     BrushInfo, CanvasSession, QuickAction, QuickMenuSet, quick_action_label, quick_actions_listed,
-    quick_adjustments_listed, quick_menu_active_after, quick_menu_added, quick_menus, quick_menus_saved,
+    quick_adjustments_listed, quick_menu_active_after, quick_menu_added, quick_menu_renamed, quick_menus,
+    quick_menus_saved,
 };
 
 use crate::icons;
@@ -101,6 +102,9 @@ pub struct QuickMenu {
     fresh: Vec<usize>,
     marked: Option<usize>,
     swipe: Option<(usize, f32)>,
+    /// The menu being renamed (its row, the active one, tapped again): what is typed, and whether
+    /// the field has had the focus yet.
+    renaming: Option<(usize, String, bool)>,
 }
 
 impl Default for QuickMenu {
@@ -124,6 +128,7 @@ impl Default for QuickMenu {
             fresh: Vec::new(),
             marked: None,
             swipe: None,
+            renaming: None,
         }
     }
 }
@@ -157,6 +162,11 @@ impl QuickMenu {
         self.menus_open = false;
         self.fresh.clear();
         self.swipe = None;
+        // a name being typed is kept as it is
+        if let Some((i, typed, _)) = self.renaming.take() {
+            self.menus = quick_menu_renamed(std::mem::take(&mut self.menus), i as u32, typed);
+            self.keep();
+        }
     }
 
     /// The buttons the ring shows.
@@ -537,6 +547,7 @@ impl QuickMenu {
         };
         let mut chose = None;
         let mut delete = None;
+        let mut renamed = None;
         let mut add = false;
         egui::Area::new(Id::unique("quick menus")).fixed_pos(screen.min).order(Order::Tooltip).show(ctx, |ui| {
             ui.painter().add(Shape::convex_polygon(arrow.to_vec(), argb(PICKER_FILL), Stroke::NONE));
@@ -601,16 +612,44 @@ impl QuickMenu {
                                 if on { (Weight::SemiBold, Color32::WHITE) } else { (Weight::Regular, argb(ROW_INK)) };
                             let painter = ui.painter().with_clip_rect(ui.clip_rect().intersect(list));
                             let at = pos2(moved.left() + 16.0, moved.center().y + ROW_TEXT_DROP);
-                            text_tracked(
-                                &painter,
-                                at,
-                                Align2::LEFT_CENTER,
-                                &menu.name,
-                                ROW_TEXT,
-                                weight,
-                                colour,
-                                ROW_TRACKING,
-                            );
+                            if let Some((_, typed, focused)) = self.renaming.as_mut().filter(|r| r.0 == i) {
+                                // the name typed in place, all of it chosen at first
+                                let field = Rect::from_min_max(
+                                    pos2(moved.left() + 16.0, moved.top()),
+                                    pos2(moved.right() - 16.0, moved.bottom()),
+                                );
+                                let mut output = egui::TextEdit::singleline(typed)
+                                    .font(Weight::SemiBold.font(ROW_TEXT))
+                                    .text_color(Color32::WHITE)
+                                    .frame(egui::Frame::NONE)
+                                    .margin(vec2(0.0, 0.0))
+                                    .align(Align2::LEFT_CENTER)
+                                    .desired_width(field.width())
+                                    .show(&mut ui.new_child(UiBuilder::new().max_rect(field)));
+                                if !*focused {
+                                    output.response.request_focus();
+                                    let all = egui::text::CCursorRange::two(
+                                        egui::text::CCursor::new(0),
+                                        egui::text::CCursor::new(typed.chars().count()),
+                                    );
+                                    output.state.cursor.set_char_range(Some(all));
+                                    output.state.store(ui.ctx(), output.response.id);
+                                    *focused = true;
+                                } else if output.response.lost_focus() {
+                                    renamed = Some((i, typed.clone()));
+                                }
+                            } else {
+                                text_tracked(
+                                    &painter,
+                                    at,
+                                    Align2::LEFT_CENTER,
+                                    &menu.name,
+                                    ROW_TEXT,
+                                    weight,
+                                    colour,
+                                    ROW_TRACKING,
+                                );
+                            }
                             if offset < 0.0 {
                                 let button = Rect::from_min_size(
                                     pos2(r.right() - DELETE_IN - DELETE.0, r.center().y - DELETE.1 / 2.0),
@@ -638,9 +677,14 @@ impl QuickMenu {
                                 }
                             }
                             if response.clicked() {
-                                // a tap closes a row left open, else chooses the menu
+                                // a tap closes a row left open, renames the active menu, else
+                                // chooses the menu
                                 if self.swipe.is_some() {
                                     self.swipe = None;
+                                } else if on {
+                                    if self.renaming.is_none() {
+                                        self.renaming = Some((i, menu.name.clone(), false));
+                                    }
                                 } else {
                                     chose = Some(i);
                                 }
@@ -650,6 +694,11 @@ impl QuickMenu {
                     });
             });
         });
+        if let Some((i, name)) = renamed {
+            self.renaming = None;
+            self.menus = quick_menu_renamed(std::mem::take(&mut self.menus), i as u32, name);
+            self.keep();
+        }
         if add {
             self.menus = quick_menu_added(std::mem::take(&mut self.menus));
             let new = self.menus.len() - 1;

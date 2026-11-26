@@ -1,0 +1,46 @@
+{
+  "schema": 1,
+  "id": "io.github.artcraftandroid.brush-extras",
+  "name": "Brush extras",
+  "version": "1.0.0",
+  "holds": ["hooks"],
+  "publisher": {"name": "ProCraft"},
+  "description": "Randomise in the brush studio, a sound as you draw, a pressure for your finger, strokes moved off the pen tip and QuickShape curves, each with a switch of its own.",
+  "compat": {"procraft": {"interface": 16}},
+  "permissions": [],
+  "hooks": ["randomise_brush", "stroke_sound", "pressure", "position", "quickshape_curve"],
+  "controls": [
+    {"key": "randomise", "type": "feature", "label": "Brush randomiser", "description": "A Randomise button in the brush studio sets the brush's settings at random. Cancel takes it back.", "hooks": ["randomise_brush"]},
+    {"key": "brush_sounds", "type": "feature", "label": "Brush sounds", "description": "A sound as you draw: an eraser, pencil, pen, paintbrush, airbrush or spray can, by the brush. Import a recording for any of them. A brush can have its own in the Brush Studio.", "hooks": ["stroke_sound"]},
+    {"key": "volume", "type": "slider", "label": "Volume", "least": 0, "most": 1, "step": 0.01, "starts": 1, "shown_times": 100, "unit": "%", "live": true, "under": "brush_sounds"},
+    {"key": "sound", "type": "slider", "label": "Sound", "least": 0, "most": 6, "step": 1, "starts": 0, "names": ["By brush", "Eraser", "Pencil", "Pen", "Paintbrush", "Airbrush", "Spray can"], "live": true, "under": "brush_sounds"},
+    {"key": "eraser", "type": "switch", "label": "Sound when erasing", "starts": true, "under": "brush_sounds"},
+    {"key": "eraser_sound", "type": "slider", "label": "Erasing sound", "least": 1, "most": 6, "step": 1, "starts": 1, "names": ["Eraser", "Pencil", "Pen", "Paintbrush", "Airbrush", "Spray can"], "live": true, "under": "brush_sounds"},
+    {"key": "eraser_recording", "type": "file", "label": "Eraser recording", "accepts": "sound", "under": "brush_sounds"},
+    {"key": "pencil_recording", "type": "file", "label": "Pencil recording", "accepts": "sound", "under": "brush_sounds"},
+    {"key": "pen_recording", "type": "file", "label": "Pen recording", "accepts": "sound", "under": "brush_sounds"},
+    {"key": "paintbrush_recording", "type": "file", "label": "Paintbrush recording", "accepts": "sound", "under": "brush_sounds"},
+    {"key": "airbrush_recording", "type": "file", "label": "Airbrush recording", "accepts": "sound", "under": "brush_sounds"},
+    {"key": "spray_recording", "type": "file", "label": "Spray can recording", "accepts": "sound", "under": "brush_sounds"},
+    {"key": "finger_pressure", "type": "feature", "label": "Finger pressure", "description": "Gives your finger a pressure, as a pen has: the faster it moves the lighter it presses, and each stroke tapers in and out. Pens and mice draw as they do.", "hooks": ["pressure"]},
+    {"key": "speed", "type": "slider", "label": "Speed influence", "least": 0, "most": 1, "step": 0.01, "starts": 0.7, "shown_times": 100, "unit": "%", "under": "finger_pressure"},
+    {"key": "start", "type": "slider", "label": "Start taper", "least": 0, "most": 200, "step": 1, "starts": 20, "unit": " pt", "at_least": "Off", "under": "finger_pressure"},
+    {"key": "end", "type": "slider", "label": "End taper", "least": 0, "most": 200, "step": 1, "starts": 40, "unit": " pt", "at_least": "Off", "under": "finger_pressure"},
+    {"key": "least", "type": "slider", "label": "Least pressure", "least": 0, "most": 1, "step": 0.01, "starts": 0.1, "shown_times": 100, "unit": "%", "under": "finger_pressure"},
+    {"key": "most", "type": "slider", "label": "Most pressure", "least": 0, "most": 1, "step": 0.01, "starts": 1, "shown_times": 100, "unit": "%", "under": "finger_pressure"},
+    {"key": "touch_offset", "type": "feature", "label": "Touch position offset", "description": "Moves where your strokes land, for a pen whose ink doesn't sit under its tip.", "hooks": ["position"]},
+    {"key": "x", "type": "slider", "label": "X", "least": -100, "most": 100, "step": 1, "starts": 0, "unit": " px", "under": "touch_offset"},
+    {"key": "y", "type": "slider", "label": "Y", "least": -100, "most": 100, "step": 1, "starts": 0, "unit": " px", "under": "touch_offset"},
+    {"key": "quickshape_curves", "type": "feature", "label": "QuickShape curves", "description": "A stroke that bends more than once snaps to a curve you can reshape: drag its points, tap one to make it a corner.", "hooks": ["quickshape_curve"]}
+  ],
+  "brush_controls": [
+    {"key": "sound", "label": "Sound", "choices": ["Default", "Eraser", "Pencil", "Pen", "Paintbrush", "Airbrush", "Spray can", "No sound"], "under": "brush_sounds", "from": "io.github.artcraftandroid.brush-sounds"}
+  ],
+  "replaces": [
+    {"id": "io.github.artcraftandroid.randomise-brush", "switch": "randomise"},
+    {"id": "io.github.artcraftandroid.brush-sounds", "switch": "brush_sounds", "controls": {"volume": "volume", "sound": "sound", "eraser": "eraser", "eraser_sound": "eraser_sound", "eraser_recording": "eraser_recording", "pencil_recording": "pencil_recording", "pen_recording": "pen_recording", "paintbrush_recording": "paintbrush_recording", "airbrush_recording": "airbrush_recording", "spray_recording": "spray_recording"}},
+    {"id": "io.github.artcraftandroid.finger-pressure", "switch": "finger_pressure", "controls": {"speed": "speed", "start": "start", "end": "end", "least": "least", "most": "most"}},
+    {"id": "io.github.artcraftandroid.touch-offset", "switch": "touch_offset", "controls": {"x": "x", "y": "y"}},
+    {"id": "io.github.artcraftandroid.quickshape-curves", "switch": "quickshape_curves"}
+  ]
+}

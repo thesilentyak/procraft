@@ -17,9 +17,14 @@ import androidx.core.view.WindowInsetsControllerCompat
 import io.github.artcraftandroid.procraft.canvas.CanvasViewModel
 import io.github.artcraftandroid.procraft.canvas.ProjectionPresentation
 import io.github.artcraftandroid.procraft.canvas.PEN_DOUBLE_TAP_KEY
+import io.github.artcraftandroid.procraft.canvas.systemShortcutKeys
 import io.github.artcraftandroid.procraft.canvas.PenKeyAction
 import io.github.artcraftandroid.procraft.canvas.PenDoubleTaps
+import io.github.artcraftandroid.procraft.canvas.keyPress
+import io.github.artcraftandroid.procraft.canvas.KeysTold
+import io.github.artcraftandroid.procraft.canvas.maybePenKeys
 import io.github.artcraftandroid.procraft.canvas.penKeyButton
+import io.github.artcraftandroid.procraft.canvas.pointerKindOf
 import kotlinx.coroutines.launch
 import io.github.artcraftandroid.procraft.ui.AppRoot
 
@@ -31,6 +36,22 @@ private const val TAP_DRIFT_DP = 24f
 
 class MainActivity : ComponentActivity() {
     private val vm: CanvasViewModel by viewModels()
+
+    /** Hides the system's bars, as the model asks (let go as this activity goes: the model outlives it). */
+    private val barsHider: () -> Unit = { hideSystemBars() }
+
+    /**
+     * The brush library's file picker, registered with the activity rather than the library: what
+     * is picked comes in even if the library closed while the picker was up, or the system ended
+     * the app meanwhile (it is registered again as the activity is made again, and the pick is
+     * handed to it then). Any kind of file can be picked: brush files have no type of their own.
+     */
+    private val brushFilePicker = registerForActivityResult(androidx.activity.result.contract.ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let(vm::importBrushes)
+    }
+    private val brushPickerOpener: () -> Unit = {
+        runCatching { brushFilePicker.launch(arrayOf("*/*")) }.onFailure { AppLog.e("ProCraft", "opening the brush file picker", it) }
+    }
 
     // Project canvas: the presentation on a second display, and the displays coming and going
     private var projection: ProjectionPresentation? = null
@@ -44,15 +65,22 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge(SystemBarStyle.dark(Color.TRANSPARENT), SystemBarStyle.dark(Color.TRANSPARENT))
         super.onCreate(savedInstanceState)
+        // the log's file first, so that what follows is in it
+        AppLog.start(this)
+        // which graphics backend the app is trying, kept before the model (made at its first use
+        // below) makes the GPU device: a driver that crashes the app then sends the next start to
+        // the next backend (one that drew is trusted until the app or the system is updated); and
+        // how the last runs ended, so that a driver that crashed them while drawing sends this one
+        // to the other backend
+        io.github.artcraftandroid.procraft.core.setGpuRecordFolder(filesDir.path, installedBuild())
+        AppLog.toGpuStart(this)
         // text's fonts given to the core, off the main thread
         io.github.artcraftandroid.procraft.canvas.TextRenderer.prepare(assets, java.io.File(filesDir, "fonts"))
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) window.isNavigationBarContrastEnforced = false
-        // wide colour, so a Display P3 canvas's colours show as they are around it too
-        if (resources.configuration.isScreenWideColorGamut) window.colorMode = android.content.pm.ActivityInfo.COLOR_MODE_WIDE_COLOR_GAMUT
         hideSystemBars()
-        // which graphics backend the app is trying, kept before the model makes the GPU device: a
-        // driver that crashes the app then sends the next start to the next backend
-        io.github.artcraftandroid.procraft.core.setGpuRecordFolder(filesDir.path)
+        // a colour dragged down from the top bar puts back the bars the drag showed
+        vm.hideSystemBars = barsHider
+        vm.pickBrushFile = brushPickerOpener
         // made here, not inside the flow's read-only snapshot, where its setup can't write state
         val model = vm
         // laid out left to right in every language, as the original is: a right-to-left one
@@ -63,7 +91,21 @@ class MainActivity : ComponentActivity() {
             ) { AppRoot(model) }
         }
         lifecycleScope.launch { snapshotFlow { model.projectCanvas }.collect { showProjection() } }
+        // wide colour while a Display P3 canvas is open, so its colours show as they are around it
+        // too; else the default, as the canvas's surface then is: a wide window has had the
+        // interface over the canvas blurred away, or the canvas dulled, on some tablets' screens
+        lifecycleScope.launch {
+            snapshotFlow { model.wideColorWindow }.collect { wide ->
+                window.colorMode = if (wide) android.content.pm.ActivityInfo.COLOR_MODE_WIDE_COLOR_GAMUT else android.content.pm.ActivityInfo.COLOR_MODE_DEFAULT
+            }
+        }
         importOpened(intent)
+    }
+
+    /** The app as installed and the system it runs on, as one text: it differs once either is updated. */
+    private fun installedBuild(): String {
+        val installed = runCatching { packageManager.getPackageInfo(packageName, 0).lastUpdateTime }.getOrDefault(0L)
+        return "$installed ${Build.FINGERPRINT}"
     }
 
     override fun onNewIntent(intent: android.content.Intent) {
@@ -95,8 +137,9 @@ class MainActivity : ComponentActivity() {
             vm.offerPlugin(uri)
             return
         }
-        if (vm.screen == io.github.artcraftandroid.procraft.canvas.Screen.CANVAS) vm.closeArtwork()
-        vm.importFile(uri)
+        // the artwork open is left (saved) first; one that can't be saved stays, and the file comes in
+        // only if it is left without saving
+        if (vm.screen == io.github.artcraftandroid.procraft.canvas.Screen.CANVAS) vm.closeArtwork { vm.importFile(uri) } else vm.importFile(uri)
     }
 
     override fun onStart() {
@@ -117,11 +160,20 @@ class MainActivity : ComponentActivity() {
         projection = null
     }
 
-    /** The system short of memory, or the app out of sight: the canvas lets go of what it keeps only to be quicker. */
+    /**
+     * The system short of memory, or the app out of sight: the canvas lets go of what it keeps only to be quicker.
+     * From Android 14 an app in front is never told the system is short (only that it went out of sight), so the
+     * library looks for itself: its strokes' canvas goes as it closes or a moment after the last stroke, and is
+     * kept for none where memory is short, and the pictures it keeps go by what is available as each comes.
+     */
     @Suppress("DEPRECATION")
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
-        if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) vm.session?.trimMemory()
+        if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
+            vm.session?.trimMemory()
+            // the library's sample strokes too: the rows showing draw theirs again from the core's copy
+            vm.letGoOfPreviews()
+        }
     }
 
     /** Project canvas: while it is on, the canvas shows on the first second display there is. */
@@ -143,7 +195,8 @@ class MainActivity : ComponentActivity() {
      * as they are.
      */
     override fun dispatchTouchEvent(e: android.view.MotionEvent): Boolean {
-        if (!vm.tapAssistance || e.getToolType(0) != android.view.MotionEvent.TOOL_TYPE_FINGER) return super.dispatchTouchEvent(e)
+        // (a mouse or a touchpad moving the pointer is no finger, though a touchpad's says it is)
+        if (!vm.tapAssistance || pointerKindOf(e, 0) != io.github.artcraftandroid.procraft.core.PointerKind.FINGER) return super.dispatchTouchEvent(e)
         when (e.actionMasked) {
             android.view.MotionEvent.ACTION_DOWN -> {
                 heldAt = android.graphics.PointF(e.x, e.y)
@@ -169,8 +222,12 @@ class MainActivity : ComponentActivity() {
     }
 
     private val penDoubleTaps = PenDoubleTaps()
+    private val keysTold = KeysTold()
 
-    /** A hardware keyboard's shortcuts on the canvas (keys no text field took). */
+    /**
+     * A hardware keyboard's shortcuts on the canvas, a tablet's express keys' too (keys no text
+     * field took). Ctrl and Meta are both the command key.
+     */
     override fun onKeyDown(keyCode: Int, event: android.view.KeyEvent): Boolean {
         // a pen's double-tap that comes as a key of its own: as its first button, once for each
         if (keyCode == PEN_DOUBLE_TAP_KEY) {
@@ -180,10 +237,22 @@ class MainActivity : ComponentActivity() {
         // a pen's side button that comes as a key
         val penButton = event.device?.let { penKeyButton(keyCode, it.sources or event.source, it.keyboardType, it.name) }
         if (penButton != null && (event.repeatCount > 0 || vm.penKey(penButton))) return true
+        // any other key a pen sends, told once: what a pen's button gives that isn't taken
+        event.device?.takeIf { penButton == null && maybePenKeys(it.sources or event.source, it.name) && keysTold.isNew(it.id, keyCode) }?.let {
+            AppLog.i("keys", "a key from a pen: ${android.view.KeyEvent.keyCodeToString(keyCode)}, meta 0x%x, from %s (source 0x%x)".format(java.util.Locale.ROOT, event.metaState, it.name, event.source))
+        }
+        // typing in a text field (a name, the text tool's words): what the field leaves (Ctrl+J,
+        // Alt) is still typing, not the canvas's
+        if (typing()) return super.onKeyDown(keyCode, event)
         if (isAltKey(keyCode) && event.repeatCount == 0 && !event.isCtrlPressed && vm.modifyKey(true)) return true
-        if (event.repeatCount == 0 && vm.keyShortcut(keyCode, event.isCtrlPressed || event.isMetaPressed, event.isShiftPressed, event.isAltPressed)) return true
+        val press = keyPress(keyCode, event.metaState)
+        // held, a key goes on moving the view, if that is what it does
+        if (press != null && vm.keyShortcut(press, repeat = event.repeatCount > 0)) return true
         return super.onKeyDown(keyCode, event)
     }
+
+    /** Whether a text field has the keys: the view with focus edits text (Compose's, while one of its fields is focused). */
+    private fun typing() = currentFocus?.onCheckIsTextEditor() == true
 
     override fun onKeyUp(keyCode: Int, event: android.view.KeyEvent): Boolean {
         // a pen's side button that comes as a key, let go (held to erase, the eraser goes back)
@@ -205,10 +274,7 @@ class MainActivity : ComponentActivity() {
         for (group in vm.plugins.keyShortcutList(false, false)) {
             val items = group.rows.flatMap { row ->
                 row.combos.mapNotNull { c ->
-                    val code = io.github.artcraftandroid.procraft.canvas.keyCodeNamed(c.key) ?: return@mapNotNull null
-                    val modifiers = (if (c.command) android.view.KeyEvent.META_CTRL_ON else 0) or
-                        (if (c.shift) android.view.KeyEvent.META_SHIFT_ON else 0) or
-                        (if (c.alt) android.view.KeyEvent.META_ALT_ON else 0)
+                    val (code, modifiers) = systemShortcutKeys(c.key, c.command, c.shift, c.alt) ?: return@mapNotNull null
                     android.view.KeyboardShortcutInfo(row.does, code, modifiers)
                 }
             }
@@ -216,9 +282,18 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onDestroy() {
+        if (vm.hideSystemBars === barsHider) vm.hideSystemBars = null
+        if (vm.pickBrushFile === brushPickerOpener) vm.pickBrushFile = null
+        super.onDestroy()
+    }
+
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) hideSystemBars()
+        if (!hasFocus) return
+        hideSystemBars()
+        // what another app copied meanwhile (the clipboard can only be looked at with the focus)
+        vm.lookAtSystemClipboard()
     }
 
     /** The canvas uses the whole screen; a swipe from the edge shows the bars for a moment. */

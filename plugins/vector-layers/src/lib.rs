@@ -586,12 +586,13 @@ impl Layer for Vectors {
         match drawn.fill((px as usize, py as usize), limit, gap) {
             // on something drawn: that recoloured, if it is one of these
             None => self.under((dropped.x, dropped.y)).is_some_and(|at| self.recolour(at, dropped.colour)),
-            Some(inside) => {
+            Some(region) => {
                 if self.items.len() >= MOST_ITEMS {
                     return false;
                 }
                 let to_canvas = |(x, y): (f32, f32)| ((area.x as f32 + x) * scale, (area.y as f32 + y) * scale);
-                let outlines: Vec<Vec<(f32, f32)>> = fill::outlines(w, h, &inside, FILL_SMOOTHING)
+                let outlines: Vec<Vec<(f32, f32)>> = region
+                    .outlines(FILL_SMOOTHING)
                     .into_iter()
                     .map(|o| o.into_iter().map(to_canvas).collect())
                     .collect();

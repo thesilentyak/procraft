@@ -4,7 +4,7 @@
 
 use std::f32::consts::{FRAC_PI_6, PI, TAU};
 
-use crate::geom::Vec2;
+use crate::geom::{Affine, Vec2};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GuideKind {
@@ -250,6 +250,55 @@ impl Guide {
         self.looks.get(self.kind as usize).copied().unwrap_or(STARTS[0])
     }
 
+    /// The guide as it goes with a `w` × `h` canvas mirrored left to right (`horizontal`) or top
+    /// to bottom: its centre and vanishing points mirrored, and its turn too (the handle straight
+    /// up from the centre, unturned, mirrored), so it keeps its place on the picture.
+    pub fn mirror(&mut self, w: f32, h: f32, horizontal: bool) {
+        let flip = |[x, y]: [f32; 2]| if horizontal { [w - x, y] } else { [x, h - y] };
+        self.centre = flip(self.centre);
+        for v in &mut self.vanishing {
+            *v = flip(*v);
+        }
+        // the handle's way out, (sin a, -cos a), mirrored: (-sin a, -cos a) left to right, (sin a, cos a)
+        // top to bottom
+        let turned = if horizontal { -self.angle } else { PI - self.angle };
+        // within a turn either way of upright, as an archive's guide is read
+        self.angle = (turned + PI).rem_euclid(TAU) - PI;
+    }
+
+    /// The guide as it goes with the canvas cropped or resized, `to_new` taking the old canvas's
+    /// pixels to the new one's: its centre and vanishing points moved with the picture, its turn
+    /// turned with it (the handle straight up from the centre, taken across), and each grid's size
+    /// scaled as the picture is, so it stays where it was on the picture. A map that isn't finite
+    /// leaves it as it is.
+    pub fn follow(&mut self, to_new: Affine) {
+        if !to_new.is_finite() {
+            return;
+        }
+        let take = |[x, y]: [f32; 2]| {
+            let p = to_new.apply(Vec2::new(x, y));
+            [p.x, p.y]
+        };
+        self.centre = take(self.centre);
+        for v in &mut self.vanishing {
+            *v = take(*v);
+        }
+        // the handle's way out, (sin a, -cos a), as the map takes it
+        let (sin, cos) = self.angle.sin_cos();
+        let way = Vec2::new(to_new.a * sin - to_new.c * cos, to_new.b * sin - to_new.d * cos);
+        if way.length() > 1e-9 {
+            // within a turn either way of upright, as an archive's guide is read
+            self.angle = (way.x.atan2(-way.y) + PI).rem_euclid(TAU) - PI;
+        }
+        let scale = to_new.scale_factor();
+        for look in &mut self.looks {
+            let size = look.size * scale;
+            if size.is_finite() && size > 0.0 {
+                look.size = size;
+            }
+        }
+    }
+
     fn centre(&self) -> Vec2 {
         Vec2::new(self.centre[0], self.centre[1])
     }
@@ -372,8 +421,10 @@ impl Guide {
                 if self.rotational || k % 2 == 0 {
                     out.push((turn(p, a), a, false));
                 } else {
-                    // the mirror axis between the two neighbouring turned copies
-                    let m = axis + a / 2.0;
+                    // mirrored across one of the guide's lines (the parts lie between them):
+                    // the kth part round from the stroke's is its mirror across the line
+                    // (k + 1) / 2 parts round
+                    let m = axis + (a + step) / 2.0;
                     out.push((mirror(p, m), 2.0 * m, true));
                 }
             }
@@ -447,6 +498,137 @@ mod tests {
 
     fn on(kind: GuideKind) -> Guide {
         Guide { on: true, kind, assisted: true, ..Guide::new(200, 100) }
+    }
+
+    #[test]
+    fn a_mirrored_guide_mirrors_its_copies_and_lines() {
+        let (w, h) = (200.0, 100.0);
+        let flip =
+            |p: Vec2, horizontal: bool| if horizontal { Vec2::new(w - p.x, p.y) } else { Vec2::new(p.x, h - p.y) };
+        let near = |a: Vec2, b: Vec2| (a - b).length() < 1e-3;
+        let p = Vec2::new(130.0, 30.0);
+        for symmetry in [SymmetryKind::Vertical, SymmetryKind::Horizontal, SymmetryKind::Quadrant, SymmetryKind::Radial]
+        {
+            for rotational in [false, true] {
+                for horizontal in [true, false] {
+                    let g = Guide {
+                        symmetry,
+                        rotational,
+                        centre: [70.0, 40.0],
+                        angle: 0.3,
+                        vanishing: vec![[10.0, 20.0]],
+                        ..on(GuideKind::Symmetry)
+                    };
+                    let mut m = g.clone();
+                    m.mirror(w, h, horizontal);
+                    assert!((-PI..PI).contains(&m.angle), "{}", m.angle);
+                    assert_eq!(m.vanishing, vec![if horizontal { [190.0, 20.0] } else { [10.0, 80.0] }]);
+                    // each copy of the mirrored point is a mirrored copy of the point
+                    let (before, after) = (g.copies(p), m.copies(flip(p, horizontal)));
+                    assert_eq!(before.len(), after.len());
+                    for (q, ..) in &before {
+                        assert!(
+                            after.iter().any(|(r, ..)| near(*r, flip(*q, horizontal))),
+                            "{symmetry:?} {rotational} {horizontal}: {q:?} not in {after:?}"
+                        );
+                    }
+                    // and its lines are the mirrored lines
+                    for (a, b) in g.lines(200, 100) {
+                        let (fa, fb) = (flip(a, horizontal), flip(b, horizontal));
+                        assert!(
+                            m.lines(200, 100)
+                                .iter()
+                                .any(|&(c, d)| (near(c, fa) && near(d, fb)) || (near(c, fb) && near(d, fa))),
+                            "{symmetry:?} {horizontal}: line {a:?}-{b:?}"
+                        );
+                    }
+                    // mirrored back, as it was
+                    m.mirror(w, h, horizontal);
+                    assert!(near(m.centre(), g.centre()) && (m.angle - g.angle).abs() < 1e-5, "{m:?}");
+                }
+            }
+        }
+        // the grids' and perspective's lines too
+        for kind in [GuideKind::Grid, GuideKind::Isometric, GuideKind::Perspective] {
+            for horizontal in [true, false] {
+                let g = Guide {
+                    centre: [70.0, 40.0],
+                    angle: 0.3,
+                    vanishing: vec![[60.0, 45.0], [180.0, 35.0]],
+                    ..on(kind)
+                };
+                let mut m = g.clone();
+                m.mirror(w, h, horizontal);
+                let (before, after) = (g.lines(200, 100), m.lines(200, 100));
+                assert_eq!(before.len(), after.len(), "{kind:?}");
+                let close = |a: Vec2, b: Vec2| (a - b).length() < 0.05;
+                for (a, b) in before {
+                    let (fa, fb) = (flip(a, horizontal), flip(b, horizontal));
+                    assert!(
+                        after.iter().any(|&(c, d)| (close(c, fa) && close(d, fb)) || (close(c, fb) && close(d, fa))),
+                        "{kind:?} {horizontal}: line {a:?}-{b:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A crop takes the guide with the picture, as it takes the layers: its centre and vanishing
+    /// points to where the same picture pixels are on the new canvas (within a thousandth of a
+    /// pixel), its turn turned as the crop turns the picture, its grids scaled as it scales them;
+    /// it was put back in the middle with no vanishing points, so perspective drew nothing.
+    #[test]
+    fn a_cropped_canvas_s_guide_stays_where_it_was_on_the_picture() {
+        use crate::crop::crop;
+        use crate::document::Document;
+        let g = Guide {
+            centre: [210.0, 140.0],
+            angle: 0.4,
+            vanishing: vec![[-150.0, 120.0], [520.0, 110.0], [260.0, 900.0]],
+            ..on(GuideKind::Perspective)
+        };
+        let far = |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).hypot(a[1] - b[1]);
+        // turned and resampled to half its size; cut by whole pixels; resized up three times
+        let crops = [
+            ([100.0, 50.0, 400.0, 300.0], 0.3, Some((200, 150)), 0.5),
+            ([30.0, 20.0, 100.0, 80.0], 0.0, None, 1.0),
+            ([0.0, 0.0, 200.0, 100.0], 0.0, Some((600, 300)), 3.0),
+        ];
+        for (rect, turn, size, scale) in crops {
+            let c = crop(rect, turn, size);
+            let mut doc = Document::new(400, 300);
+            doc.guide = g.clone();
+            let m = doc.cropped(&c).guide;
+            let back = |[x, y]: [f32; 2]| {
+                let p = c.to_old.apply(Vec2::new(x, y));
+                [p.x, p.y]
+            };
+            let worst = m
+                .vanishing
+                .iter()
+                .zip(&g.vanishing)
+                .map(|(new, old)| far(back(*new), *old))
+                .fold(far(back(m.centre), g.centre), f32::max);
+            assert_eq!(m.vanishing.len(), 3);
+            assert!(worst < 1e-3, "{rect:?}: {worst} px off");
+            assert!((m.angle - (g.angle - turn)).abs() < 1e-5, "{rect:?}: turned {}", m.angle);
+            for (new, old) in m.looks.iter().zip(&g.looks) {
+                assert!((new.size / old.size - scale).abs() < 1e-5, "{rect:?}: {} from {}", new.size, old.size);
+            }
+            // the rest as it was, and perspective still drawn over the new canvas
+            assert_eq!((m.on, m.kind, m.symmetry, m.assisted), (g.on, g.kind, g.symmetry, g.assisted));
+            assert!(m.lines(c.width, c.height).len() > 24, "{rect:?}");
+        }
+        // cut by whole pixels, the points only move by the cut's corner
+        let c = crop([30.0, 20.0, 100.0, 80.0], 0.0, None);
+        let mut m = g.clone();
+        m.follow(c.to_old.inverse().unwrap());
+        assert_eq!(m.vanishing, vec![[-180.0, 100.0], [490.0, 90.0], [230.0, 880.0]]);
+        assert_eq!(m.centre, [180.0, 120.0]);
+        // a map that is no number leaves it be
+        let mut same = g.clone();
+        same.follow(Affine { a: f32::NAN, ..Affine::IDENTITY });
+        assert_eq!(same, g);
     }
 
     #[test]
@@ -561,6 +743,33 @@ mod tests {
         // off, nothing moves
         let off = Guide { assisted: false, ..g };
         assert_eq!(off.assist(start, Vec2::new(50.0, 14.0)), Vec2::new(50.0, 14.0));
+    }
+
+    #[test]
+    fn a_kaleidoscope_mirrors_across_its_own_lines_a_copy_to_each_part() {
+        // quadrant, centred at (100, 50): mirrored across the upright line and the level one,
+        // and turned half round
+        let quad = Guide { symmetry: SymmetryKind::Quadrant, ..on(GuideKind::Symmetry) };
+        let mut at: Vec<(i32, i32, bool)> = quad
+            .copies(Vec2::new(70.0, 40.0))
+            .iter()
+            .map(|(q, _, mirrored)| (q.x.round() as i32, q.y.round() as i32, *mirrored))
+            .collect();
+        at.sort();
+        assert_eq!(at, [(70, 60, true), (130, 40, true), (130, 60, false)]);
+        // radial, as usual and turned: the stroke and its copies one to each of the parts the
+        // lines make, the mirrored ones every other part
+        for angle in [0.0, 0.3] {
+            let radial = Guide { symmetry: SymmetryKind::Radial, angle, ..on(GuideKind::Symmetry) };
+            let p = Vec2::new(100.0 + 30.0 * (angle + 0.2).cos(), 50.0 + 30.0 * (angle + 0.2).sin());
+            let part = |q: Vec2| ((q.y - 50.0).atan2(q.x - 100.0) - angle).rem_euclid(TAU) / (TAU / 8.0);
+            let mut parts: Vec<(u32, bool)> =
+                radial.copies(p).iter().map(|(q, _, mirrored)| (part(*q).floor() as u32, *mirrored)).collect();
+            parts.push((part(p).floor() as u32, false));
+            parts.sort();
+            let want: Vec<(u32, bool)> = (0..8).map(|k| (k, k % 2 == 1)).collect();
+            assert_eq!(parts, want, "turned {angle}");
+        }
     }
 
     #[test]

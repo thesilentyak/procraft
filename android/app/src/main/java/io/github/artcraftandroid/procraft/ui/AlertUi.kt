@@ -17,6 +17,8 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.paddingFromBaseline
@@ -83,6 +85,8 @@ fun <T : Any> Alert(
     onExtra: (T) -> Unit = {},
     first: ((T) -> Unit)? = null,
     alone: Boolean = false,
+    field: String? = null,
+    onField: (String) -> Unit = {},
 ) {
     val last = remember { arrayOfNulls<Any>(1) }
     if (value != null) last[0] = value
@@ -103,6 +107,8 @@ fun <T : Any> Alert(
     ) {
         Box(
             Modifier.fillMaxSize().background(Color.Black.copy(alpha = ALERT_DIM * shown))
+                // (asking for a name, above the keyboard as it comes up, and high in the screen)
+                .then(if (field != null) Modifier.imePadding() else Modifier)
                 // nothing under it is touched while it is up, and a tap beside the panel cancels
                 .pointerInput(Unit) {
                     awaitEachGesture {
@@ -110,19 +116,24 @@ fun <T : Any> Alert(
                         if (waitForUpOrCancellation() != null) cancelling.value?.invoke()
                     }
                 },
-            contentAlignment = Alignment.Center,
+            contentAlignment = if (field != null) androidx.compose.ui.BiasAlignment(0f, -0.5f) else Alignment.Center,
         ) {
             val buttons = if (alone) 1 else if (extra != null) 3 else 2
             val need = AlertButtonWidth * buttons + AlertButtonGap * (buttons - 1) + AlertSide * 2
             val measurer = androidx.compose.ui.text.rememberTextMeasurer()
             val density = androidx.compose.ui.platform.LocalDensity.current
             val said = message(kept)
+            val titled = with(density) {
+                measurer.measure(title(kept), androidx.compose.ui.text.TextStyle(fontSize = 26.sp, fontWeight = FontWeight.Bold)).size.width.toDp() +
+                    if (icon != null) 32.dp else 0.dp
+            }
             val words = with(density) {
                 val m = if (said.isEmpty()) 0 else measurer.measure(said, androidx.compose.ui.text.TextStyle(fontSize = 16.sp, lineHeight = 20.sp)).size.width
-                val t = measurer.measure(title(kept), androidx.compose.ui.text.TextStyle(fontSize = 26.sp, fontWeight = FontWeight.Bold)).size.width
-                maxOf(m.toDp(), t.toDp() + if (icon != null) 32.dp else 0.dp)
+                maxOf(m.toDp(), titled)
             }
             val width = (words + AlertTextSide * 2).coerceIn(need, maxOf(AlertMostWidth, need))
+            // a title wider than the panel at its widest goes onto a second line, rather than cut off
+            val titleWraps = titled > width - AlertSide * 2
             Column(
                 Modifier.width(width).graphicsLayer {
                     alpha = shown
@@ -135,15 +146,27 @@ fun <T : Any> Alert(
                     .padding(start = AlertSide, end = AlertSide, top = 21.dp, bottom = 16.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                Row(Modifier.height(31.dp), verticalAlignment = Alignment.CenterVertically) {
+                Row(if (titleWraps) Modifier.heightIn(min = 31.dp) else Modifier.height(31.dp), verticalAlignment = Alignment.CenterVertically) {
                     icon?.let {
                         Icon(it, contentDescription = null, tint = Pc.Accent, modifier = Modifier.size(24.dp))
                         Spacer(Modifier.width(8.dp))
                     }
-                    Text(title(kept), color = AlertInk, fontSize = 26.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+                    Text(title(kept), color = AlertInk, fontSize = 26.sp, fontWeight = FontWeight.Bold, maxLines = if (titleWraps) 2 else 1, textAlign = TextAlign.Center)
                 }
                 Spacer(Modifier.height(13.dp))
                 said.takeIf { it.isNotEmpty() }?.let { Text(it, color = AlertInk, fontSize = 16.sp, lineHeight = 20.sp, textAlign = TextAlign.Center) }
+                // a field for a name (a layout saved or renamed), when there is one
+                field?.let { text ->
+                    androidx.compose.foundation.text.BasicTextField(
+                        text,
+                        onValueChange = onField,
+                        singleLine = true,
+                        textStyle = androidx.compose.ui.text.TextStyle(color = AlertInk, fontSize = 17.sp),
+                        cursorBrush = androidx.compose.ui.graphics.SolidColor(Pc.Accent),
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = AlertTextSide - AlertSide).height(40.dp)
+                            .clip(RoundedCornerShape(10.dp)).background(AlertCancelFill).padding(horizontal = 12.dp, vertical = 10.dp),
+                    )
+                }
                 Spacer(Modifier.height(27.dp))
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(AlertButtonGap)) {
                     // a first choice of three, blue too (a tap outside still cancels), or Cancel; a
@@ -198,11 +221,16 @@ fun ExportProgress(shown: io.github.artcraftandroid.procraft.canvas.CanvasViewMo
 
 /**
  * The card over everything while a file is brought in ([shown] not null): as the export card, with
- * "Importing" after the import glyph and the file's name under it.
+ * "Importing" after the import glyph and the file's name under it; "Importing brushes" and the
+ * file's size too while a plugin's brush engine reads it.
  */
 @Composable
-fun ImportProgress(shown: io.github.artcraftandroid.procraft.canvas.CanvasViewModel.ImportShown?, onCancel: () -> Unit) =
-    ProgressCard(shown?.let { CardShown(it.progress, it.done, it.name) }, "Importing", PcIcons.TabImport, onCancel)
+fun ImportProgress(shown: io.github.artcraftandroid.procraft.canvas.CanvasViewModel.ImportShown?, onCancel: () -> Unit) {
+    // the title kept as the card goes, as the rest of what it shows is
+    val title = remember { arrayOf("Importing") }
+    if (shown != null) title[0] = shown.title
+    ProgressCard(shown?.let { CardShown(it.progress, it.done, it.name) }, title[0], PcIcons.TabImport, onCancel)
+}
 
 /**
  * The card over everything while the gallery is searched for lost artworks ([progress] not null):

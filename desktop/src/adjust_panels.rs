@@ -77,9 +77,13 @@ pub(crate) fn shown(v: f32, max: bool) -> String {
     }
 }
 
-/// Where a toolbar `size` big floats: centred, 25 above the window's foot.
-pub(crate) fn panel_rect(screen: Rect, w: f32, h: f32) -> Rect {
-    Rect::from_min_size(pos2(screen.center().x - w / 2.0, screen.bottom() - PANEL_RISE - h), vec2(w, h))
+/// Where a toolbar `size` big floats: centred, 25 above the window's foot; floating, where the
+/// layout has it (see [`crate::panel::bottom_rect`]).
+pub(crate) fn panel_rect(ctx: &egui::Context, screen: Rect, w: f32, h: f32) -> Rect {
+    crate::panel::bottom_rect(
+        ctx,
+        Rect::from_min_size(pos2(screen.center().x - w / 2.0, screen.bottom() - PANEL_RISE - h), vec2(w, h)),
+    )
 }
 
 /// Draws a toolbar's panel and runs `inside` in it.
@@ -189,7 +193,7 @@ fn option_slider_let_go(
 /// Recolor's toolbar: the Flood slider, how far from the colour under the reticle the fill
 /// reaches. Returns the value dragged to.
 pub(crate) fn recolor_toolbar(ctx: &egui::Context, threshold: f32) -> Option<f32> {
-    let rect = panel_rect(ctx.content_rect(), 332.0, 70.0);
+    let rect = panel_rect(ctx, ctx.content_rect(), 332.0, 70.0);
     let mut moved = None;
     panel(ctx, "recolor toolbar", rect, |ui| {
         let shown = format!("{}%", (threshold * 100.0).round());
@@ -265,7 +269,7 @@ impl Toolbars {
         screen: Rect,
         wide: bool,
     ) {
-        let rect = if wide { panel_rect(screen, 903.0, 113.0) } else { panel_rect(screen, 532.0, 292.0) };
+        let rect = if wide { panel_rect(ctx, screen, 903.0, 113.0) } else { panel_rect(ctx, screen, 532.0, 292.0) };
         let mut more = None;
         panel(ctx, "noise toolbar", rect, |ui| {
             let kinds: Vec<(&str, f32, &Icon)> = NOISE_KINDS.iter().map(|k| (k.1, k.2, k.3)).collect();
@@ -336,7 +340,7 @@ impl Toolbars {
         screen: Rect,
         wide: bool,
     ) {
-        let rect = if wide { panel_rect(screen, 903.0, 95.0) } else { panel_rect(screen, 532.0, 272.0) };
+        let rect = if wide { panel_rect(ctx, screen, 903.0, 95.0) } else { panel_rect(ctx, screen, 532.0, 272.0) };
         let tone = shown.balance_tone as usize;
         let mut more = None;
         panel(ctx, "balance panel", rect, |ui| {
@@ -390,7 +394,7 @@ impl Toolbars {
     /// The curves panel: the chosen channel's curve over a grid (drag its points; touch elsewhere
     /// to add one; tap a point for Delete over it), and the channels.
     fn curves(&mut self, ctx: &egui::Context, session: &CanvasSession, shown: &AdjustShown, screen: Rect) {
-        let rect = panel_rect(screen, 584.0, 183.0);
+        let rect = panel_rect(ctx, screen, 584.0, 183.0);
         let channel = shown.curve_channel;
         let points: Vec<Pos2> = shown
             .curves
@@ -474,13 +478,15 @@ impl Toolbars {
                 let at = to_screen(*p);
                 delete_at = Some(Rect::from_min_size(pos2(at.x - 39.0, at.y - 14.0 - 44.0), vec2(78.0, 44.0)));
             }
-            // the channels
+            // the channels (a filter layer's curves have alpha too)
             let column = Rect::from_min_max(pos2(inner.right() - 111.0, inner.top()), inner.max);
-            let h = (column.height() - 3.0) / 4.0;
-            for (i, name) in ["Gamma", "Red", "Green", "Blue"].iter().enumerate() {
+            let names = ["Gamma", "Red", "Green", "Blue", "Alpha"];
+            let count = (shown.curve_channels as usize).clamp(1, names.len());
+            let h = (column.height() - (count as f32 - 1.0)) / count as f32;
+            for (i, name) in names.iter().take(count).enumerate() {
                 let top = column.top() + i as f32 * (h + 1.0);
                 let cell = Rect::from_min_size(pos2(column.left(), top), vec2(column.width(), h));
-                let (upper, lower) = (if i == 0 { 13 } else { 0 }, if i == 3 { 13 } else { 0 });
+                let (upper, lower) = (if i == 0 { 13 } else { 0 }, if i + 1 == count { 13 } else { 0 });
                 let corners = egui::CornerRadius { nw: upper, ne: upper, sw: lower, se: lower };
                 let chosen = channel as usize == i;
                 ui.painter().rect_filled(cell, corners, if chosen { argb(pc::ACCENT) } else { argb(PANEL_BUTTON) });
@@ -680,7 +686,7 @@ fn glitch(
     screen: Rect,
     wide: bool,
 ) {
-    let rect = if wide { panel_rect(screen, 973.0, 120.0) } else { panel_rect(screen, 640.0, 167.0) };
+    let rect = if wide { panel_rect(ctx, screen, 973.0, 120.0) } else { panel_rect(ctx, screen, 640.0, 167.0) };
     panel(ctx, "glitch toolbar", rect, |ui| {
         let kinds: Vec<(&str, f32, &Icon)> = GLITCH_KINDS.iter().map(|k| (k.1, k.2, k.3)).collect();
         let chosen = GLITCH_KINDS.iter().position(|k| k.0 == shown.glitch_kind).unwrap_or(0);
@@ -715,7 +721,7 @@ fn glitch(
 
 /// The bloom toolbar: transition, size and burn.
 fn bloom(ctx: &egui::Context, session: &CanvasSession, shown: &AdjustShown, screen: Rect, wide: bool) {
-    let rect = if wide { panel_rect(screen, 1013.0, 95.0) } else { panel_rect(screen, 532.0, 220.0) };
+    let rect = if wide { panel_rect(ctx, screen, 1013.0, 95.0) } else { panel_rect(ctx, screen, 532.0, 220.0) };
     panel(ctx, "bloom toolbar", rect, |ui| {
         for (i, name) in ["Transition", "Size", "Burn"].iter().enumerate() {
             let v = shown.bloom.get(i).copied().unwrap_or(0.0);
@@ -737,7 +743,7 @@ fn plugin_filter(ctx: &egui::Context, session: &CanvasSession, shown: &AdjustSho
     use procraft_core::{PluginControl, plugin_slider_along, plugin_slider_at, plugin_slider_shown};
     let Some(filter) = &shown.plugin else { return };
     let rows = filter.controls.len().max(1) as f32;
-    let rect = panel_rect(screen, 532.0, 41.0 + 54.0 * rows + 8.5 * (rows - 1.0));
+    let rect = panel_rect(ctx, screen, 532.0, 41.0 + 54.0 * rows + 8.5 * (rows - 1.0));
     panel(ctx, "plugin filter toolbar", rect, |ui| {
         for (i, control) in filter.controls.iter().enumerate() {
             let at = pos2(rect.center().x - 250.0, rect.top() + 24.0 + i as f32 * 62.5);
@@ -767,7 +773,8 @@ fn plugin_filter(ctx: &egui::Context, session: &CanvasSession, shown: &AdjustSho
                     }
                 }
                 // (a filter has none)
-                PluginControl::File { .. } => {}
+                // a filter has neither
+                PluginControl::File { .. } | PluginControl::Texture { .. } | PluginControl::Folder { .. } => {}
             }
         }
     });
@@ -775,7 +782,7 @@ fn plugin_filter(ctx: &egui::Context, session: &CanvasSession, shown: &AdjustSho
 
 /// The halftone toolbar: full colour, screen print or newspaper.
 fn halftone(ctx: &egui::Context, look: &mut Look, session: &CanvasSession, shown: &AdjustShown, screen: Rect) {
-    let rect = panel_rect(screen, 507.0, 66.0);
+    let rect = panel_rect(ctx, screen, 507.0, 66.0);
     panel(ctx, "halftone toolbar", rect, |ui| {
         let kinds: Vec<(&str, f32, &Icon)> = HALFTONE_KINDS.iter().map(|k| (k.1, k.2, k.3)).collect();
         let chosen = HALFTONE_KINDS.iter().position(|k| k.0 == shown.halftone_kind).unwrap_or(0);
@@ -787,7 +794,7 @@ fn halftone(ctx: &egui::Context, look: &mut Look, session: &CanvasSession, shown
 
 /// The chromatic aberration toolbar: perspective or displace, with the kind's two sliders.
 fn chromatic(ctx: &egui::Context, look: &mut Look, session: &CanvasSession, shown: &AdjustShown, screen: Rect) {
-    let rect = panel_rect(screen, 668.0, 120.0);
+    let rect = panel_rect(ctx, screen, 668.0, 120.0);
     panel(ctx, "chromatic toolbar", rect, |ui| {
         let kinds: Vec<(&str, f32, &Icon)> = CHROMA_KINDS.iter().map(|k| (k.1, k.2, k.3)).collect();
         let chosen = CHROMA_KINDS.iter().position(|k| k.0 == shown.chroma_kind).unwrap_or(0);
@@ -811,7 +818,7 @@ fn chromatic(ctx: &egui::Context, look: &mut Look, session: &CanvasSession, show
 
 /// The perspective blur toolbar: positional or directional.
 fn perspective(ctx: &egui::Context, look: &mut Look, session: &CanvasSession, shown: &AdjustShown, screen: Rect) {
-    let rect = panel_rect(screen, 492.0, 66.0);
+    let rect = panel_rect(ctx, screen, 492.0, 66.0);
     panel(ctx, "perspective toolbar", rect, |ui| {
         let kinds: Vec<(&str, f32, &Icon)> = PERSPECTIVE_KINDS.iter().map(|k| (k.1, k.2, k.3)).collect();
         let chosen = PERSPECTIVE_KINDS.iter().position(|k| k.0 == shown.perspective_kind).unwrap_or(0);

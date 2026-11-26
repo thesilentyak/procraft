@@ -39,6 +39,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
@@ -69,9 +71,86 @@ private val DoneBlue get() = Pc.tinted(Color(0xFF0190FF))
  * rows and their line, 24 between the groups, one row. */
 private val TypedBottom = 286.dp
 
-/** The units sizes are typed in: the key's name, the unit's (as presets keep it) and its mark. */
-private enum class SizeUnit(val label: String, val key: String, val mark: String) {
-    MILLIMETERS("Millimeters", "mm", "mm"), CENTIMETERS("Centimeters", "cm", "cm"), INCHES("Inches", "in", "″"), PIXELS("Pixels", "px", "px")
+/**
+ * How Custom Canvas lays out in a window [width] across. Wider than 700 the sections are a
+ * rounded panel 319 across, 10 in from the window's left, top and bottom, under its title, and the
+ * page starts 372 in. In a narrower window (split screen, a phone) they are a rail of icons 81
+ * across, flush with the window's left, top and bottom, untitled; the page starts 123 in and the
+ * name 111 in, from its left.
+ */
+internal class CanvasSheetFit(width: Dp) {
+    val narrow = width <= 700.dp
+    val railWidth = if (narrow) 81.dp else 319.dp
+    val railInset = if (narrow) 0.dp else 10.dp
+    val railCorner = if (narrow) 0.dp else 20.dp
+    val pageStart = if (narrow) 123.dp else 372.dp
+
+    /** The name's left and its width, in a narrow window (20 clear of Cancel and Done). */
+    val nameStart = 111.dp
+    val nameWidth = (width - nameStart - 180.dp).coerceAtLeast(0.dp)
+
+    /** A section's cell, 8 in from the panel's left and 52 tall: in the rail as wide as it leaves
+     * (8 in on each side). */
+    val cellWidth = if (narrow) railWidth - 16.dp else 304.dp
+}
+
+/**
+ * The keypad's sizes in a window [width] across, upright or [wide], with [room] left under the
+ * rows it types into.
+ *
+ * - Up to 420 across it is compact: five columns 5 apart (units, three of digits, Backspace /
+ *   Next / Done) in a cluster up to 320 across, 8 clear of the window's sides; keys 60 tall, 5
+ *   apart, 12 under the panel's top and 9 over its bottom. Backspace is a row tall, Next 9 under
+ *   it fills to the second row's foot, and Done is two rows tall. Short unit names, ⌫ for
+ *   Backspace.
+ * - Wider, it is the tablet's: upright keys 120 x 71 (8 apart down) in a 342 panel; wide 150 x
+ *   87.5 (9 apart) in a 457 one, the rows from 47 below its top; 9 apart across, 30 between the
+ *   three groups. Where the window is narrower than that and 16, the keys, gaps and words are that
+ *   much narrower and smaller.
+ *
+ * Where the window leaves it less height than that ([room]), it and its keys are that much shorter
+ * (to half), so it stays under the rows it types into.
+ */
+internal class KeypadFit(width: Dp, wide: Boolean, room: Dp) {
+    val compact = width <= 420.dp
+    private val full = if (compact) 276.dp else if (wide) 457.dp else 342.dp
+    private val fit = (room / full).coerceIn(0.5f, 1f)
+
+    /** How much of the tablet's width the keys keep (1 in a compact keypad, whose keys are its own). */
+    val scale = if (compact) 1f else ((width - 16.dp) / (if (wide) 828.dp else 678.dp)).coerceIn(0f, 1f)
+
+    /** A column of keys across, and a key's height. */
+    val keyWidth = if (compact) ((minOf(320.dp, width - 16.dp) - 20.dp) / 5).coerceAtLeast(0.dp) else (if (wide) 150.dp else 120.dp) * scale
+    val keyHeight = (if (compact) 60.dp else if (wide) 87.5.dp else 71.dp) * fit
+
+    /** Between keys across, between rows, and between the three groups. */
+    val across = if (compact) 5.dp else 9.dp * scale
+    val down = (if (compact) 5.dp else if (wide) 9.dp else 8.dp) * fit
+    val groups = if (compact) 5.dp else 30.dp * scale
+
+    /** Backspace and Next: their heights and the gap between them. */
+    val backspaceHeight = keyHeight
+    val commandGap = if (compact) 9.dp * fit else down
+    val nextHeight = keyHeight + down - commandGap
+
+    /** The panel's height, and where the rows start in it (upright, centred in it instead). */
+    val height = full * fit
+    val top = (if (compact) 12.dp else if (wide) 47.dp else 0.dp) * fit
+    val centred = !compact && !wide
+
+    /** The rows' height: four keys and three gaps. */
+    val rows = keyHeight * 4 + down * 3
+
+    /** Backspace's word, and the commands' words and ⌫ as a share of the tablet's (its 15, for
+     * 18 point type): compact, Next and Done at 16 and ⌫ at 28; the tablet's as narrowed. */
+    val backspace = if (compact) "⌫" else "Backspace"
+    val commandsText = if (compact) 16f / 18f else scale
+    val backspaceText = if (compact) 28f / 18f else scale
+}
+
+/** The units sizes are typed in: the key's name (in full, and short on a compact keypad), the unit's (as presets keep it) and its mark. */
+internal enum class SizeUnit(val label: String, val short: String, val key: String, val mark: String) {
+    MILLIMETERS("Millimeters", "MM", "mm", "mm"), CENTIMETERS("Centimeters", "CM", "cm", "cm"), INCHES("Inches", "IN", "in", "″"), PIXELS("Pixels", "PX", "px", "px")
 }
 
 /** The fields the keypad types into. */
@@ -156,37 +235,49 @@ fun CustomCanvasScreen(vm: CanvasViewModel, onMade: () -> Unit) {
     }
     BackHandler { vm.closeCustomCanvas() }
     BoxWithConstraints(Modifier.fillMaxSize().background(ScreenFill).pointerInput(Unit) { detectTapGestures { } }) {
-        // the sections
-        Column(Modifier.padding(start = 10.dp, top = 10.dp, bottom = 10.dp).width(319.dp).fillMaxHeight().clip(RoundedCornerShape(20.dp)).background(PanelFill)) {
-            Text("Custom Canvas", color = Ink, fontSize = 22.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 24.dp, top = 16.dp, bottom = 17.dp))
+        val fit = CanvasSheetFit(maxWidth)
+        // the sections (in a narrow window their icons alone, in a rail)
+        Column(
+            Modifier.padding(start = fit.railInset, top = fit.railInset, bottom = fit.railInset).width(fit.railWidth).fillMaxHeight()
+                .clip(RoundedCornerShape(fit.railCorner)).background(PanelFill),
+        ) {
+            if (fit.narrow) {
+                Spacer(Modifier.height(8.dp))
+            } else {
+                Text("Custom Canvas", color = Ink, fontSize = 22.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 24.dp, top = 16.dp, bottom = 17.dp))
+            }
             Sections.forEachIndexed { i, s ->
                 val chosen = i == section
                 Row(
-                    Modifier.padding(start = 8.dp, bottom = 10.dp).size(304.dp, 52.dp).clip(CircleShape).background(if (chosen) Pc.Accent else Color.Transparent).clickable {
+                    Modifier.padding(start = 8.dp, bottom = 10.dp).size(fit.cellWidth, 52.dp).clip(CircleShape).background(if (chosen) Pc.Accent else Color.Transparent).clickable {
                         commit()
                         section = i
-                    }.padding(start = 16.dp),
+                    }.padding(start = if (fit.narrow) 0.dp else 16.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    // icons centred 43 in, whatever their size; the names 69 in
-                    Box(Modifier.width(38.dp), contentAlignment = Alignment.Center) {
-                        Icon(s.icon, contentDescription = null, tint = if (chosen) Color.White else IdleInk, modifier = Modifier.requiredSize(s.size))
+                    // icons centred 43 in, whatever their size; the names 69 in (in the rail the
+                    // icons centred in their cells, unnamed)
+                    Box(if (fit.narrow) Modifier.fillMaxWidth() else Modifier.width(38.dp), contentAlignment = Alignment.Center) {
+                        Icon(s.icon, contentDescription = if (fit.narrow) s.label else null, tint = if (chosen) Color.White else IdleInk, modifier = Modifier.requiredSize(s.size))
                     }
-                    Text(s.label, color = if (chosen) Color.White else IdleInk, fontSize = 15.sp, modifier = Modifier.padding(start = 7.dp))
+                    if (!fit.narrow) Text(s.label, color = if (chosen) Color.White else IdleInk, fontSize = 15.sp, modifier = Modifier.padding(start = 7.dp))
                 }
             }
         }
         // the name, Cancel and Done
-        // on a wide screen centred over the page, upright from its left
+        // on a wide screen centred over the page, upright from its left; in a narrow window from
+        // the rail's side
         val wide = maxWidth > maxHeight
         BasicTextField(
             name, { name = it.take(64) }, singleLine = true,
             textStyle = TextStyle(
                 color = Ink, fontSize = 22.sp, fontWeight = FontWeight.Bold,
-                textAlign = if (wide) androidx.compose.ui.text.style.TextAlign.Center else androidx.compose.ui.text.style.TextAlign.Start,
+                textAlign = if (wide && !fit.narrow) androidx.compose.ui.text.style.TextAlign.Center else androidx.compose.ui.text.style.TextAlign.Start,
             ),
             cursorBrush = SolidColor(Pc.Accent),
-            modifier = if (wide) {
+            modifier = if (fit.narrow) {
+                Modifier.offset(x = fit.nameStart, y = 28.dp).width(fit.nameWidth)
+            } else if (wide) {
                 Modifier.padding(start = 372.dp, end = 32.dp).offset(y = 28.dp).fillMaxWidth()
             } else {
                 Modifier.offset(x = 394.dp, y = 28.dp).width(maxWidth - 394.dp - 160.dp)
@@ -203,7 +294,7 @@ fun CustomCanvasScreen(vm: CanvasViewModel, onMade: () -> Unit) {
                 Icon(PcIcons.DoneTick, contentDescription = "Create", tint = Color.White, modifier = Modifier.requiredSize(40.dp))
             }
         }
-        Column(Modifier.padding(start = 372.dp, end = 32.dp, top = 120.dp)) {
+        Column(Modifier.padding(start = fit.pageStart, end = 32.dp, top = 120.dp)) {
             when (section) {
                 0 -> {
                     Group {
@@ -266,8 +357,7 @@ fun CustomCanvasScreen(vm: CanvasViewModel, onMade: () -> Unit) {
         if (section == 0 && field != null) {
             Keypad(
                 Modifier.align(Alignment.BottomCenter),
-                wide,
-                maxHeight - TypedBottom,
+                KeypadFit(maxWidth, wide, maxHeight - TypedBottom),
                 unit,
                 onUnit = {
                     commit()
@@ -367,50 +457,54 @@ private fun SwitchLine(label: String, on: Boolean, onChange: (Boolean) -> Unit) 
 }
 
 /**
- * The keypad: units on the left, the digits, and Backspace, Next and Done on the right. Upright its
- * keys are 120 x 71 (8 apart down) in a 342 panel; on a [wide] screen 150 x 87.5 (9 apart) in a
- * 457 one, the rows from 47 below its top. Where the screen leaves it less than that ([room]), it
- * and its keys are that much shorter (to half), so it stays under the rows it types into.
+ * The keypad: units on the left, the digits, and Backspace, Next and Done on the right, sized by
+ * [fit] (see [KeypadFit]). A compact one names the units short and shows ⌫ for Backspace, its
+ * Next and Done a little smaller (16 to the tablet's 18) and ⌫ larger (28).
  */
 @Composable
-private fun Keypad(modifier: Modifier, wide: Boolean, room: Dp, unit: SizeUnit, onUnit: (SizeUnit) -> Unit, onKey: (String) -> Unit, onNext: () -> Unit, onDone: () -> Unit) {
-    val full = if (wide) 457.dp else 342.dp
-    val fit = (room / full).coerceIn(0.5f, 1f)
-    val w = if (wide) 150.dp else 120.dp
-    val h = (if (wide) 87.5.dp else 71.dp) * fit
-    val down = (if (wide) 9.dp else 8.dp) * fit
-    val across = 9.dp
+private fun Keypad(modifier: Modifier, fit: KeypadFit, unit: SizeUnit, onUnit: (SizeUnit) -> Unit, onKey: (String) -> Unit, onNext: () -> Unit, onDone: () -> Unit) {
+    val w = fit.keyWidth
+    val h = fit.keyHeight
+    val down = fit.down
+    val across = fit.across
+    val words = 15.sp * fit.scale
+    val digits = 26.sp * fit.scale
+    val commands = 15.sp * fit.commandsText
     Box(
-        modifier.fillMaxWidth().height(full * fit).background(KeypadFill).padding(top = if (wide) 47.dp * fit else 0.dp),
-        contentAlignment = if (wide) Alignment.TopCenter else Alignment.Center,
+        modifier.fillMaxWidth().height(fit.height).background(KeypadFill).padding(top = fit.top),
+        contentAlignment = if (fit.centred) Alignment.Center else Alignment.TopCenter,
     ) {
-        Row(horizontalArrangement = Arrangement.spacedBy(30.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(fit.groups)) {
             Column(verticalArrangement = Arrangement.spacedBy(down)) {
                 for (u in listOf(SizeUnit.MILLIMETERS, SizeUnit.CENTIMETERS, SizeUnit.INCHES, SizeUnit.PIXELS)) {
-                    Key(u.label, if (u == unit) UnitChosen else KeyFill, if (u != unit) Ink else if (Pc.light) Color.White else Color(0xFF1F1F1F), 15.sp, w, h) { onUnit(u) }
+                    val ink = if (u != unit) Ink else if (Pc.light) Color.White else Color(0xFF1F1F1F)
+                    Key(if (fit.compact) u.short else u.label, if (u == unit) UnitChosen else KeyFill, ink, words, w, h) { onUnit(u) }
                 }
             }
             Column(verticalArrangement = Arrangement.spacedBy(down)) {
                 for (row in listOf(listOf("7", "8", "9"), listOf("4", "5", "6"), listOf("1", "2", "3"))) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(across)) { for (k in row) Key(k, DigitFill, Ink, 26.sp, w, h) { onKey(k) } }
+                    Row(horizontalArrangement = Arrangement.spacedBy(across)) { for (k in row) Key(k, DigitFill, Ink, digits, w, h) { onKey(k) } }
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(across)) {
-                    Key("0", DigitFill, Ink, 26.sp, w * 2 + across, h) { onKey("0") }
-                    Key(".", DigitFill, Ink, 26.sp, w, h) { onKey(".") }
+                    Key("0", DigitFill, Ink, digits, w * 2 + across, h) { onKey("0") }
+                    Key(".", DigitFill, Ink, digits, w, h) { onKey(".") }
                 }
             }
-            Column(verticalArrangement = Arrangement.spacedBy(down)) {
-                Key("Backspace", KeyFill, Ink, 15.sp, w, h) { onKey("⌫") }
-                Key("Next", KeyFill, Ink, 15.sp, w, h) { onNext() }
-                Key("Done", KeyFill, Ink, 15.sp, w, h * 2 + down) { onDone() }
+            Column {
+                Key(fit.backspace, KeyFill, Ink, 15.sp * fit.backspaceText, w, fit.backspaceHeight, description = "Backspace".takeIf { fit.compact }) { onKey("⌫") }
+                Spacer(Modifier.height(fit.commandGap))
+                Key("Next", KeyFill, Ink, commands, w, fit.nextHeight) { onNext() }
+                Spacer(Modifier.height(down))
+                Key("Done", KeyFill, Ink, commands, w, h * 2 + down) { onDone() }
             }
         }
     }
 }
 
 @Composable
-private fun Key(label: String, fill: Color, ink: Color, size: androidx.compose.ui.unit.TextUnit, width: Dp, height: Dp, onClick: () -> Unit) {
-    Box(Modifier.size(width, height).clip(RoundedCornerShape(8.dp)).background(fill).clickable(onClick = onClick), contentAlignment = Alignment.Center) {
+private fun Key(label: String, fill: Color, ink: Color, size: androidx.compose.ui.unit.TextUnit, width: Dp, height: Dp, description: String? = null, onClick: () -> Unit) {
+    val named = if (description != null) Modifier.semantics { contentDescription = description } else Modifier
+    Box(Modifier.size(width, height).clip(RoundedCornerShape(8.dp)).background(fill).clickable(onClick = onClick).then(named), contentAlignment = Alignment.Center) {
         Text(label, color = ink, fontSize = size)
     }
 }

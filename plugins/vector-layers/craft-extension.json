@@ -2,7 +2,7 @@
   "schema": 1,
   "id": "io.github.artcraftandroid.vector-layers",
   "name": "Vector layers",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "holds": ["hooks"],
   "publisher": { "name": "ProCraft" },
   "description": "Layers whose strokes stay strokes: drawn with any brush, then moved, restyled, cut or hidden as strokes, and filled by dropping a colour in them.",

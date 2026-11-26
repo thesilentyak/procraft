@@ -1,13 +1,14 @@
 //! The render thread: owns the window's surface and draws a frame whenever something changed.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use procraft_engine::profile::Profile;
 use procraft_gpu::{Gpu, wgpu};
 
 use crate::Shared;
-use crate::frame::{configure, screen_profile};
+use crate::frame::{configure, configure_with, screen_profile};
+use crate::frame_loop::Acquired;
 
 /// The window drawn into: Android's native window, or the iPad app's `CAMetalLayer`.
 #[cfg(target_os = "android")]
@@ -100,96 +101,82 @@ pub(crate) fn run(shared: Arc<Shared>, window: Window) {
         let mut st = shared.lock();
         st.reconfigure = true;
         st.needs_frame = true;
-        st.gpu.as_ref().map(|g| g.queue.clone())
+        st.gpu.as_ref().map(|g| (g.queue.clone(), g.clone()))
     };
-    let Some(queue) = queue else { return };
+    let Some((queue, gpu)) = queue else { return };
 
-    let mut config: Option<wgpu::SurfaceConfiguration> = None;
-    let mut last_present: Option<Instant> = None;
-    let started = Instant::now();
+    let mut screen = WindowScreen {
+        surface,
+        queue,
+        gpu,
+        caps: None,
+        config: None,
+        #[cfg(target_os = "android")]
+        refreshes: crate::window::Refreshes::start(),
+    };
     let mut pipelines_kept = false;
-    loop {
-        let (size, reconfigure) = {
-            let mut st = shared.lock();
-            // a device lost draws nothing again: there is only its stopping to wait for
-            while !st.stop && (!st.needs_frame || st.gpu.as_ref().is_some_and(Gpu::is_lost)) {
-                // a frame due later (the selection's bands drifting) comes then, unless asked sooner
-                match st.frame_due.filter(|_| !st.gpu.as_ref().is_some_and(Gpu::is_lost)) {
-                    Some(at) => {
-                        if shared.wake.wait_until(&mut st, at).timed_out() {
-                            st.frame_due = None;
-                            st.needs_frame = true;
-                        }
-                    }
-                    None => shared.wake.wait(&mut st),
-                }
-            }
-            if st.stop {
-                break;
-            }
-            (st.window_size, std::mem::replace(&mut st.reconfigure, false))
-        };
-        if reconfigure || config.is_none() {
-            let st = shared.lock();
-            let Some(gpu) = st.gpu.as_ref() else { break };
-            config = configure(gpu, &surface, size, true);
-        }
-        let Some(format) = config.as_ref().map(|c| c.format) else {
-            std::thread::sleep(Duration::from_millis(16));
-            continue;
-        };
-        let screen = config.as_ref().map_or(Profile::Srgb, screen_profile);
-        // wait for the next image before looking at the input, so the frame shows the latest
-        let frame = match surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) => f,
-            wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
-                shared.lock().reconfigure = true;
-                f
-            }
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                shared.lock().reconfigure = true;
-                std::thread::sleep(Duration::from_millis(4));
-                continue;
-            }
-            wgpu::CurrentSurfaceTexture::Timeout
-            | wgpu::CurrentSurfaceTexture::Occluded
-            | wgpu::CurrentSurfaceTexture::Validation => {
-                std::thread::sleep(Duration::from_millis(4));
-                continue;
-            }
-        };
-        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        {
-            let mut guard = shared.lock();
-            let st = &mut *guard;
-            let held = Instant::now();
-            // the window changed size while the image was awaited (the device turned): the view is
-            // already for the new size, so this image is let go and the surface configured again
-            if st.window_size != size {
-                continue;
-            }
-            st.draw_frame(&view, format, size, screen, started);
-            let now = Instant::now();
-            if let Some(prev) = last_present {
-                st.frame_interval_ms = now.duration_since(prev).as_secs_f32() * 1000.0;
-            }
-            last_present = Some(now);
-            // everything else waits on the lock meanwhile
-            if held.elapsed() > SLOW_FRAME {
-                log::warn!("a frame held the canvas {} ms", held.elapsed().as_millis());
-            }
-            // whoever waited on the lock meanwhile (a touch) has it next, before this thread's
-            // next frame
-            parking_lot::MutexGuard::unlock_fair(guard);
-        }
-        queue.present(frame);
+    crate::frame_loop::draw_loop(&shared, &mut screen, || {
         showing.shown();
         if !std::mem::replace(&mut pipelines_kept, true) {
             keep_pipelines(&shared);
         }
-    }
-    drop(surface);
+    });
+    drop(screen);
     drop(window);
+}
+
+/// The window's surface, as the render loop draws into it: its capabilities asked once (they last
+/// as long as it does), how it was last configured, and (on Android 13 and later) the screen's
+/// refreshes as the system tells them.
+struct WindowScreen {
+    surface: wgpu::Surface<'static>,
+    queue: wgpu::Queue,
+    gpu: Gpu,
+    caps: Option<wgpu::SurfaceCapabilities>,
+    config: Option<wgpu::SurfaceConfiguration>,
+    #[cfg(target_os = "android")]
+    refreshes: Option<crate::window::Refreshes>,
+}
+
+impl crate::frame_loop::Screen for WindowScreen {
+    type Image = wgpu::SurfaceTexture;
+
+    fn configure(&mut self, gpu: &Gpu, size: (u32, u32), wide: bool) -> Option<(wgpu::TextureFormat, Profile)> {
+        let caps = self.caps.get_or_insert_with(|| self.surface.get_capabilities(&gpu.adapter));
+        self.config = configure_with(gpu, &self.surface, caps, size, wide);
+        self.config.as_ref().map(|c| (c.format, screen_profile(c)))
+    }
+
+    fn acquire(&mut self) -> Acquired<wgpu::SurfaceTexture> {
+        match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f) => Acquired::Ready(f),
+            wgpu::CurrentSurfaceTexture::Suboptimal(f) => Acquired::Suboptimal(f),
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => Acquired::Outdated,
+            wgpu::CurrentSurfaceTexture::Timeout
+            | wgpu::CurrentSurfaceTexture::Occluded
+            | wgpu::CurrentSurfaceTexture::Validation => Acquired::Unavailable,
+        }
+    }
+
+    fn view(&self, image: &wgpu::SurfaceTexture) -> wgpu::TextureView {
+        image.texture.create_view(&wgpu::TextureViewDescriptor::default())
+    }
+
+    fn present(&mut self, image: wgpu::SurfaceTexture) {
+        self.queue.present(image);
+    }
+
+    #[cfg(target_os = "android")]
+    fn refreshes(&mut self, drawing: bool) -> Option<crate::pacing::Timeline> {
+        self.refreshes.as_ref().and_then(|r| r.timeline(drawing))
+    }
+
+    fn gpu_idle(&mut self) -> bool {
+        // looked at, never waited on: a wait with a timeout lost the device on a tablet's driver
+        // (one without, as the canvas's own, never did)
+        let now = wgpu::PollType::Wait { submission_index: None, timeout: Some(Duration::ZERO) };
+        self.gpu.is_lost() || self.gpu.device.poll(now).is_ok()
+    }
 }
 
 /// Keeps the device's pipelines for the next run (see [`Gpu::keep_pipelines`]): the screen's,
@@ -203,11 +190,9 @@ fn keep_pipelines(shared: &Shared) {
     }
 }
 
-/// A frame that holds the canvas longer than this is logged: touches wait on it.
-const SLOW_FRAME: Duration = Duration::from_millis(200);
-
-/// How often the second display looks for a new frame of the main window.
-const PROJECTION_POLL: Duration = Duration::from_millis(8);
+/// How long the second display waits at most for a new frame of the main window before it looks
+/// again (its size or its stop come sooner, as each wakes it).
+const PROJECTION_WAIT: Duration = Duration::from_secs(1);
 
 /// Project canvas's thread: the whole canvas fitted and centred on black on a second display,
 /// drawn again after each frame of the main window.
@@ -232,20 +217,22 @@ pub(crate) fn project(shared: Arc<Shared>, window: Window) {
     let Some(queue) = shared.lock().gpu.as_ref().map(|g| g.queue.clone()) else { return };
     let mut config: Option<wgpu::SurfaceConfiguration> = None;
     let mut size = (0, 0);
+    let mut wide = false;
     let mut drawn: Option<u64> = None;
     loop {
-        let (wanted, frames) = {
+        let (wanted, frames, wants_wide) = {
             let st = shared.lock();
             if st.projection_stop {
                 break;
             }
-            (st.projection_size, st.frames)
+            (st.projection_size, st.frames, st.wide_colour())
         };
-        if wanted != size || config.is_none() {
+        if wanted != size || config.is_none() || wants_wide != wide {
             size = wanted;
             let st = shared.lock();
             let Some(gpu) = st.gpu.as_ref() else { break };
-            config = configure(gpu, &surface, size, true);
+            config = configure(gpu, &surface, size, wants_wide);
+            wide = wants_wide;
             drawn = None;
         }
         let Some(format) = config.as_ref().map(|c| c.format) else {
@@ -253,7 +240,12 @@ pub(crate) fn project(shared: Arc<Shared>, window: Window) {
             continue;
         };
         if drawn == Some(frames) {
-            std::thread::sleep(PROJECTION_POLL);
+            // until the main window draws a frame (it wakes this), or the display's size or stop
+            // come
+            let mut st = shared.lock();
+            if st.frames == frames && st.projection_size == size && !st.projection_stop {
+                let _ = shared.wake.wait_for(&mut st, PROJECTION_WAIT);
+            }
             continue;
         }
         let frame = match surface.get_current_texture() {

@@ -10,7 +10,7 @@ object GenerationUi {
     const val enabled = false
 
     @Composable
-    fun BarButton(vm: CanvasViewModel, width: Dp) = Unit
+    fun BarButton(vm: CanvasViewModel, width: Dp, upright: Boolean = false) = Unit
 
     @Composable
     fun SelectionButton(vm: CanvasViewModel, width: Dp) = Unit

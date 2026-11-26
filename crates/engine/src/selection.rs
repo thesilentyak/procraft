@@ -33,18 +33,27 @@ impl Mask {
     /// The smallest rectangle holding everything it takes (x, y, width, height); none when it
     /// takes nothing.
     pub fn bounds(&self) -> Option<[u32; 4]> {
+        self.bounds_within([0, 0, self.width, self.height])
+    }
+
+    /// [`Mask::bounds`] of a mask that takes nothing outside `within` (x, y, width, height), looked
+    /// for only there: a small part of a large canvas is found without going over all of it.
+    pub fn bounds_within(&self, within: [u32; 4]) -> Option<[u32; 4]> {
         let w = self.width as usize;
         if w == 0 {
             return None;
         }
+        let [x, y, bw, bh] = within.map(|v| v as usize);
+        let (x0, x1) = (x.min(w), x.saturating_add(bw).min(w));
         let (mut top, mut bottom, mut left, mut right) = (None, 0, usize::MAX, 0);
-        for (y, row) in self.data.chunks(w).enumerate() {
-            let Some(first) = row.iter().position(|&v| v > 0) else { continue };
-            let last = row.iter().rposition(|&v| v > 0).unwrap_or(first);
-            top.get_or_insert(y);
-            bottom = y;
-            left = left.min(first);
-            right = right.max(last);
+        for (j, row) in self.data.chunks(w).enumerate().skip(y).take(bh) {
+            let row = row.get(x0..x1).unwrap_or_default();
+            let Some(first) = first_set(row) else { continue };
+            let last = last_set(row).unwrap_or(first);
+            top.get_or_insert(j);
+            bottom = j;
+            left = left.min(x0 + first);
+            right = right.max(x0 + last);
         }
         let top = top?;
         let n = |v: usize| u32::try_from(v).unwrap_or(u32::MAX);
@@ -52,7 +61,7 @@ impl Mask {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.data.iter().all(|&v| v == 0)
+        first_set(&self.data).is_none()
     }
 
     /// The rectangle between corners `a` and `b` (canvas pixels), with partly covered edge pixels.
@@ -131,7 +140,9 @@ impl Mask {
             let mut crossings: Vec<(f32, i32)> = Vec::new();
             for (k, row) in rows.chunks_mut(w.max(1)).enumerate() {
                 let y = y_lo + first + k;
-                coverage.iter_mut().for_each(|c| *c = 0.0);
+                // the columns the row's spans reach: only those are worked out (the rest stay
+                // clear), and cleared again for the next row
+                let mut reached: Option<(usize, usize)> = None;
                 for sub in 0..POLYGON_ROWS {
                     let sy = y as f32 + (sub as f32 + 0.5) / POLYGON_ROWS as f32;
                     crossings.clear();
@@ -146,14 +157,18 @@ impl Mask {
                     for pair in crossings.windows(2) {
                         let [(x0, d), (x1, _)] = pair else { continue };
                         winding += d;
-                        if winding != 0 {
-                            add_span(&mut coverage, *x0, *x1, 1.0 / POLYGON_ROWS as f32);
+                        if winding != 0
+                            && let Some((a, b)) = add_span(&mut coverage, *x0, *x1, 1.0 / POLYGON_ROWS as f32)
+                        {
+                            reached = Some(reached.map_or((a, b), |(lo, hi)| (lo.min(a), hi.max(b))));
                         }
                     }
                 }
-                for (v, c) in row.iter_mut().zip(&coverage) {
+                let Some((lo, hi)) = reached else { continue };
+                for (v, c) in row.iter_mut().zip(&coverage).take(hi + 1).skip(lo) {
                     *v = to_byte(*c);
                 }
+                coverage.iter_mut().take(hi + 1).skip(lo).for_each(|c| *c = 0.0);
             }
         });
         m
@@ -493,19 +508,20 @@ fn to_byte(v: f32) -> u8 {
     (v.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
-/// Adds `amount` × the covered part of each pixel between `x0` and `x1` to `row`.
-fn add_span(row: &mut [f32], x0: f32, x1: f32, amount: f32) {
+/// Adds `amount` × the covered part of each pixel between `x0` and `x1` to `row`; the first and
+/// last pixels it may have added to (none if it added nothing).
+fn add_span(row: &mut [f32], x0: f32, x1: f32, amount: f32) -> Option<(usize, usize)> {
     let n = row.len().saturating_sub(1) as f32;
     let (x0, x1) = (x0.clamp(0.0, n), x1.clamp(0.0, n));
     if x1 <= x0 {
-        return;
+        return None;
     }
     let (first, last) = (x0.floor() as usize, x1.floor() as usize);
     if first == last {
         if let Some(c) = row.get_mut(first) {
             *c += (x1 - x0) * amount;
         }
-        return;
+        return Some((first, last));
     }
     if let Some(c) = row.get_mut(first) {
         *c += (first as f32 + 1.0 - x0) * amount;
@@ -515,6 +531,25 @@ fn add_span(row: &mut [f32], x0: f32, x1: f32, amount: f32) {
     }
     if let Some(c) = row.get_mut(last) {
         *c += (x1 - last as f32) * amount;
+    }
+    Some((first, last))
+}
+
+/// Where the first byte of `bytes` that isn't 0 is, if one is: gone through a word at a time.
+pub fn first_set(bytes: &[u8]) -> Option<usize> {
+    let (words, rest) = bytes.as_chunks::<8>();
+    match words.iter().position(|w| u64::from_ne_bytes(*w) != 0) {
+        Some(k) => words.get(k)?.iter().position(|&b| b != 0).map(|i| 8 * k + i),
+        None => rest.iter().position(|&b| b != 0).map(|i| 8 * words.len() + i),
+    }
+}
+
+/// Where the last byte of `bytes` that isn't 0 is, if one is: gone through a word at a time.
+pub fn last_set(bytes: &[u8]) -> Option<usize> {
+    let (head, words) = bytes.as_rchunks::<8>();
+    match words.iter().rposition(|w| u64::from_ne_bytes(*w) != 0) {
+        Some(k) => words.get(k)?.iter().rposition(|&b| b != 0).map(|i| head.len() + 8 * k + i),
+        None => head.iter().rposition(|&b| b != 0),
     }
 }
 
@@ -536,7 +571,7 @@ fn blur_columns_into(values: &[f32], out: &mut [u8], w: usize, h: usize, r: usiz
     }
     std::thread::scope(|scope| {
         for (k, mut pieces) in bands.into_iter().enumerate() {
-            scope.spawn(move || {
+            crate::par::beside(scope, move || {
                 let (from, to) = (k * part, (k * part + part).min(w));
                 let (mut strip, mut blurred, mut sums) = (Vec::new(), Vec::new(), Vec::new());
                 for x0 in (from..to).step_by(STRIP) {
@@ -593,7 +628,7 @@ fn by_bands<T: Send>(data: &mut [T], width: usize, f: impl Fn(usize, &mut [T]) +
     std::thread::scope(|scope| {
         for (k, rows) in data.chunks_mut(band * width).enumerate() {
             let f = &f;
-            scope.spawn(move || f(k * band, rows));
+            crate::par::beside(scope, move || f(k * band, rows));
         }
     });
 }
@@ -619,6 +654,116 @@ fn blur_row(row: &mut [f32], r: usize, line: &mut Vec<f32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`Mask::polygon`] as it was: every column of each row it reaches worked out.
+    fn polygon_every_column(width: u32, height: u32, points: &[Vec2]) -> Mask {
+        let mut m = Mask::empty(width, height);
+        let w = width as usize;
+        let edges: Vec<(Vec2, Vec2)> =
+            points.iter().zip(points.iter().cycle().skip(1)).map(|(a, b)| (*a, *b)).collect();
+        let (lo, hi) = points.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| (lo.min(p.y), hi.max(p.y)));
+        let (y_lo, y_hi) = (lo.max(0.0) as usize, (hi.max(0.0).ceil() as usize).min(height as usize));
+        let mut coverage = vec![0.0f32; w + 1];
+        for y in y_lo..y_hi {
+            coverage.iter_mut().for_each(|c| *c = 0.0);
+            for sub in 0..POLYGON_ROWS {
+                let sy = y as f32 + (sub as f32 + 0.5) / POLYGON_ROWS as f32;
+                let mut crossings: Vec<(f32, i32)> = edges
+                    .iter()
+                    .filter(|(a, b)| (a.y <= sy) != (b.y <= sy))
+                    .map(|(a, b)| (a.x + (sy - a.y) / (b.y - a.y) * (b.x - a.x), if b.y > a.y { 1 } else { -1 }))
+                    .collect();
+                crossings.sort_by(|p, q| p.0.total_cmp(&q.0));
+                let mut winding = 0;
+                for pair in crossings.windows(2) {
+                    let [(x0, d), (x1, _)] = pair else { continue };
+                    winding += d;
+                    if winding != 0 {
+                        add_span(&mut coverage, *x0, *x1, 1.0 / POLYGON_ROWS as f32);
+                    }
+                }
+            }
+            for (v, c) in m.data[y * w..(y + 1) * w].iter_mut().zip(&coverage) {
+                *v = to_byte(*c);
+            }
+        }
+        m
+    }
+
+    /// A polygon's selection works out only the columns each row's spans reach (a small shape on a
+    /// large canvas went over every column of every row it reached), and comes out byte for byte
+    /// as when it went over all of them: ellipses, a star crossing itself, shapes past the canvas's
+    /// edges and on its last column. Printed: a small ellipse on a 4096 square canvas both ways.
+    #[test]
+    fn a_polygon_works_out_only_the_columns_it_reaches_and_comes_out_the_same() {
+        let ellipse = |cx: f32, cy: f32, rx: f32, ry: f32| -> Vec<Vec2> {
+            (0..128)
+                .map(|i| {
+                    let t = i as f32 / 128.0 * std::f32::consts::TAU;
+                    Vec2::new(cx + rx * t.cos(), cy + ry * t.sin())
+                })
+                .collect()
+        };
+        let star: Vec<Vec2> = (0..5)
+            .map(|i| {
+                let t = i as f32 * 4.0 / 5.0 * std::f32::consts::PI;
+                Vec2::new(150.0 + 120.0 * t.sin(), 150.0 - 120.0 * t.cos())
+            })
+            .collect();
+        let shapes = [
+            (300, 300, ellipse(150.0, 150.0, 100.3, 60.7)),
+            (300, 300, ellipse(10.0, 290.0, 80.0, 80.0)),
+            (300, 300, star),
+            (
+                257,
+                131,
+                vec![Vec2::new(-20.5, 3.2), Vec2::new(256.9, 0.4), Vec2::new(250.0, 140.0), Vec2::new(40.0, 99.9)],
+            ),
+            (64, 64, vec![Vec2::new(63.2, 0.0), Vec2::new(64.0, 64.0), Vec2::new(62.7, 30.0)]),
+        ];
+        for (w, h, points) in &shapes {
+            assert_eq!(Mask::polygon(*w, *h, points), polygon_every_column(*w, *h, points), "{points:?}");
+        }
+        let small = ellipse(2000.0, 2000.0, 300.0, 200.0);
+        let t = std::time::Instant::now();
+        let now = Mask::polygon(4096, 4096, &small);
+        let quick = t.elapsed().as_secs_f64() * 1000.0;
+        let t = std::time::Instant::now();
+        let was = polygon_every_column(4096, 4096, &small);
+        let every = t.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "a small ellipse on a 4096 square canvas: {quick:.1} ms now, {every:.1} ms going over every column (on one thread)"
+        );
+        assert_eq!(now, was);
+    }
+
+    /// The first and last byte set, found a word at a time, are where looking byte by byte finds
+    /// them, wherever they fall within or beside a word.
+    #[test]
+    fn the_first_and_last_byte_set_are_found_a_word_at_a_time() {
+        for len in [0usize, 1, 7, 8, 9, 16, 31, 64, 4097] {
+            for at in [0usize, 1, 6, 7, 8, 13, 15, 16, 63, 4000, 4096] {
+                if at >= len.max(1) && len > 0 {
+                    continue;
+                }
+                let mut bytes = vec![0u8; len];
+                assert_eq!((first_set(&bytes), last_set(&bytes)), (None, None));
+                if len == 0 {
+                    continue;
+                }
+                bytes[at] = 3;
+                assert_eq!((first_set(&bytes), last_set(&bytes)), (Some(at), Some(at)), "{len} {at}");
+                bytes[len - 1] = 1;
+                bytes[0] = 1;
+                assert_eq!((first_set(&bytes), last_set(&bytes)), (Some(0), Some(len - 1)));
+            }
+        }
+        let mut m = Mask::empty(50, 3);
+        assert!(m.is_empty());
+        m.data[149] = 1;
+        assert!(!m.is_empty());
+        assert_eq!(m.bounds(), Some([49, 2, 1, 1]));
+    }
 
     /// An automatic selection the plain way: the pixels joined to the seed through pixels whose
     /// colour, the four channels' differences added up, is within the threshold.

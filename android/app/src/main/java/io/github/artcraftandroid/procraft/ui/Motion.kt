@@ -174,6 +174,9 @@ object Motion {
     fun sideBarOut(right: Boolean): androidx.compose.animation.ExitTransition =
         androidx.compose.animation.slideOutHorizontally(tween(130, easing = CubicBezierEasing(0.42f, 0f, 1f, 1f))) { if (right) it else -it }
 
+    /** The side bar let go where its modify button dragged it: back to its width and its place, 0.15 s, easing out. */
+    fun sideBarSettle(): AnimationSpec<Float> = tween(150, easing = EaseOut)
+
     /** A tool's header (crop, guides) fading in over the top bar as its mode begins. */
     fun toolHeaderIn(): AnimationSpec<Float> = tween(220, easing = EaseInOut)
 
@@ -347,7 +350,7 @@ fun <T : Any> FadingValue(value: T?, spec: AnimationSpec<Float>, content: @Compo
     if (shown > 0f) content(kept, shown)
 }
 
-/** How a panel looks as it opens or closes, for its frosted backdrop to follow: [pivot] in screen pixels. */
+/** How a panel looks as it opens or closes, for its frosted backdrop to follow: [pivot] on the canvas (pixels). */
 class PanelLook(val alpha: Float, val scale: Float, val pivot: Offset)
 
 val LocalPanelLook = compositionLocalOf { PanelLook(1f, 1f, Offset.Zero) }
@@ -355,7 +358,7 @@ val LocalPanelLook = compositionLocalOf { PanelLook(1f, 1f, Offset.Zero) }
 /**
  * Shows [content] for [target] unless it is [hidden]. The panels hanging from the top bar come and
  * go at once (as measured, within a frame); [content] still gets how opaque and
- * how big the panel is and where this host's top left is on screen (pixels), for its frosted
+ * how big the panel is and where this host's top left is on the canvas (pixels), for its frosted
  * backdrop.
  */
 @Composable
@@ -382,9 +385,21 @@ fun <T> PanelPresence(
     }
     @Suppress("UNCHECKED_CAST")
     val shown = if (target != hidden) target else if (fading) last[0] as T? ?: return else return
-    Box(Modifier.fillMaxSize().onGloballyPositioned { origin = it.positionOnScreen() }) {
+    // on the canvas, where the frost behind panels is (by the screen; without a canvas, less what
+    // the interface keeps clear of)
+    val corner = LocalClearance.current.corner
+    val backdrops = LocalBackdrops.current
+    Box(Modifier.fillMaxSize().onGloballyPositioned { origin = backdrops?.onCanvas(it.positionOnScreen()) ?: (it.positionOnScreen() - corner) }) {
         content(shown, if (target == hidden) fade.value else 1f, 1f, origin)
     }
+}
+
+/**
+ * Takes every touch on it that what is inside doesn't (those go to what is inside first): none reaches the canvas under
+ * it, for all its drag. For what Edit layout moves, whose glass between its buttons would let a press through.
+ */
+fun Modifier.keepsItsTouches(): Modifier = pointerInput(Unit) {
+    awaitEachGesture { awaitFirstDown(requireUnconsumed = false).consume() }
 }
 
 /** Keeps touches from what is inside: a panel fading away takes none (the canvas around it does). */
@@ -437,9 +452,12 @@ fun MenuPresence(open: Boolean, origin: androidx.compose.ui.graphics.TransformOr
     var pivot by remember { mutableStateOf(Offset.Zero) }
     val a = alpha.value.coerceIn(0f, 1f)
     val k = scale.value
+    val corner = LocalClearance.current.corner
+    val backdrops = LocalBackdrops.current
     val look = Modifier
         .onGloballyPositioned { c ->
-            pivot = c.positionOnScreen() + Offset(origin.pivotFractionX * c.size.width, origin.pivotFractionY * c.size.height)
+            val at = backdrops?.onCanvas(c.positionOnScreen()) ?: (c.positionOnScreen() - corner)
+            pivot = at + Offset(origin.pivotFractionX * c.size.width, origin.pivotFractionY * c.size.height)
         }
         .graphicsLayer {
             this.alpha = a

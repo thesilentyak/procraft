@@ -35,6 +35,8 @@ impl CanvasSession {
 
     pub fn resize_projection(&self, width: u32, height: u32) {
         self.shared.lock().projection_size = (width.max(1), height.max(1));
+        // its thread, waiting for the next frame, draws at the new size at once
+        self.shared.wake.notify_all();
     }
 
     /// Lets go of the second display's window; returns once its thread has finished.
@@ -42,6 +44,7 @@ impl CanvasSession {
         let handle = self.shared.projection.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(handle) = handle {
             self.shared.lock().projection_stop = true;
+            self.shared.wake.notify_all();
             let _ = handle.join();
             self.shared.lock().projection_stop = false;
         }

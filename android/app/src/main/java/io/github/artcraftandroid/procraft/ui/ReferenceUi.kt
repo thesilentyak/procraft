@@ -76,20 +76,30 @@ private val GrabHeight = 16.dp
 private const val GlassSide = 24
 
 /**
- * The reference window: the whole canvas as it is, or a picture to work from, floating over the
- * canvas. Its grab line drags it; the round button closes it (Reference off); handles over its
- * bottom corners size it. Its bars lie over the picture, and a tap on it slides them away and back.
+ * The reference windows: each the whole canvas as it is, or a picture to work from, floating over
+ * the canvas. Its grab line drags it; the round button closes it (the artwork's own: Reference
+ * off); handles over its bottom corners size it. Its bars lie over the picture, and a tap on it
+ * slides them away and back. While a plugin lets more than one be open, + opens another.
  */
 @Composable
 fun BoxScope.ReferenceWindow(vm: CanvasViewModel) {
-    // it fades in where it is, and out when closed; over the whole screen, since the fade draws
-    // into a buffer its own size and the window sits away from the corner
-    androidx.compose.animation.AnimatedVisibility(
-        vm.referenceOn,
-        Modifier.matchParentSize(),
-        enter = androidx.compose.animation.fadeIn(Motion.referenceFade()),
-        exit = androidx.compose.animation.fadeOut(Motion.referenceFade()),
-    ) { ReferenceWindowContent(vm) }
+    for (w in vm.referenceWindows) {
+        androidx.compose.runtime.key(w) {
+            // it fades in where it is, and out when closed; over the whole screen, since the fade
+            // draws into a buffer its own size and the window sits away from the corner. Crop and
+            // Resize puts it away while it is open, and it comes back after
+            androidx.compose.animation.AnimatedVisibility(
+                w.on && vm.cropRect == null,
+                Modifier.matchParentSize(),
+                enter = androidx.compose.animation.fadeIn(Motion.referenceFade()),
+                exit = androidx.compose.animation.fadeOut(Motion.referenceFade()),
+            ) {
+                ReferenceWindowContent(vm, w)
+                // faded out: a hidden window lets its picture go
+                androidx.compose.runtime.DisposableEffect(w) { onDispose { w.gone() } }
+            }
+        }
+    }
 }
 
 /** Touches here go no further: not to the picture under a bar. */
@@ -108,48 +118,56 @@ private fun glassOf(picture: ImageBitmap): ImageBitmap {
 }
 
 @Composable
-private fun ReferenceWindowContent(vm: CanvasViewModel) {
+private fun ReferenceWindowContent(vm: CanvasViewModel, w: CanvasViewModel.ReferenceWindow) {
     val density = LocalDensity.current
     val config = LocalConfiguration.current
-    val pick = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri -> uri?.let(vm::importReference) }
-    val picture = vm.referenceShown
+    val pick = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri -> uri?.let(w::importPicture) }
+    val picture = w.shown
     val tall = TopBarHeight + picture.height + BottomBarHeight
     // the first time in the middle near the bottom of the screen; then kept on it, and no bigger
     SideEffect {
-        with(density) { vm.placeReference(config.screenWidthDp.dp.toPx(), config.screenHeightDp.dp.toPx(), (TopBarHeight + BottomBarHeight).toPx()) }
+        with(density) { w.place(config.screenWidthDp.dp.toPx(), config.screenHeightDp.dp.toPx(), (TopBarHeight + BottomBarHeight).toPx()) }
     }
-    val at = vm.referenceOffset.takeIf { it != Offset.Unspecified } ?: Offset.Zero
+    val at = w.offset.takeIf { it != Offset.Unspecified } ?: Offset.Zero
+    // the artwork's own window, for the floating panels to snap against while a plugin lays them out
+    if (w.index == 0) {
+        val rect = io.github.artcraftandroid.procraft.core.LayoutRect(at.x / density.density, at.y / density.density, picture.width.value, tall.value)
+        SideEffect { vm.tellReference(rect) }
+        androidx.compose.runtime.DisposableEffect(Unit) { onDispose { vm.tellReference(null) } }
+    }
     // room around the window for the handles, which reach past its corners (touches outside a
     // layout's bounds don't reach it)
     val margin = HandleSide / 2 - 12.dp
     val below = HandleSide / 2 - 15.dp
-    val barsShown = androidx.compose.animation.core.animateFloatAsState(if (vm.referenceBarsHidden) 0f else 1f, Motion.bars(), label = "reference bars").value
+    val barsShown = androidx.compose.animation.core.animateFloatAsState(if (w.barsHidden) 0f else 1f, Motion.bars(), label = "reference bars").value
     Box(Modifier.offset { IntOffset(at.x.roundToInt() - margin.roundToPx(), at.y.roundToInt()) }) {
         Box(Modifier.padding(start = margin, end = margin, bottom = below).size(picture.width, tall).shadow(18.dp, RoundedCornerShape(ReferenceCorner)).clip(RoundedCornerShape(ReferenceCorner)).background(PictureFill)) {
             // the picture: the whole window's, under the bars. A tap hides them or brings them
             // back; a finger moves it, two zoom and move it, a finger held still picks a colour
             // from it; touches here never reach the canvas under the window
-            val shown = when (vm.referenceMode) {
-                CanvasViewModel.ReferenceMode.CANVAS, CanvasViewModel.ReferenceMode.MODEL -> vm.referenceCanvas
-                CanvasViewModel.ReferenceMode.IMAGE -> vm.referenceImage
+            val shown = when (w.mode) {
+                CanvasViewModel.ReferenceMode.CANVAS, CanvasViewModel.ReferenceMode.MODEL -> w.canvas
+                CanvasViewModel.ReferenceMode.IMAGE -> w.image
             }
-            val view = if (vm.referenceMode == CanvasViewModel.ReferenceMode.IMAGE) vm.referenceImageView else vm.referenceCanvasView
+            val view = if (w.mode == CanvasViewModel.ReferenceMode.IMAGE) w.imageView else w.canvasView
             val glass = remember(shown) { shown?.let(::glassOf) }
             // where the picture's area is, read when a finger picks (kept as the layout itself, so a
             // window dragged since is never read where it was)
             val area = remember { arrayOfNulls<androidx.compose.ui.layout.LayoutCoordinates>(1) }
-            val toScreen = { p: Offset -> area[0]?.takeIf { it.isAttached }?.localToRoot(p) ?: p }
+            // (the loupe's place in the interface: in the window, less what it keeps clear of)
+            val corner = LocalClearance.current.corner
+            val toScreen = { p: Offset -> area[0]?.takeIf { it.isAttached }?.localToRoot(p)?.minus(corner) ?: p }
             Box(
                 Modifier.fillMaxSize().clipToBounds()
                     .onGloballyPositioned { area[0] = it }
-                    .pointerInput(shown) { pictureGestures(vm, shown, toScreen) },
+                    .pointerInput(shown) { pictureGestures(vm, w, shown, toScreen) },
                 contentAlignment = Alignment.Center,
             ) {
                 if (shown != null) {
                     Canvas(Modifier.fillMaxSize()) {
                         val r = io.github.artcraftandroid.procraft.core.referencePictureRect(view, pictureSizes(size.width, size.height, shown))
                         // the canvas's pixels crisp from 100%, as on the canvas
-                        val crisp = vm.referenceMode == CanvasViewModel.ReferenceMode.CANVAS && vm.referenceCanvasWhole && r[2] >= shown.width * this.density * 0.999f
+                        val crisp = w.mode == CanvasViewModel.ReferenceMode.CANVAS && w.canvasWhole && r[2] >= shown.width * this.density * 0.999f
                         drawImage(
                             shown,
                             dstOffset = IntOffset(r[0].roundToInt(), r[1].roundToInt()),
@@ -158,10 +176,11 @@ private fun ReferenceWindowContent(vm: CanvasViewModel) {
                         )
                     }
                 }
-                when (vm.referenceMode) {
+                when (w.mode) {
                     CanvasViewModel.ReferenceMode.CANVAS, CanvasViewModel.ReferenceMode.MODEL -> Unit
                     CanvasViewModel.ReferenceMode.IMAGE -> {
-                        if (vm.referenceImage == null) {
+                        // (not while its picture is being read to show)
+                        if (w.image == null && !w.readingPicture) {
                             Box(
                                 Modifier.width(180.dp).height(60.dp).clip(RoundedCornerShape(30.dp)).background(ImportFill)
                                     .clickable { pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
@@ -190,12 +209,22 @@ private fun ReferenceWindowContent(vm: CanvasViewModel) {
             Box(Modifier.offset { IntOffset(0, topSlide.roundToInt()) }.fillMaxWidth().height(TopBarHeight).clipToBounds().overPicture(topSlide).ownTouches()) {
                 Text("Reference", color = TitleInk, fontSize = 22.sp, fontWeight = FontWeight.Bold, maxLines = 1, modifier = Modifier.align(Alignment.TopStart).padding(start = 20.dp, top = 10.dp))
                 Row(Modifier.align(Alignment.CenterEnd).padding(end = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-                    if (vm.referenceMode == CanvasViewModel.ReferenceMode.IMAGE && vm.referenceImage != null) {
-                        Text("Clear", color = Pc.Accent, fontSize = 15.sp, modifier = Modifier.clickable { vm.clearReference() }.padding(6.dp))
+                    if (w.mode == CanvasViewModel.ReferenceMode.IMAGE && w.image != null) {
+                        Text("Clear", color = Pc.Accent, fontSize = 15.sp, modifier = Modifier.clickable { w.clear() }.padding(6.dp))
                         Text("Import", color = Pc.Accent, fontSize = 15.sp, modifier = Modifier.clickable { pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }.padding(6.dp))
                     }
+                    // another window, while a plugin lets more be open
+                    if (vm.referenceWindows.size < vm.referenceWindowsAllowed) {
+                        Box(
+                            Modifier.padding(end = 8.dp).size(43.dp).clip(CircleShape).background(CloseFill).border(1.dp, CloseEdge, CircleShape)
+                                .clickable { vm.addReferenceWindow(w) },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Icon(PcIcons.Add, contentDescription = "Another reference window", tint = CloseInk, modifier = Modifier.size(28.dp))
+                        }
+                    }
                     Box(
-                        Modifier.size(43.dp).clip(CircleShape).background(CloseFill).border(1.dp, CloseEdge, CircleShape).clickable { vm.changeReferenceOn(false) },
+                        Modifier.size(43.dp).clip(CircleShape).background(CloseFill).border(1.dp, CloseEdge, CircleShape).clickable { vm.closeReferenceWindow(w) },
                         contentAlignment = Alignment.Center,
                     ) {
                         Icon(PcIcons.Cross, contentDescription = "Close", tint = CloseInk, modifier = Modifier.size(20.dp))
@@ -213,12 +242,12 @@ private fun ReferenceWindowContent(vm: CanvasViewModel) {
                 ) {
                     // on a model the third is the model itself; no Face without face tracking
                     val kinds = listOf(CanvasViewModel.ReferenceMode.CANVAS to "Canvas", CanvasViewModel.ReferenceMode.IMAGE to "Image") +
-                        listOfNotNull((CanvasViewModel.ReferenceMode.MODEL to "3D").takeIf { vm.modelOpen })
+                        listOfNotNull((CanvasViewModel.ReferenceMode.MODEL to "3D").takeIf { vm.modelOpen && w.index == 0 })
                     for ((mode, label) in kinds) {
-                        val on = vm.referenceMode == mode
+                        val on = w.mode == mode
                         Box(
                             Modifier.weight(1f).fillMaxHeight().clip(CircleShape).background(if (on) Pc.Accent else Color.Transparent)
-                                .clickable { vm.changeReferenceMode(mode) },
+                                .clickable { w.changeMode(mode) },
                             contentAlignment = Alignment.Center,
                         ) {
                             Text(label, color = if (on) Color.White else TitleInk, fontSize = 15.sp, maxLines = 1)
@@ -229,7 +258,21 @@ private fun ReferenceWindowContent(vm: CanvasViewModel) {
             // the grab line stays when the bars go, and dragging by it moves the window
             Box(
                 Modifier.fillMaxWidth().height(GrabHeight)
-                    .pointerInput(Unit) { detectDragGestures { change, amount -> change.consume(); vm.moveReference(amount) } },
+                    .pointerInput(Unit) {
+                        var total = Offset.Zero
+                        detectDragGestures(
+                            onDragStart = {
+                                total = Offset.Zero
+                                w.hold()
+                            },
+                            onDragEnd = { w.letGo() },
+                            onDragCancel = { w.letGo() },
+                        ) { change, amount ->
+                            change.consume()
+                            total += amount
+                            w.drag(total, amount)
+                        }
+                    },
             ) {
                 Box(Modifier.align(Alignment.TopCenter).padding(top = 4.dp).size(40.dp, 4.dp).clip(CircleShape).background(GrabLine))
             }
@@ -242,7 +285,7 @@ private fun ReferenceWindowContent(vm: CanvasViewModel) {
                     .pointerInput(left) {
                         detectDragGestures { change, amount ->
                             change.consume()
-                            vm.resizeReference(with(density) { amount.x.toDp() }, with(density) { amount.y.toDp() }, fromLeft = left)
+                            w.resize(with(density) { amount.x.toDp() }, with(density) { amount.y.toDp() }, fromLeft = left)
                         }
                     },
             )
@@ -260,7 +303,7 @@ private fun pictureSizes(width: Float, height: Float, picture: ImageBitmap) =
  * following the finger until it lets go; a finger moves it, two zoom and move it. [toScreen] turns
  * a point in the picture's area into one in the window, for the loupe.
  */
-private suspend fun PointerInputScope.pictureGestures(vm: CanvasViewModel, picture: ImageBitmap?, toScreen: (Offset) -> Offset) {
+private suspend fun PointerInputScope.pictureGestures(vm: CanvasViewModel, w: CanvasViewModel.ReferenceWindow, picture: ImageBitmap?, toScreen: (Offset) -> Offset) {
     awaitEachGesture {
         val first = awaitFirstDown(requireUnconsumed = false)
         first.consume()
@@ -283,9 +326,9 @@ private suspend fun PointerInputScope.pictureGestures(vm: CanvasViewModel, pictu
         }
         if (ended == null && picture != null && sizes != null) {
             fun pickAt(p: Offset) {
-                val view = if (vm.referenceMode == CanvasViewModel.ReferenceMode.IMAGE) vm.referenceImageView else vm.referenceCanvasView
+                val view = if (w.mode == CanvasViewModel.ReferenceMode.IMAGE) w.imageView else w.canvasView
                 val at = io.github.artcraftandroid.procraft.core.referencePicturePoint(view, sizes, p.x, p.y) ?: return
-                vm.pickReference(picture, at[0], at[1], at[2], toScreen(p))
+                vm.pickReference(picture, at[0], at[1], at[2], toScreen(p), pen = first.type == androidx.compose.ui.input.pointer.PointerType.Stylus)
             }
             pickAt(first.position)
             while (true) {
@@ -302,7 +345,7 @@ private suspend fun PointerInputScope.pictureGestures(vm: CanvasViewModel, pictu
         if (!moved) {
             val second = withTimeoutOrNull(viewConfiguration.doubleTapTimeoutMillis) { awaitFirstDown(requireUnconsumed = false) }
             second?.consume()
-            if (second == null) vm.toggleReferenceBars() else vm.fitReference()
+            if (second == null) w.toggleBars() else w.fit()
             return@awaitEachGesture
         }
         // until every finger lets go, they move the picture and two or more zoom it
@@ -317,7 +360,7 @@ private suspend fun PointerInputScope.pictureGestures(vm: CanvasViewModel, pictu
             val after = both.fold(Offset.Zero) { a, c -> a + c.position } / both.size.toFloat()
             val apartBefore = both.sumOf { (it.previousPosition - before).getDistance().toDouble() }.toFloat()
             val apartAfter = both.sumOf { (it.position - after).getDistance().toDouble() }.toFloat()
-            vm.pinchReference(sizes, before, after, if (apartBefore > 0f) apartAfter / apartBefore else 1f)
+            w.pinch(sizes, before, after, if (apartBefore > 0f) apartAfter / apartBefore else 1f)
         }
     }
 }

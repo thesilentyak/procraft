@@ -50,7 +50,9 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.PointerType
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import android.content.res.Configuration
@@ -60,8 +62,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.artcraftandroid.procraft.canvas.CanvasViewModel
 import io.github.artcraftandroid.procraft.canvas.PadSurfaceView
+import io.github.artcraftandroid.procraft.core.ListSliderTouch
 import io.github.artcraftandroid.procraft.core.SourceKind
 import io.github.artcraftandroid.procraft.core.curveSamples
+import io.github.artcraftandroid.procraft.core.listSliderTouch
 import io.github.artcraftandroid.procraft.core.sliderExtras
 import kotlin.math.pow
 import kotlin.math.roundToInt
@@ -121,6 +125,20 @@ private val StudioDone get() = Pc.tinted(Color(0xFF0190FF))
 /** Where the settings start below the drawing pad (points from the top). */
 private val PadHeight = 510.dp
 private val TabsWidth = 81.dp
+
+/** The landscape studio's pages card (with its margin), its settings and the line after them. */
+private val PagesAndSettings = 330.dp + SettingsWidth + 1.dp
+
+/** The least the pad beside them needs: its Drawing Pad button and Cancel and Done, apart. */
+internal val PadLeast = 360.dp
+
+/**
+ * Whether the studio in a window [width] wide lays its pages, settings and pad side by side: in
+ * landscape where the pad still has room for its buttons (on a phone held sideways it had about 80
+ * across, and Done was squeezed to nothing), else the pages as a rail beside the pad over the
+ * settings, as upright.
+ */
+internal fun studioSideBySide(landscape: Boolean, width: Dp) = landscape && width >= PagesAndSettings + PadLeast
 
 /**
  * How a slider reads; [SIZE] reads the size the control sets (the brush's most size × place^2.2) as a
@@ -420,6 +438,7 @@ private fun StudioParts(vm: CanvasViewModel) {
         message = { "The pair becomes two brushes again, side by side in the set. It can't be undone." },
         action = "Uncombine",
         destructive = false,
+        icon = PcIcons.AlertQuestion,
         onCancel = { parting = null },
         onAction = {
             parting = null
@@ -429,6 +448,8 @@ private fun StudioParts(vm: CanvasViewModel) {
     var list by remember { mutableStateOf(false) }
     var at by remember { mutableStateOf(IntOffset.Zero) }
     var rowY by remember { mutableFloatStateOf(0f) }
+    // the Secondary card held: where the press was (in the window), the Uncombine callout under it
+    var callout by remember { mutableStateOf<Offset?>(null) }
     Column(
         Modifier.fillMaxWidth().height(PartsHeight).onGloballyPositioned {
             val p = it.positionInWindow()
@@ -453,7 +474,7 @@ private fun StudioParts(vm: CanvasViewModel) {
         PcPopup(
             textScale = MATCHED_POPUP_TEXT,
             popupPositionProvider = place,
-            onDismissRequest = { if (!list) cards = false },
+            onDismissRequest = { if (!list && callout == null) cards = false },
             properties = androidx.compose.ui.window.PopupProperties(focusable = !list),
         ) {
             Column(Modifier.width(PartCardWidth).clip(RoundedCornerShape(12.dp)).background(StudioTabs), verticalArrangement = Arrangement.spacedBy(PartGap)) {
@@ -468,16 +489,33 @@ private fun StudioParts(vm: CanvasViewModel) {
                     Spacer(Modifier.width(6.dp))
                     Icon(PcIcons.ChevronRight, contentDescription = null, tint = StudioDim, modifier = Modifier.size(24.dp))
                 }
-                PartCard(vm, 1, "Secondary", second = true)
-                Box(
-                    Modifier.fillMaxWidth().height(CombineRow).tap {
-                        cards = false
-                        parting = Unit
-                    }.padding(start = 11.dp),
-                    contentAlignment = Alignment.CenterStart,
-                ) {
-                    Text("Uncombine", color = Pc.Accent, fontSize = 17.sp, maxLines = 1)
-                }
+                PartCard(vm, 1, "Secondary", second = true, onHold = { callout = it })
+            }
+        }
+    }
+    callout?.let { press ->
+        val density = LocalDensity.current
+        val place = remember(press) {
+            object : androidx.compose.ui.window.PopupPositionProvider {
+                override fun calculatePosition(anchorBounds: IntRect, windowSize: IntSize, layoutDirection: LayoutDirection, popupContentSize: IntSize) =
+                    IntOffset((press.x - popupContentSize.width / 2f).roundToInt(), (press.y + with(density) { CalloutDrop.toPx() }).roundToInt())
+            }
+        }
+        PcPopup(
+            textScale = MATCHED_POPUP_TEXT,
+            popupPositionProvider = place,
+            onDismissRequest = { callout = null },
+            properties = androidx.compose.ui.window.PopupProperties(focusable = true),
+        ) {
+            Box(
+                Modifier.size(CalloutWidth, CalloutHeight).clip(RoundedCornerShape(CalloutHeight / 2)).background(CalloutFill).tap {
+                    callout = null
+                    cards = false
+                    parting = Unit
+                },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text("Uncombine", color = CalloutInk, fontSize = 15.sp, maxLines = 1)
             }
         }
     }
@@ -489,11 +527,25 @@ private fun StudioParts(vm: CanvasViewModel) {
     }
 }
 
-/** A part as a card: blue when it shows; tapped, it shows, the cards staying. */
+/** The Uncombine callout a held Secondary card shows: its size, how far under the press it hangs, its light fill and dark word. */
+private val CalloutWidth = 104.dp
+private val CalloutHeight = 36.dp
+private val CalloutDrop = 10.dp
+private val CalloutFill = Color(0xFFE9E9E9)
+private val CalloutInk = Color(0xFF1C1C1C)
+
+/** A part as a card: blue when it shows; tapped, it shows, the cards staying; held, [onHold] gets where (in the window). */
 @Composable
-private fun PartCard(vm: CanvasViewModel, i: Int, name: String, second: Boolean) {
+private fun PartCard(vm: CanvasViewModel, i: Int, name: String, second: Boolean, onHold: ((Offset) -> Unit)? = null) {
     val on = second == vm.studioSecond
-    Box(Modifier.fillMaxWidth().height(PartCardHeight).clip(RoundedCornerShape(12.dp)).background(if (on) Pc.Accent else PartCardFill).tap { vm.showStudioPart(second) }) {
+    var corner by remember { mutableStateOf(Offset.Zero) }
+    val pressing = if (onHold == null) {
+        Modifier.tap { vm.showStudioPart(second) }
+    } else {
+        Modifier.onGloballyPositioned { corner = it.positionInWindow() }
+            .pointerInput(Unit) { detectTapGestures(onTap = { vm.showStudioPart(second) }, onLongPress = { onHold(corner + it) }) }
+    }
+    Box(Modifier.fillMaxWidth().height(PartCardHeight).clip(RoundedCornerShape(12.dp)).background(if (on) Pc.Accent else PartCardFill).then(pressing)) {
         vm.studioParts.getOrNull(i)?.let {
             Image(it, contentDescription = null, contentScale = ContentScale.Fit, modifier = Modifier.fillMaxSize().padding(horizontal = 30.dp, vertical = 20.dp))
         }
@@ -620,7 +672,7 @@ private fun Studio(vm: CanvasViewModel) {
     BoxWithConstraints(
         Modifier.fillMaxSize().background(StudioBack).pointerInput(Unit) { awaitEachGesture { awaitFirstDown().consume() } },
     ) {
-        if (landscape) {
+        if (studioSideBySide(landscape, maxWidth)) {
             // the pages listed by name on a card, the settings beside them, the pad on the right
             Row(Modifier.fillMaxSize()) {
                 StudioPagesCard(vm)
@@ -648,7 +700,8 @@ private fun Studio(vm: CanvasViewModel) {
 /** Portrait: the pages as icons down the left. */
 @Composable
 private fun StudioRail(vm: CanvasViewModel) {
-    Column(Modifier.width(TabsWidth).fillMaxHeight().background(StudioTabs).padding(top = 46.dp)) {
+    // scrolling where the window is too short for all of them (a phone held sideways)
+    Column(Modifier.width(TabsWidth).fillMaxHeight().background(StudioTabs).verticalScroll(rememberScrollState()).padding(top = 46.dp)) {
         STUDIO_TABS.forEachIndexed { i, tab ->
             val on = vm.studioTab == i
             Box(
@@ -1215,15 +1268,29 @@ internal fun StudioSlider(
                 if (!enabled) return@pointerInput
                 awaitEachGesture {
                     val down = awaitFirstDown()
-                    down.consume()
+                    val span = if (both) 2f else 1f
+                    val travel = (size.width - 2 * KNOB_INSET.toPx()).coerceAtLeast(1f)
+                    // landing on the knob it is the slider's at once; elsewhere the first ten points
+                    // either way decide, so a finger scrolling the list over a slider leaves it be
+                    val t = (if (both) (current + 1f) / 2f else current).coerceIn(0f, 1f)
+                    val knob = Offset(KNOB_INSET.toPx() + travel * t, size.height / 2f)
+                    val pen = down.type == PointerType.Stylus || down.type == PointerType.Eraser
+                    val fromKnob = (down.position - knob).getDistance().toDp().value
+                    var owner = listSliderTouch(fromKnob, pen, 0f, 0f)
+                    if (owner == ListSliderTouch.SLIDER) down.consume()
                     var last = down.position.x
                     var v = current
                     while (true) {
                         val ev = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
                         if (!ev.pressed) break
+                        if (owner == ListSliderTouch.UNDECIDED) {
+                            val moved = ev.position - down.position
+                            owner = listSliderTouch(fromKnob, pen, moved.x.toDp().value, moved.y.toDp().value)
+                        }
+                        // the list's: it scrolls, the slider as it was
+                        if (owner == ListSliderTouch.LIST) break
+                        if (owner == ListSliderTouch.UNDECIDED) continue
                         // relative: the knob follows the drag, as far as it travels
-                        val span = if (both) 2f else 1f
-                        val travel = (size.width - 2 * KNOB_INSET.toPx()).coerceAtLeast(1f)
                         v = (v + (ev.position.x - last) / travel * span).coerceIn(if (both) -1f else 0f, 1f)
                         last = ev.position.x
                         change(v)
@@ -1805,7 +1872,8 @@ private fun NodeMenu(points: List<Offset>, index: Int, box: androidx.compose.ui.
     }
 }
 
-private val NodeMenuFill = Color(0xFF101010)
-private val NodeMenuHalo = 16.dp
-private val NodeMenuWidth = 70.dp
-private val NodeMenuRow = 36.dp
+/** A node menu's look (a curve's, the guide editor's handles'): its fill, the room round it for its shadow, its width and its rows' height. */
+internal val NodeMenuFill = Color(0xFF101010)
+internal val NodeMenuHalo = 16.dp
+internal val NodeMenuWidth = 70.dp
+internal val NodeMenuRow = 36.dp

@@ -97,6 +97,7 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -108,10 +109,12 @@ import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import io.github.artcraftandroid.procraft.core.GalleryAction
 
 /**
  * A gallery cell's sizes: its pitch both ways (the screen's width over the columns, three upright
- * and four on its side), the content's width (40 less) and the thumbnail box's height (82 less).
+ * and four on its side, two on a phone: [galleryColumns]), the content's width (40 less) and the
+ * thumbnail box's height (82 less).
  */
 private data class CellSize(val pitch: Dp, val width: Dp, val thumb: Dp)
 
@@ -150,15 +153,18 @@ fun GalleryScreen(vm: CanvasViewModel) {
     var dropOnto by remember { mutableStateOf<String?>(null) }
     val dropPlaces = remember { DropPlaces() }
     var backLit by remember { mutableStateOf(false) }
-    // Select: the artworks picked, by folder
+    // Select: the artworks and stacks picked, by folder
     var selecting by remember { mutableStateOf(false) }
     val selected = remember { mutableStateListOf<String>() }
     var moreOpen by remember { mutableStateOf(false) }
     // Share's formats, open for these artworks
     var sharing by remember { mutableStateOf<GalleryShare?>(null) }
-    // artworks waiting for their PDF's quality
-    var pdfFor by remember { mutableStateOf<List<Artwork>?>(null) }
-    var deletingSelected by remember { mutableStateOf(false) }
+    // artworks waiting for their PDF's quality (several go into one, named as the share says)
+    var pdfFor by remember { mutableStateOf<GalleryShare?>(null) }
+    // a stack swiped to, asked about deleting
+    var deletingStack by remember { mutableStateOf<io.github.artcraftandroid.procraft.gallery.Stack?>(null) }
+    // what Select's Delete is asking about
+    var deletingSelected by remember { mutableStateOf<io.github.artcraftandroid.procraft.gallery.Pick?>(null) }
     var previewing by remember { mutableStateOf<List<Artwork>?>(null) }
     // which of them Preview starts on
     var previewFrom by remember { mutableIntStateOf(0) }
@@ -166,7 +172,12 @@ fun GalleryScreen(vm: CanvasViewModel) {
     var opening by remember { mutableStateOf<PinchOpening?>(null) }
     val context = androidx.compose.ui.platform.LocalContext.current
     val scope = rememberCoroutineScope()
-    fun picked() = vm.artworks.filter { it.dir.name in selected }
+    // what Select's actions act on now (the shared core's rules)
+    fun picked() = vm.store.pick(vm.galleryEntries, selected, vm.openStack != null)
+
+    // several shared as one PDF are named after the stack open, or the one stack picked alone
+    fun shareName(p: io.github.artcraftandroid.procraft.gallery.Pick) =
+        (p.entries.singleOrNull() as? io.github.artcraftandroid.procraft.gallery.Stack)?.name ?: galleryShareName(vm.openStack?.name)
     fun endSelecting() {
         selecting = false
         selected.clear()
@@ -180,6 +191,8 @@ fun GalleryScreen(vm: CanvasViewModel) {
         uri?.let(vm::newFromPicture)
     }
     if (vm.openStack != null && !selecting) BackHandler { vm.showStack(null) }
+    // the band kept clear of the status bar and camera in the gallery's own colour
+    ClearBandShows(Pc.GalleryBackground)
     BoxWithConstraints(Modifier.fillMaxSize().background(Pc.GalleryBackground)) {
         val (screenWidth, screenHeight) = maxWidth to maxHeight
         vm.windowPx = androidx.compose.ui.unit.IntSize(constraints.maxWidth, constraints.maxHeight)
@@ -189,7 +202,30 @@ fun GalleryScreen(vm: CanvasViewModel) {
             if (renaming != null || renamingStack != null || about) tween(300) else tween(150),
             label = "blur",
         )
-        val dropCell = cellSize(screenWidth, if (screenWidth > screenHeight) 4 else 3)
+        // the shared core's columns: by the way the screen is turned, or in a narrow window by its width
+        val columns = io.github.artcraftandroid.procraft.core.galleryColumns(screenWidth.value, screenWidth > screenHeight).toInt()
+        val dropCell = cellSize(screenWidth, columns)
+        // the title row laid out for the window (the shared core's rules): the buttons that fit,
+        // the rest under More, and the title on one line, shrunk to fit beside them
+        val titleText = vm.openStack?.name ?: "ProCraft Diffusion"
+        val titleStyle = androidx.compose.material3.LocalTextStyle.current.merge(androidx.compose.ui.text.TextStyle(fontSize = 36.sp, fontWeight = FontWeight.Bold))
+        val titleMeasurer = androidx.compose.ui.text.rememberTextMeasurer()
+        val titleSize = remember(titleText, titleStyle) { titleMeasurer.measure(titleText, titleStyle, softWrap = false, maxLines = 1).size }
+        val headerDensity = LocalDensity.current
+        val headerConfig = androidx.compose.ui.platform.LocalConfiguration.current
+        val fit = io.github.artcraftandroid.procraft.core.galleryHeaderFit(
+            screenWidth.value,
+            // in a stack the name follows the way back; selecting, it stands alone
+            if (vm.openStack != null && !selecting) 60f else 32f,
+            with(headerDensity) { titleSize.width.toDp().value },
+            selecting,
+            headerConfig.screenWidthDp > headerConfig.screenHeightDp,
+            vm.openStack != null,
+        )
+        val titleHeight = with(headerDensity) { titleSize.height.toDp() }
+        // the middle of More in the title row, for its list to hang from
+        val moreCentre = fit.capsuleLeft.dp + fit.buttons.takeWhile { it.action != GalleryAction.MORE }.sumOf { it.width.toDouble() }.toFloat().dp +
+            (fit.buttons.firstOrNull { it.action == GalleryAction.MORE }?.width ?: 0f).dp / 2
         Column(
             Modifier.fillMaxSize().then(if (blur > 0.dp) Modifier.blur(blur) else Modifier).then(
                 galleryDrop(
@@ -203,38 +239,43 @@ fun GalleryScreen(vm: CanvasViewModel) {
                         dropOnto = null
                     },
                     onMove = vm::moveInGallery,
+                    onTakeOut = vm::takeOutOfStack,
                     onStack = vm::dropOnto,
                     onFiles = vm::importFiles,
                 ),
             ),
         ) {
             if (selecting) {
-                val screen = androidx.compose.ui.platform.LocalConfiguration.current
+                val pick = picked()
                 SelectHeader(
                     title = vm.openStack?.name ?: "ProCraft Diffusion",
-                    count = selected.size,
-                    wide = screen.screenWidthDp > screen.screenHeightDp,
-                    canStack = vm.openStack == null,
+                    fit = fit,
+                    titleHeight = titleHeight,
+                    count = pick.entries.size,
+                    canStack = pick.canStack,
                     onStack = {
-                        vm.stackArtworks(picked())
+                        vm.stackPicked(picked().entries)
                         endSelecting()
                     },
                     onPreview = {
                         previewFrom = 0
-                        previewing = picked()
+                        previewing = picked().artworks
                     },
-                    onShare = { sharing = GalleryShare(picked(), null) },
+                    onShare = { picked().let { p -> sharing = GalleryShare(p.artworks, null, shareName(p)) } },
                     onDuplicate = {
-                        picked().forEach(vm::duplicateArtwork)
+                        vm.duplicateEntries(picked().entries)
                         endSelecting()
                     },
-                    onDelete = { deletingSelected = true },
+                    onDelete = { deletingSelected = picked() },
                     onMore = { moreOpen = !moreOpen },
                     onDone = ::endSelecting,
                 )
             } else {
                 GalleryHeader(
                     stack = vm.openStack?.name,
+                    fit = fit,
+                    titleHeight = titleHeight,
+                    onMore = { moreOpen = !moreOpen },
                     backLit = backLit,
                     onBackPlaced = { dropPlaces.back = it },
                     onBack = { vm.showStack(null) },
@@ -275,7 +316,6 @@ fun GalleryScreen(vm: CanvasViewModel) {
                         Text("Tap + to start a new canvas", color = Pc.GalleryText, fontSize = 17.sp)
                     }
                 } else {
-                    val columns = if (screenWidth > screenHeight) 4 else 3
                     val cell = cellSize(screenWidth, columns)
                     androidx.compose.runtime.CompositionLocalProvider(LocalCell provides cell) {
                     // the whole screen under the header, so artworks flying in from a stack lower down
@@ -301,33 +341,71 @@ fun GalleryScreen(vm: CanvasViewModel) {
                                 )
                                 val view = LocalView.current
                                 val density = androidx.compose.ui.platform.LocalDensity.current
-                                StackCell(
-                                    entry, vm.galleryVersion, dim = selecting, wash = dropOnto == entry.dir.name,
-                                    modifier = Modifier.animateItem(fadeInSpec = null, fadeOutSpec = null).graphicsLayer { alpha = faint.value },
-                                    onPlaced = { stackCellAt[entry.dir.name] = it },
-                                    onDrag = { touch ->
-                                        // its top artwork's picture, lifted, held where the finger is on it
-                                        val placed = stackCellAt[entry.dir.name]
-                                        val top = entry.artworks.firstOrNull()
-                                        if (!selecting && placed != null && top != null) {
-                                            val box = with(density) {
-                                                androidx.compose.ui.geometry.Rect(
-                                                    placed.center.x - cell.width.toPx() / 2f, placed.top + 39.dp.toPx(),
-                                                    placed.center.x + cell.width.toPx() / 2f, placed.top + 39.dp.toPx() + cell.thumb.toPx(),
-                                                )
+                                // swiped open, it fades back and its actions grow in over it, as an artwork's
+                                val open = androidx.compose.animation.core.animateFloatAsState(
+                                    if (swiped == entry.dir.name) 1f else 0f, Motion.swipeActions(), label = "swipe",
+                                ).value
+                                // selecting, a tap picks it (or lets it go), as an artwork's
+                                val stackChosen = entry.dir.name in selected
+                                Box(Modifier.animateItem(fadeInSpec = null, fadeOutSpec = null)) {
+                                    StackCell(
+                                        entry, vm.galleryVersion, chosen = if (selecting) stackChosen else null, wash = dropOnto == entry.dir.name,
+                                        modifier = Modifier.fillMaxWidth().graphicsLayer { alpha = faint.value * (1f - SWIPED_FADE * open.coerceIn(0f, 1f)) },
+                                        onPlaced = { stackCellAt[entry.dir.name] = it },
+                                        onSwipe = { dx, dy -> swipeOpens(dx, dy, selecting)?.let { opens -> swiped = if (opens) entry.dir.name else null } },
+                                        onDrag = { touch ->
+                                            // its top artwork's picture, lifted, held where the finger is on it
+                                            val placed = stackCellAt[entry.dir.name]
+                                            val top = entry.artworks.firstOrNull()
+                                            if (!selecting && placed != null && top != null) {
+                                                val box = with(density) {
+                                                    androidx.compose.ui.geometry.Rect(
+                                                        placed.center.x - cell.width.toPx() / 2f, placed.top + 39.dp.toPx(),
+                                                        placed.center.x + cell.width.toPx() / 2f, placed.top + 39.dp.toPx() + cell.thumb.toPx(),
+                                                    )
+                                                }
+                                                val picture = fitted(box, top)
+                                                val held = (touch - picture.topLeft) * Motion.ARTWORK_LIFTED
+                                                val w = (picture.width * Motion.ARTWORK_LIFTED).toInt()
+                                                val h = (picture.height * Motion.ARTWORK_LIFTED).toInt()
+                                                if (io.github.artcraftandroid.procraft.gallery.startStackDrag(view, entry, w, h, android.graphics.Point(held.x.toInt(), held.y.toInt()))) {
+                                                    dragging = entry.dir.name
+                                                }
                                             }
-                                            val picture = fitted(box, top)
-                                            val held = (touch - picture.topLeft) * Motion.ARTWORK_LIFTED
-                                            val w = (picture.width * Motion.ARTWORK_LIFTED).toInt()
-                                            val h = (picture.height * Motion.ARTWORK_LIFTED).toInt()
-                                            if (io.github.artcraftandroid.procraft.gallery.startStackDrag(view, entry, w, h, android.graphics.Point(held.x.toInt(), held.y.toInt()))) {
-                                                dragging = entry.dir.name
+                                        },
+                                        onRename = {
+                                            // a tap puts away the actions showing; selecting, it picks the stack
+                                            when {
+                                                swiped != null -> swiped = null
+                                                !selecting -> renamingStack = entry
+                                                stackChosen -> selected.remove(entry.dir.name)
+                                                else -> selected.add(entry.dir.name)
                                             }
+                                        },
+                                    ) {
+                                        when {
+                                            swiped != null -> swiped = null
+                                            !selecting -> vm.showStack(entry)
+                                            stackChosen -> selected.remove(entry.dir.name)
+                                            else -> selected.add(entry.dir.name)
                                         }
-                                    },
-                                    onRename = { if (!selecting) renamingStack = entry },
-                                ) {
-                                    if (!selecting) vm.showStack(entry)
+                                    }
+                                    if (open > 0f) {
+                                        // a stack's act on every artwork in it
+                                        SwipeActions(
+                                            open,
+                                            Modifier.align(Alignment.TopCenter).padding(top = 39.dp + cell.thumb / 2 - SwipePillHeight / 2),
+                                            onShare = { at -> sharing = GalleryShare(entry.artworks, at, entry.name) },
+                                            onDuplicate = {
+                                                swiped = null
+                                                vm.duplicateStack(entry)
+                                            },
+                                            onDelete = {
+                                                swiped = null
+                                                deletingStack = entry
+                                            },
+                                        )
+                                    }
                                 }
                                 return@items
                             }
@@ -408,7 +486,7 @@ fun GalleryScreen(vm: CanvasViewModel) {
                                                 }
                                                 val d = moved
                                                 if (d != null) {
-                                                    if (!selecting && kotlin.math.abs(d.x) > kotlin.math.abs(d.y)) swiped = if (d.x < 0f) a.dir.name else null
+                                                    swipeOpens(d.x, d.y, selecting)?.let { opens -> swiped = if (opens) a.dir.name else null }
                                                     return@awaitEachGesture
                                                 }
                                                 if (!held) {
@@ -453,10 +531,13 @@ fun GalleryScreen(vm: CanvasViewModel) {
                                     horizontalAlignment = Alignment.CenterHorizontally,
                                 ) {
                                     Box(
-                                        Modifier.padding(top = 39.dp).size(cell.width, cell.thumb).graphicsLayer {
-                                            scaleX = lift.value
-                                            scaleY = lift.value
-                                        },
+                                        Modifier.padding(top = 39.dp).size(cell.width, cell.thumb)
+                                            // the box it is fitted in, for the cell it will be once its canvas is turned
+                                            .onGloballyPositioned { if (vm.galleryZoom == null) vm.thumbBoxAt[a.dir.name] = it.boundsInWindow() }
+                                            .graphicsLayer {
+                                                scaleX = lift.value
+                                                scaleY = lift.value
+                                            },
                                         contentAlignment = Alignment.BottomCenter,
                                     ) {
                                         // where it is, for zooming into it, unless the gallery is zooming itself
@@ -480,7 +561,7 @@ fun GalleryScreen(vm: CanvasViewModel) {
                                         open,
                                         // centred on the thumbnail's frame
                                         Modifier.align(Alignment.TopCenter).padding(top = 39.dp + cell.thumb / 2 - SwipePillHeight / 2),
-                                        onShare = { at -> sharing = GalleryShare(listOf(a), at) },
+                                        onShare = { at -> sharing = GalleryShare(listOf(a), at, a.name) },
                                         onDuplicate = {
                                             swiped = null
                                             vm.duplicateArtwork(a)
@@ -525,31 +606,56 @@ fun GalleryScreen(vm: CanvasViewModel) {
             }
         }
         if (moreOpen) Box(Modifier.fillMaxSize().pointerInput(Unit) { detectTapGestures { moreOpen = false } })
-        // under More, kept 4 from the screen's edge
-        val morePlace = popoverPlace(250.dp, maxWidth - 20.dp - 44.dp - 13.dp - 61.dp / 2, maxWidth, minRight = 4.dp)
-        MenuPresence(moreOpen, androidx.compose.ui.graphics.TransformOrigin(morePlace.arrowX / 250.dp, 0f)) { look ->
+        // under More, kept 4 from the screen's edge: what the title row has no room for
+        val morePlace = popoverPlace(250.dp, moreCentre, maxWidth, minRight = 4.dp)
+        // Share's formats under Select's Share, or under More when Share is in its list
+        val shareCentre = if (fit.buttons.any { it.action == GalleryAction.SHARE }) selectShareCentre(maxWidth) else moreCentre
+        MenuPresence(moreOpen && fit.more.isNotEmpty(), androidx.compose.ui.graphics.TransformOrigin(morePlace.arrowX / 250.dp, 0f)) { look ->
             val place = morePlace
-            MoreOptions(
-                Modifier.offset(x = place.left, y = 60.dp).then(look),
-                place.arrowX,
-                count = selected.size,
-                canStack = vm.openStack == null,
-                onStack = {
+            val pick = picked()
+            val any = pick.entries.isNotEmpty()
+            val rows = fit.more.map { action ->
+                val label = when (action) {
+                    GalleryAction.SELECT -> "Select"
+                    GalleryAction.IMPORT -> "Import"
+                    GalleryAction.PHOTO -> "Photo"
+                    GalleryAction.STACK -> "Stack"
+                    GalleryAction.PREVIEW -> "Preview"
+                    GalleryAction.SHARE -> "Share"
+                    GalleryAction.DUPLICATE -> "Duplicate"
+                    GalleryAction.DELETE -> "Delete"
+                    GalleryAction.MORE -> "More"
+                }
+                val enabled = when (action) {
+                    GalleryAction.SELECT, GalleryAction.IMPORT, GalleryAction.PHOTO -> true
+                    GalleryAction.STACK -> pick.canStack
+                    else -> any
+                }
+                MoreRow(label, enabled) {
                     moreOpen = false
-                    vm.stackArtworks(picked())
-                    endSelecting()
-                },
-                onPreview = {
-                    moreOpen = false
-                    previewFrom = 0
-                    previewing = picked()
-                },
-                onDuplicate = {
-                    moreOpen = false
-                    picked().forEach(vm::duplicateArtwork)
-                    endSelecting()
-                },
-            )
+                    when (action) {
+                        GalleryAction.SELECT -> selecting = true
+                        GalleryAction.IMPORT -> importFile.launch(arrayOf("*/*"))
+                        GalleryAction.PHOTO -> photo.launch(androidx.activity.result.PickVisualMediaRequest(androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia.ImageOnly))
+                        GalleryAction.STACK -> {
+                            vm.stackPicked(picked().entries)
+                            endSelecting()
+                        }
+                        GalleryAction.PREVIEW -> {
+                            previewFrom = 0
+                            previewing = picked().artworks
+                        }
+                        GalleryAction.SHARE -> picked().let { p -> sharing = GalleryShare(p.artworks, null, shareName(p)) }
+                        GalleryAction.DUPLICATE -> {
+                            vm.duplicateEntries(picked().entries)
+                            endSelecting()
+                        }
+                        GalleryAction.DELETE -> deletingSelected = picked()
+                        GalleryAction.MORE -> {}
+                    }
+                }
+            }
+            MoreOptions(Modifier.offset(x = place.left, y = 60.dp).then(look), place.arrowX, rows)
         }
         // Share's formats: beside a swiped artwork's Share, or under Select's
         var shown by remember { mutableStateOf<GalleryShare?>(null) }
@@ -558,7 +664,7 @@ fun GalleryScreen(vm: CanvasViewModel) {
         shown?.let { share ->
             val density = LocalDensity.current.density
             val from = share.from?.let { r -> androidx.compose.ui.geometry.Rect(r.left / density, r.top / density, r.right / density, r.bottom / density) }
-            val place = formatsPlace(from, maxWidth, maxHeight, selectShareCentre(maxWidth))
+            val place = formatsPlace(from, maxWidth, maxHeight, shareCentre)
             MenuPresence(sharing != null, place.origin) { look ->
                 ImageFormats(Modifier.offset(x = place.left, y = place.top).then(look), place.side, place.arrowAt) { format ->
                     sharing = null
@@ -568,7 +674,7 @@ fun GalleryScreen(vm: CanvasViewModel) {
                         share.artworks.firstOrNull()?.let { vm.openForAnimatedExport(it, animated) }
                         if (selecting) endSelecting()
                     } else if (format == "PDF") {
-                        pdfFor = share.artworks
+                        pdfFor = share
                     } else {
                         // with the export card; a failure is told, a cancel shares nothing
                         vm.viewModelScope.launch {
@@ -579,10 +685,10 @@ fun GalleryScreen(vm: CanvasViewModel) {
             }
         }
         PdfQualityAlert(pdfFor != null, onCancel = { pdfFor = null }) { quality ->
-            val list = pdfFor.orEmpty()
+            val share = pdfFor ?: return@PdfQualityAlert
             pdfFor = null
             vm.viewModelScope.launch {
-                vm.shareFromGallery(list, "PDF", quality.jpeg)?.let { (files, mime) -> runCatching { shareFiles(context, files, mime) } }
+                vm.shareFromGallery(share.artworks, "PDF", quality.jpeg, share.group)?.let { (files, mime) -> runCatching { shareFiles(context, files, mime) } }
             }
         }
         opening?.let { o ->
@@ -595,7 +701,7 @@ fun GalleryScreen(vm: CanvasViewModel) {
                 opening = null
             }
         }
-        previewing?.let { list -> ArtworkPreview(list, vm.galleryVersion, previewFrom) { previewing = null } }
+        previewing?.let { list -> ArtworkPreview(list, vm.galleryVersion, previewFrom, playing = vm.inFront) { previewing = null } }
         // a sheet sliding up over the gallery, and back down
         androidx.compose.animation.AnimatedVisibility(
             vm.customCanvasOpen,
@@ -670,23 +776,36 @@ fun GalleryScreen(vm: CanvasViewModel) {
                         }
                     }
                 },
+                onShareLog = { shareLog(context, vm.viewModelScope) { vm.message = LOG_NOT_READY } },
             ) { about = false }
         }
         RecoveryProgress(recovery, recovered)
     }
 
-    // deleting the picked artworks, or one swiped to
+    // deleting what Select picked (a stack with its artworks), or one swiped to
     Alert(
-        if (deletingSelected) selected.size else null,
-        title = { n -> if (n == 1) "Delete 1 artwork?" else "Delete $n artworks?" },
-        message = { "This can't be undone." },
+        deletingSelected,
+        title = { p -> p.deleteTitle },
+        message = { p -> p.deleteMessage },
         action = "Delete",
         icon = PcIcons.Trash,
-        onCancel = { deletingSelected = false },
-        onAction = {
-            picked().forEach(vm::deleteArtwork)
-            deletingSelected = false
+        onCancel = { deletingSelected = null },
+        onAction = { p ->
+            vm.deleteEntries(p.entries)
+            deletingSelected = null
             endSelecting()
+        },
+    )
+    Alert(
+        deletingStack,
+        title = { st -> "Delete “${st.name}”?" },
+        message = { st -> "Its ${st.artworks.size} artworks go with it. This can't be undone." },
+        action = "Delete",
+        icon = PcIcons.Trash,
+        onCancel = { deletingStack = null },
+        onAction = { st ->
+            vm.deleteStack(st)
+            deletingStack = null
         },
     )
     Alert(
@@ -701,12 +820,39 @@ fun GalleryScreen(vm: CanvasViewModel) {
             deleting = null
         },
     )
+    // an artwork whose opening closed the app last time: opened again only when asked to (it can
+    // be shared, duplicated or deleted from the gallery meanwhile); its log (that run's, kept for
+    // it) shared from here, with no canvas to open for Help's
+    Alert(
+        vm.openingEndedApp,
+        title = { io.github.artcraftandroid.procraft.core.openingEndedAppTitle() },
+        // how that run ended, where Android kept it: short of memory, a crash (the log asked for), or
+        // not known (the log asked for too)
+        message = { o -> io.github.artcraftandroid.procraft.core.openingEndedAppSaidAfter(o.end) },
+        action = "Open Anyway",
+        destructive = false,
+        extra = "Share Log",
+        onExtra = { shareLog(context, vm.viewModelScope) { vm.message = LOG_NOT_READY } },
+        onCancel = { vm.openingEndedApp = null },
+        onAction = { o ->
+            vm.openingEndedApp = null
+            vm.openArtwork(o.artwork, anyway = true, then = o.then)
+        },
+    )
 }
 
-/** The title row: the app's name, the select/import/photo capsule and the new-canvas button. */
+/**
+ * The title row: the app's name (in a stack, the way back and its name), the capsule of Select,
+ * Import and Photo and the new-canvas button, laid out by [fit]: in a narrow window some or all of
+ * the buttons go under More ([onMore]) and the title shrinks to fit ([titleHeight] its height at
+ * its own size), never wrapping.
+ */
 @Composable
 private fun GalleryHeader(
     stack: String?,
+    fit: io.github.artcraftandroid.procraft.core.GalleryHeaderFit,
+    titleHeight: Dp,
+    onMore: () -> Unit,
     backLit: Boolean,
     onBackPlaced: (androidx.compose.ui.geometry.Rect) -> Unit,
     onBack: () -> Unit,
@@ -742,26 +888,33 @@ private fun GalleryHeader(
                 // in a stack: back to the gallery (blue while touched, or while an artwork dragged
                 // rests on it to go back), and the stack's name
                 val touch = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
+                val density = LocalDensity.current
                 val ink = if (heldOf(touch) || backLit) Pc.Accent else Pc.GalleryTitle
                 Row(
-                    Modifier.padding(start = 20.dp, top = 12.dp).height(41.dp).onGloballyPositioned { onBackPlaced(it.boundsInRoot()) }
+                    Modifier.padding(start = 20.dp, top = 12.dp).height(41.dp).onGloballyPositioned {
+                        // a drag takes the way back as the title row's whole height there, from the edge
+                        val b = it.boundsInRoot()
+                        val pad = with(density) { 12.dp.toPx() to 20.dp.toPx() }
+                        onBackPlaced(androidx.compose.ui.geometry.Rect(b.left - pad.second, b.top - pad.first, b.right, b.top - pad.first + with(density) { 55.dp.toPx() }))
+                    }
                         .clickable(touch, indication = null, onClick = onBack),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Box(Modifier.width(40.dp), contentAlignment = Alignment.Center) {
                         Icon(PcIcons.ChevronLeft, contentDescription = "Back", tint = ink, modifier = Modifier.size(28.dp))
                     }
-                    Text(name, color = ink, fontSize = 36.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+                    GalleryTitle(name, ink, fit, Modifier)
                 }
             } else {
-                Text(
-                    "ProCraft Diffusion",
-                    color = Pc.GalleryTitle,
-                    fontSize = 36.sp,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(start = 32.dp, top = 11.dp)
-                        .clickable(remember { androidx.compose.foundation.interaction.MutableInteractionSource() }, indication = null, onClick = onAbout),
-                )
+                // as wide as there is room beside the capsule, the name on one line in it
+                Box(Modifier.padding(start = 32.dp, top = 11.dp).size(fit.titleRoom.dp, titleHeight), contentAlignment = Alignment.CenterStart) {
+                    GalleryTitle(
+                        "ProCraft Diffusion",
+                        Pc.GalleryTitle,
+                        fit,
+                        Modifier.clickable(remember { androidx.compose.foundation.interaction.MutableInteractionSource() }, indication = null, onClick = onAbout),
+                    )
+                }
             }
         }
         Row(Modifier.align(Alignment.TopEnd).padding(top = 10.dp, end = 20.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -769,14 +922,15 @@ private fun GalleryHeader(
                 Modifier.height(45.dp).clip(CircleShape).background(Pc.Capsule).border(1.dp, Pc.CapsuleEdge, CircleShape),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                for ((label, width) in listOf("Select" to 69.dp, "Import" to 71.dp, "Photo" to 66.dp)) {
-                    val action: () -> Unit = when (label) {
-                        "Import" -> onImport
-                        "Photo" -> onPhoto
+                for (b in fit.buttons) {
+                    val action: () -> Unit = when (b.action) {
+                        GalleryAction.IMPORT -> onImport
+                        GalleryAction.PHOTO -> onPhoto
+                        GalleryAction.MORE -> onMore
                         else -> onSelect
                     }
-                    Box(Modifier.width(width).height(45.dp).clickable(onClick = action), contentAlignment = Alignment.Center) {
-                        Text(label, color = Pc.GalleryText, fontSize = 16.sp)
+                    Box(Modifier.width(b.width.dp).height(45.dp).clickable(onClick = action), contentAlignment = Alignment.Center) {
+                        CapsuleLabel(b, fit, Pc.GalleryText)
                     }
                 }
             }
@@ -788,20 +942,44 @@ private fun GalleryHeader(
     }
 }
 
-/** One of Select's buttons: its label, width, whether it can act now, and what it does. */
-private class SelectAction(val label: String, val width: Dp, val enabled: Boolean, val onClick: () -> Unit)
+/** The title's name ([text]), on one line at its size shrunk as [fit] says, cut short if even then too long. */
+@Composable
+private fun GalleryTitle(text: String, ink: Color, fit: io.github.artcraftandroid.procraft.core.GalleryHeaderFit, modifier: Modifier) {
+    Text(
+        text,
+        color = ink,
+        fontSize = 36.sp * fit.titleScale,
+        fontWeight = FontWeight.Bold,
+        maxLines = 1,
+        softWrap = false,
+        overflow = TextOverflow.Ellipsis,
+        modifier = Modifier.widthIn(max = fit.titleRoom.dp).then(modifier),
+    )
+}
+
+/** A capsule button's face: its name, or, More alone in the capsule, its glyph. */
+@Composable
+private fun CapsuleLabel(b: io.github.artcraftandroid.procraft.core.GalleryButton, fit: io.github.artcraftandroid.procraft.core.GalleryHeaderFit, ink: Color) {
+    if (b.action == GalleryAction.MORE && fit.buttons.size == 1) {
+        Icon(PcIcons.More, contentDescription = b.label, tint = ink, modifier = Modifier.size(24.dp))
+    } else {
+        Text(b.label, color = ink, fontSize = 16.sp)
+    }
+}
 
 /**
  * Select's title row: upright, Share, Delete and More; on a wide screen Stack, Preview, Share,
- * Duplicate and Delete side by side ([wide]). Each is dimmed until it can act on the [count]
- * picked artworks (Stack on two or more; More always opens, its rows greyed). Then the blue round
- * button that ends selecting.
+ * Duplicate and Delete side by side (in a stack no Stack); in a narrow window More alone, as [fit]
+ * lays it out. Each is dimmed until it can act on the [count] picked artworks and stacks (Stack on
+ * two or more, [canStack]; More always opens, its rows greyed). Then the blue round button that
+ * ends selecting.
  */
 @Composable
 private fun SelectHeader(
     title: String,
+    fit: io.github.artcraftandroid.procraft.core.GalleryHeaderFit,
+    titleHeight: Dp,
     count: Int,
-    wide: Boolean,
     canStack: Boolean,
     onStack: () -> Unit,
     onPreview: () -> Unit,
@@ -812,24 +990,23 @@ private fun SelectHeader(
     onDone: () -> Unit,
 ) {
     val any = count > 0
-    val actions = if (wide) {
-        listOf(
-            SelectAction("Stack", 65.dp, canStack && count >= 2, onStack),
-            SelectAction("Preview", 80.dp, any, onPreview),
-            SelectAction("Share", 65.dp, any, onShare),
-            SelectAction("Duplicate", 91.dp, any, onDuplicate),
-            SelectAction("Delete", 70.dp, any, onDelete),
-        )
-    } else {
-        listOf(SelectAction("Share", 65.dp, any, onShare), SelectAction("Delete", 70.dp, any, onDelete), SelectAction("More", 61.dp, true, onMore))
-    }
     Box(Modifier.fillMaxWidth().height(55.dp)) {
-        Text(title, color = Pc.GalleryTitle, fontSize = 36.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 32.dp, top = 11.dp))
+        Box(Modifier.padding(start = 32.dp, top = 11.dp).size(fit.titleRoom.dp, titleHeight), contentAlignment = Alignment.CenterStart) {
+            GalleryTitle(title, Pc.GalleryTitle, fit, Modifier)
+        }
         Row(Modifier.align(Alignment.TopEnd).padding(top = 10.dp, end = 20.dp), verticalAlignment = Alignment.CenterVertically) {
             Row(Modifier.height(45.dp).clip(CircleShape).background(Pc.Capsule).border(1.dp, Pc.CapsuleEdge, CircleShape), verticalAlignment = Alignment.CenterVertically) {
-                for (a in actions) {
-                    Box(Modifier.width(a.width).height(45.dp).clickable(enabled = a.enabled, onClick = a.onClick), contentAlignment = Alignment.Center) {
-                        Text(a.label, color = if (a.enabled) Pc.GalleryTitle else Pc.GallerySize, fontSize = 16.sp)
+                for (b in fit.buttons) {
+                    val (enabled, action) = when (b.action) {
+                        GalleryAction.STACK -> canStack to onStack
+                        GalleryAction.PREVIEW -> any to onPreview
+                        GalleryAction.SHARE -> any to onShare
+                        GalleryAction.DUPLICATE -> any to onDuplicate
+                        GalleryAction.DELETE -> any to onDelete
+                        else -> true to onMore
+                    }
+                    Box(Modifier.width(b.width.dp).height(45.dp).clickable(enabled = enabled, onClick = action), contentAlignment = Alignment.Center) {
+                        CapsuleLabel(b, fit, if (enabled) Pc.GalleryTitle else Pc.GallerySize)
                     }
                 }
             }
@@ -880,7 +1057,7 @@ private fun RenameArtwork(a: Artwork, version: Int, from: androidx.compose.ui.ge
         onDone(text.text.trim().ifEmpty { a.name })
     }
     BackHandler(enabled = !closing) { finish() }
-    val ratio = if (a.width > 0 && a.height > 0) a.width.toFloat() / a.height else 0.75f
+    val ratio = a.ratio
     BoxWithConstraints(
         Modifier.fillMaxSize().graphicsLayer { alpha = if (closing) shown else 1f }
             .pointerInput(a) { detectTapGestures { finish() } },
@@ -942,8 +1119,8 @@ private const val DRAGGED_ALPHA = 0.3f
 /** The blue over an artwork (or stack) a dragged artwork would be stacked with. */
 private val DropWash = Color(0x800064DC)
 
-/** How long a dragged artwork rests on a stack (or a stack's way back) before it opens (the gallery). */
-private const val SPRING_MS = 600L
+/** How long a dragged artwork rests on a stack (or a stack's way back) before it opens (the gallery): the shared core's. */
+private val SPRING_MS = io.github.artcraftandroid.procraft.core.gallerySpringMs()
 
 /** Where the gallery's own drags land: the grid showing (its state, and its place and height in the root), and a stack's way back. */
 private class DropPlaces {
@@ -958,8 +1135,10 @@ private val DragScrollEdge = 60.dp
 private val DragScrollStep = 12.dp
 
 /** Artwork [a]'s picture as it sits in its thumbnail's [box]: fitted, standing on the box's bottom. */
-private fun fitted(box: androidx.compose.ui.geometry.Rect, a: Artwork): androidx.compose.ui.geometry.Rect {
-    val ratio = if (a.width > 0 && a.height > 0) a.width.toFloat() / a.height else 0.75f
+private fun fitted(box: androidx.compose.ui.geometry.Rect, a: Artwork): androidx.compose.ui.geometry.Rect = fittedIn(box, a.ratio)
+
+/** A picture [ratio] wide to its height as it sits in a thumbnail's [box]: fitted, standing on the box's bottom. */
+fun fittedIn(box: androidx.compose.ui.geometry.Rect, ratio: Float): androidx.compose.ui.geometry.Rect {
     val w = if (ratio <= box.width / box.height) box.height * ratio else box.width
     val h = w / ratio
     return androidx.compose.ui.geometry.Rect(box.center.x - w / 2f, box.bottom - h, box.center.x + w / 2f, box.bottom)
@@ -997,7 +1176,7 @@ private fun dropAt(grid: androidx.compose.foundation.lazy.grid.LazyGridState, en
  * goes where it is let go. Near the grid's top or bottom the grid scrolls. An artwork resting on a
  * stack opens it ([onOpen]) and, in a stack, on the way back ([onBackLit] meanwhile) opens the
  * gallery ([onBack]), the drag going on, so it can be put in a stack where it is let go, or taken
- * out of one.
+ * out of one; let go on the way back at once, it is taken out to the gallery's front ([onTakeOut]).
  */
 @Composable
 private fun galleryDrop(
@@ -1011,6 +1190,7 @@ private fun galleryDrop(
     onOver: (String?) -> Unit,
     onEnded: () -> Unit,
     onMove: (GalleryEntry, Int) -> Unit,
+    onTakeOut: (GalleryEntry) -> Unit,
     onStack: (Artwork, GalleryEntry) -> Unit,
     onFiles: (List<android.net.Uri>) -> Unit,
 ): Modifier {
@@ -1022,6 +1202,7 @@ private fun galleryDrop(
     val over = androidx.compose.runtime.rememberUpdatedState(onOver)
     val ended = androidx.compose.runtime.rememberUpdatedState(onEnded)
     val move = androidx.compose.runtime.rememberUpdatedState(onMove)
+    val takeOut = androidx.compose.runtime.rememberUpdatedState(onTakeOut)
     val stack = androidx.compose.runtime.rememberUpdatedState(onStack)
     // files dragged in from another app are imported, as Import's
     val files = androidx.compose.runtime.rememberUpdatedState(onFiles)
@@ -1047,6 +1228,9 @@ private fun galleryDrop(
 
             // what it rests on: "" the way back, else a stack (by folder)
             var springOn: String? = null
+
+            // over the way back out of the stack open
+            var onBackNow = false
 
             fun stopSpring() {
                 spring?.cancel()
@@ -1074,7 +1258,8 @@ private fun galleryDrop(
                 val d = e.toAndroidDragEvent()
                 val entry = dragged(e) ?: return
                 val r = Offset(d.x, d.y)
-                if (!inGallery.value && places.back?.contains(r) == true) {
+                onBackNow = !inGallery.value && places.back?.contains(r) == true
+                if (onBackNow) {
                     at = null
                     edge = 0
                     over.value(null)
@@ -1100,6 +1285,7 @@ private fun galleryDrop(
 
             override fun onExited(event: androidx.compose.ui.draganddrop.DragAndDropEvent) {
                 at = null
+                onBackNow = false
                 edge = 0
                 stopSpring()
                 over.value(null)
@@ -1110,6 +1296,11 @@ private fun galleryDrop(
                     val uris = event.droppedFiles(activity)
                     if (uris.isNotEmpty()) files.value(uris)
                     return uris.isNotEmpty()
+                }
+                // let go on the way back before it opened the gallery: out to the gallery's front
+                if (onBackNow && !inGallery.value) {
+                    takeOut.value(e)
+                    return true
                 }
                 val drop = at ?: return true
                 val list = now.value
@@ -1127,6 +1318,7 @@ private fun galleryDrop(
 
             override fun onEnded(event: androidx.compose.ui.draganddrop.DragAndDropEvent) {
                 at = null
+                onBackNow = false
                 edge = 0
                 stopSpring()
                 ended.value()
@@ -1175,8 +1367,11 @@ private fun SwipeActions(open: Float, modifier: Modifier, onShare: (androidx.com
     }
 }
 
-/** Artworks to share, and the swiped Share button's place (window pixels); none from Select. */
-private class GalleryShare(val artworks: List<Artwork>, val from: androidx.compose.ui.geometry.Rect?)
+/**
+ * Artworks to share, the swiped Share button's place (window pixels; none from Select), and what
+ * several of them shared as one PDF are named.
+ */
+private class GalleryShare(val artworks: List<Artwork>, val from: androidx.compose.ui.geometry.Rect?, val group: String)
 
 private val FormatsWidth = 260.dp
 private val FormatsTitleHeight = 55.dp
@@ -1235,33 +1430,42 @@ private fun ImageFormats(modifier: Modifier, side: ArrowSide, arrowAt: Dp, onPic
     }
 }
 
-/** More options for the picked artworks: Preview, Stack (two or more), Duplicate. */
+/** A row of More's list: its name, whether it can act now (else greyed), and what it does. */
+private class MoreRow(val label: String, val enabled: Boolean, val onClick: () -> Unit)
+
+/**
+ * More's list, of what the title row has no room for: selecting, Preview, Stack (two or more;
+ * none in a stack) and Duplicate, and in a narrow window Share and Delete too; else Import and
+ * Photo, and in a narrow window Select too.
+ */
 @Composable
-private fun MoreOptions(modifier: Modifier, arrowX: Dp, count: Int, canStack: Boolean, onStack: () -> Unit, onPreview: () -> Unit, onDuplicate: () -> Unit) {
+private fun MoreOptions(modifier: Modifier, arrowX: Dp, rows: List<MoreRow>) {
     Popover(250.dp, arrowX, modifier, fill = Pc.GalleryPopover) {
         Text("More Options", color = Pc.PanelTitle, fontSize = 24.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 24.dp, top = 14.dp, bottom = 12.dp))
         Column(Modifier.padding(start = 10.dp, end = 10.dp, bottom = 12.dp).clip(RoundedCornerShape(18.dp)).background(Pc.ActionsGroup)) {
-            for ((i, row) in listOf(Triple("Preview", true, onPreview), Triple("Stack", canStack && count >= 2, onStack), Triple("Duplicate", true, onDuplicate)).withIndex()) {
-                val (label, ready, action) = row
-                val enabled = ready && count > 0
+            for ((i, row) in rows.withIndex()) {
                 if (i > 0) Box(Modifier.fillMaxWidth().height(1.dp).background(Pc.ActionsSeparator))
-                Box(Modifier.fillMaxWidth().height(44.dp).clickable(enabled = enabled, onClick = action).padding(start = 16.dp), contentAlignment = Alignment.CenterStart) {
-                    Text(label, color = if (enabled) Pc.PanelTitle else Pc.ActionsDisabled, fontSize = 17.sp)
+                Box(Modifier.fillMaxWidth().height(44.dp).clickable(enabled = row.enabled, onClick = row.onClick).padding(start = 16.dp), contentAlignment = Alignment.CenterStart) {
+                    Text(row.label, color = if (row.enabled) Pc.PanelTitle else Pc.ActionsDisabled, fontSize = 17.sp)
                 }
             }
         }
     }
 }
 
-/** A stack: its newest artwork on two more cards, the name, and how many it holds; a tap opens it. */
+/**
+ * A stack: its newest artwork on two more cards, the name, and how many it holds; a tap opens it.
+ * While selecting ([chosen] not null) its top card has an artwork's mark, filled when picked.
+ */
 @Composable
 private fun StackCell(
     s: io.github.artcraftandroid.procraft.gallery.Stack,
     version: Int,
-    dim: Boolean,
+    chosen: Boolean?,
     wash: Boolean,
     modifier: Modifier,
     onPlaced: (androidx.compose.ui.geometry.Rect) -> Unit,
+    onSwipe: (Float, Float) -> Unit,
     onDrag: (Offset) -> Unit,
     onRename: () -> Unit,
     onOpen: () -> Unit,
@@ -1275,20 +1479,26 @@ private fun StackCell(
         modifier.height(cell.pitch).onGloballyPositioned {
             onPlaced(it.boundsInWindow())
             cellAt[0] = it.positionInWindow()
-        }.pointerInput(s) {
-            // a tap opens it (on its name, renames it); held and moved, it is dragged ([onDrag], with
-            // the finger's place in the window)
+        }.pointerInput(s, chosen) {
+            // a tap opens it (on its name, renames it); moved across, it is swiped ([onSwipe], how
+            // far across and down); held and moved, it is dragged ([onDrag], with the finger's
+            // place in the window)
             awaitEachGesture {
                 val down = awaitFirstDown()
                 var up: androidx.compose.ui.input.pointer.PointerInputChange? = null
-                var moved = false
+                var moved: Offset? = null
                 val held = withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
-                    while (up == null && !moved) {
+                    while (up == null && moved == null) {
                         val c = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
-                        if (!c.pressed) up = c else if ((c.position - down.position).getDistance() > viewConfiguration.touchSlop) moved = true
+                        val d = c.position - down.position
+                        if (!c.pressed) up = c else if (d.getDistance() > viewConfiguration.touchSlop) moved = d
                     }
                     false
                 } ?: true
+                moved?.let { d ->
+                    onSwipe(d.x, d.y)
+                    return@awaitEachGesture
+                }
                 if (!held) {
                     up?.let {
                         it.consume()
@@ -1317,9 +1527,9 @@ private fun StackCell(
                     Box(Modifier.graphicsLayer { rotationZ = turn }, contentAlignment = Alignment.BottomCenter) { Thumbnail(top, version) }
                 }
             }
-            Thumbnail(top, version, wash = wash)
+            Thumbnail(top, version, chosen, wash = wash)
         }
-        Text(s.name, color = if (dim) Pc.GallerySize else Pc.GalleryText, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, modifier = Modifier.padding(top = 12.dp))
+        Text(s.name, color = if (chosen == true) Color.White else Pc.GalleryText, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, modifier = Modifier.padding(top = 12.dp))
         Text("${s.artworks.size} artworks", color = Pc.GallerySize, fontSize = 10.sp)
     }
 }
@@ -1394,14 +1604,16 @@ private fun PinchOpeningOverlay(o: PinchOpening, version: Int, done: (Boolean) -
  * close it, as measured).
  */
 @Composable
-private fun ArtworkPreview(list: List<Artwork>, version: Int, start: Int, onClose: () -> Unit) {
+private fun ArtworkPreview(list: List<Artwork>, version: Int, start: Int, playing: Boolean, onClose: () -> Unit) {
     var index by remember(list, start) { mutableIntStateOf(start) }
     // a tap shows (or hides) the close button and the arrows to the other picked artworks
     var controls by remember { mutableStateOf(false) }
     val a = list.getOrNull(index) ?: return onClose()
     BackHandler(onBack = onClose)
+    // the screen's pixels Preview fills
+    var box by remember { mutableStateOf(IntSize.Zero) }
     Box(
-        Modifier.fillMaxSize().background(Color.Black).pointerInput(list) {
+        Modifier.fillMaxSize().background(Color.Black).onSizeChanged { box = it }.pointerInput(list) {
             var moved = 0f
             detectHorizontalDragGestures(
                 onDragStart = { moved = 0f },
@@ -1418,6 +1630,12 @@ private fun ArtworkPreview(list: List<Artwork>, version: Int, start: Int, onClos
         val image by produceState<ImageBitmap?>(null, a.dir.path, version) {
             value = withContext(Dispatchers.IO) { BitmapFactory.decodeFile(a.thumbnail.path)?.asImageBitmap() }
         }
+        // the artwork itself, as large as it shows: drawn whole on a thread of its own (the
+        // thumbnail, 512 pixels, enlarged till then)
+        val sharp by produceState<ImageBitmap?>(null, a.dir.path, version, box) {
+            value = null
+            if (box.width > 0 && box.height > 0) value = withContext(Dispatchers.Default) { previewPicture(a, box) }
+        }
         // an animated artwork plays as its settings say, its thumbnail showing until its frames are read
         val side = androidx.compose.ui.platform.LocalConfiguration.current.let { with(androidx.compose.ui.platform.LocalDensity.current) { maxOf(it.screenWidthDp, it.screenHeightDp).dp.roundToPx() } }
         val played by produceState<PlayedFrames?>(null, a.dir.path, version) {
@@ -1425,11 +1643,12 @@ private fun ArtworkPreview(list: List<Artwork>, version: Int, start: Int, onClos
             value = withContext(Dispatchers.Default) { readFrames(a.dir.path, side) }
         }
         var frame by remember(played) { mutableStateOf<ImageBitmap?>(null) }
-        androidx.compose.runtime.LaunchedEffect(played) {
+        // (held while the app is away)
+        androidx.compose.runtime.LaunchedEffect(played, playing) {
             val p = played ?: return@LaunchedEffect
             var at = 0u
             var step = 1
-            while (true) {
+            while (playing) {
                 frame = p.pictures.getOrNull(p.order.getOrElse(at.toInt()) { 0 })
                 kotlinx.coroutines.delay(1000L / p.fps.coerceAtLeast(1))
                 // round again, turned back, or (a single pass) staying on its last frame
@@ -1438,7 +1657,8 @@ private fun ArtworkPreview(list: List<Artwork>, version: Int, start: Int, onClos
                 step = next.step
             }
         }
-        (frame ?: image)?.let { ThumbnailImage(it, a.name, ContentScale.Fit) }
+        // (the thumbnail enlarged smoothly while the artwork is drawn, not in squares)
+        (frame ?: sharp ?: image)?.let { ThumbnailImage(it, a.name, ContentScale.Fit, smooth = it === image && previewLoads(a, box)) }
         androidx.compose.animation.AnimatedVisibility(controls, Modifier.fillMaxSize(), enter = androidx.compose.animation.fadeIn(), exit = androidx.compose.animation.fadeOut()) {
             Box(Modifier.fillMaxSize()) {
                 // a light disc with a black cross, 41 in from the top right
@@ -1455,6 +1675,32 @@ private fun ArtworkPreview(list: List<Artwork>, version: Int, start: Int, onClos
             }
         }
     }
+}
+
+/** The gallery thumbnail's longest side (the shared core's project.rs): an artwork shown no larger has its thumbnail to show. */
+private const val THUMBNAIL_SIDE = 512u
+
+/** The longest side [a] is drawn at for Preview filling [box] (pixels), turned as it shows. */
+private fun previewSide(a: Artwork, box: IntSize): UInt {
+    val (w, h) = if (a.turns % 2 != 0) a.height to a.width else a.width to a.height
+    return io.github.artcraftandroid.procraft.core.previewSide(w.coerceAtLeast(1).toUInt(), h.coerceAtLeast(1).toUInt(), box.width.toUInt(), box.height.toUInt())
+}
+
+/** Whether Preview would draw [a] whole for [box]: it shows larger than its thumbnail. */
+private fun previewLoads(a: Artwork, box: IntSize): Boolean = box.width > 0 && box.height > 0 && previewSide(a, box) > THUMBNAIL_SIDE
+
+/**
+ * [a] as Preview shows it filling [box] (pixels): the whole picture at a pixel of its own a screen
+ * pixel, as its thumbnail is made (the shared core's `artwork_preview_png`), never larger than the
+ * screen. None where its thumbnail shows as much, it plays, opening it ended the app before (it
+ * isn't opened again unasked), or it can't be drawn. Slow: the artwork is opened whole, then let go.
+ */
+private fun previewPicture(a: Artwork, box: IntSize): ImageBitmap? {
+    val dir = a.dir.path
+    if (!previewLoads(a, box)) return null
+    if (io.github.artcraftandroid.procraft.core.artworkPlays(dir) || io.github.artcraftandroid.procraft.core.openingEndedApp(dir)) return null
+    val png = io.github.artcraftandroid.procraft.core.artworkPreviewPng(dir, previewSide(a, box)) ?: return null
+    return BitmapFactory.decodeByteArray(png, 0, png.size)?.asImageBitmap()
 }
 
 /** An artwork's frames as read for Preview, and how they play. */
@@ -1480,7 +1726,7 @@ private fun readFrames(dir: String, side: Int): PlayedFrames? {
                 bitmap.asImageBitmap()
             }
         }
-        return PlayedFrames(pictures, s.animationSequence().map { it.toInt() }, settings.fps.toInt(), settings.playback)
+        return PlayedFrames(pictures, s.animationPlayOrder().map { it.toInt() }, settings.fps.toInt(), settings.playback)
     } finally {
         s.destroy()
     }
@@ -1536,13 +1782,13 @@ private fun PreviewArrow(left: Boolean, modifier: Modifier, onClick: () -> Unit)
 private fun thumbnailFilter(image: ImageBitmap, shown: Float, density: Float) =
     if (shown >= image.width * density * 0.999f) FilterQuality.None else FilterQuality.Low
 
-/** An artwork's thumbnail fitted in its box (or filling it, by [scale]), filtered by [thumbnailFilter]. */
+/** An artwork's thumbnail fitted in its box (or filling it, by [scale]), filtered by [thumbnailFilter] (or [smooth]ly). */
 @Composable
-private fun ThumbnailImage(image: ImageBitmap, name: String, scale: ContentScale) {
+private fun ThumbnailImage(image: ImageBitmap, name: String, scale: ContentScale, smooth: Boolean = false) {
     val density = LocalDensity.current.density
     var shown by remember { mutableFloatStateOf(0f) }
     // made again when the filter changes (Image(bitmap) keeps its first)
-    val filter = thumbnailFilter(image, shown, density)
+    val filter = if (smooth) FilterQuality.Low else thumbnailFilter(image, shown, density)
     val painter = remember(image, filter) { androidx.compose.ui.graphics.painter.BitmapPainter(image, filterQuality = filter) }
     Image(
         painter,
@@ -1576,7 +1822,7 @@ private fun Thumbnail(a: Artwork, version: Int, chosen: Boolean? = null, wash: B
         if (decoded != null) ThumbnailsShown.put(a.thumbnail.path, decoded)
         value = decoded ?: value
     }
-    val ratio = if (a.width > 0 && a.height > 0) a.width.toFloat() / a.height else 0.75f
+    val ratio = a.ratio
     val cell = LocalCell.current
     val tall = ratio <= cell.width / cell.thumb
     Box(
@@ -1772,10 +2018,11 @@ private fun Chip(text: String, modifier: Modifier = Modifier) {
 
 /**
  * What the app is, over the gallery (blurred and dimmed under it): its icon 300 across, its name,
- * its version; a round button at the top right closes it, as back does.
+ * its version; a round button at the top right closes it, as back does. The version held shares the
+ * app's log ([onShareLog]): the gallery's way to it with no canvas open, and nothing added to see.
  */
 @Composable
-private fun AboutApp(onRecover: () -> Unit, onClose: () -> Unit) {
+private fun AboutApp(onRecover: () -> Unit, onShareLog: () -> Unit, onClose: () -> Unit) {
     BackHandler(onBack = onClose)
     val context = androidx.compose.ui.platform.LocalContext.current
     val version = remember {
@@ -1795,7 +2042,13 @@ private fun AboutApp(onRecover: () -> Unit, onClose: () -> Unit) {
                 )
             }
             Text("ProCraft Diffusion", color = Color.White, fontSize = 52.sp, fontWeight = FontWeight.Bold, maxLines = 1, modifier = Modifier.padding(top = 12.dp))
-            Text(version, color = AboutInk, fontSize = 13.sp, maxLines = 1, modifier = Modifier.padding(top = 14.dp))
+            Text(
+                version,
+                color = AboutInk,
+                fontSize = 13.sp,
+                maxLines = 1,
+                modifier = Modifier.padding(top = 14.dp).pointerInput(Unit) { detectTapGestures(onLongPress = { onShareLog() }) },
+            )
         }
         Box(
             Modifier.align(Alignment.TopCenter).padding(top = AboutButtonTop).size(220.dp, 38.dp).clip(RoundedCornerShape(8.dp))

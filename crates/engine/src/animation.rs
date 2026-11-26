@@ -106,6 +106,17 @@ pub fn frames(doc: &Document) -> Vec<LayerId> {
     doc.members(None).into_iter().filter(|id| doc.layer(*id).is_some_and(|l| l.visible)).collect()
 }
 
+/// The frames that play, as indices into [`frames`] (`count` of them): all but a background frame
+/// (the first) and a foreground frame (the last, not with pages), which show with each of them
+/// instead. A background alone, or a background and a foreground alone, leave none.
+pub fn played(a: Option<&Animation>, count: usize) -> std::ops::Range<usize> {
+    let Some(a) = a else { return 0..count };
+    let start = usize::from(a.background).min(count);
+    let foreground = a.foreground && !a.pages && count > 1;
+    let end = count - usize::from(foreground);
+    start..end.max(start)
+}
+
 /// The frame holding the current layer.
 pub fn current_frame(doc: &Document) -> Option<usize> {
     let mut id = doc.current();
@@ -172,6 +183,29 @@ mod tests {
         let p = Animation { pages: true, ..b };
         assert_eq!(look(&p, 0, 6, 3, false), FrameLook::Shown);
         assert_eq!(look(&p, 5, 6, 3, false), FrameLook::Hidden);
+    }
+
+    #[test]
+    fn a_background_and_a_foreground_frame_do_not_play() {
+        let a = Animation::default();
+        assert_eq!(played(None, 4), 0..4);
+        assert_eq!(played(Some(&a), 4), 0..4);
+        let back = Animation { background: true, ..a.clone() };
+        assert_eq!(played(Some(&back), 4), 1..4);
+        let front = Animation { foreground: true, ..a.clone() };
+        assert_eq!(played(Some(&front), 4), 0..3);
+        let both = Animation { background: true, foreground: true, ..a.clone() };
+        assert_eq!(played(Some(&both), 4), 1..3);
+        // a background alone, or with a foreground, leaves nothing to play; a lone frame is no
+        // foreground
+        assert!(played(Some(&back), 1).is_empty());
+        assert!(played(Some(&both), 2).is_empty());
+        assert!(played(Some(&both), 1).is_empty());
+        assert_eq!(played(Some(&front), 1), 0..1);
+        assert!(played(Some(&both), 0).is_empty());
+        // pages have a background page but no foreground
+        let pages = Animation { pages: true, ..both };
+        assert_eq!(played(Some(&pages), 4), 1..4);
     }
 
     #[test]

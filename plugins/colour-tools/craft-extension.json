@@ -1,0 +1,41 @@
+{
+  "schema": 1,
+  "id": "io.github.artcraftandroid.colour-tools",
+  "name": "Colour tools",
+  "version": "1.1.0",
+  "holds": ["hooks"],
+  "publisher": {"name": "ProCraft"},
+  "description": "A colour triangle in Classic, colour labels on layers and ColorDrop tools, each with a switch of its own.",
+  "compat": {"procraft": {"interface": 16}},
+  "permissions": ["artwork.read", "artwork.write", "panel"],
+  "hooks": ["picker", "floating_picker_only", "layer_label", "fill_all_layers", "fill_mask"],
+  "controls": [
+    {"key": "colour_triangle", "type": "feature", "label": "Colour triangle", "description": "The colour panel's Classic tab picks saturation and brightness in a triangle instead of a square, with the hue on a ring round it if you like, switched from a menu in its corner.", "hooks": ["picker", "floating_picker_only"]},
+    {"key": "triangle", "type": "switch", "label": "Triangle in Classic", "starts": true, "under": "colour_triangle"},
+    {"key": "ring", "type": "switch", "label": "Hue ring around the triangle", "under": "triangle"},
+    {"key": "picker_only", "type": "switch", "label": "Picker only in the floating window", "under": "triangle"},
+    {"key": "colour_labels", "type": "feature", "label": "Colour labels", "description": "Gives a layer or a group a colour label, one of eight, from Colour label in its options; the label shows on its row in the Layers panel and is saved with the artwork.", "hooks": ["layer_label"]},
+    {"key": "colordrop", "type": "feature", "label": "ColorDrop tools", "description": "ColorDrop fills up to the lines on every layer you see, and keeps out of gaps in your lines.", "hooks": ["fill_all_layers", "fill_mask"]},
+    {"key": "all_layers", "type": "switch", "label": "ColorDrop fills by all layers", "under": "colordrop"},
+    {"key": "gap_closing", "type": "switch", "label": "ColorDrop gap closing", "under": "colordrop"},
+    {"key": "gap", "type": "slider", "label": "Gap", "least": 0, "most": 32, "step": 1, "starts": 0, "unit": " px", "at_least": "Off", "keeps": "fill_gap", "under": "gap_closing"}
+  ],
+  "actions": [
+    {"key": "label", "label": "Colour label", "place": "layer", "under": "colour_labels"}
+  ],
+  "menu": {
+    "place": "classic", "under": "colour_triangle",
+    "choices": [
+      {"key": "square", "label": "Square", "icon": "M21 4.4L20.97 4.13L20.89 3.86L20.76 3.62L20.59 3.41L20.38 3.24L20.14 3.11L19.87 3.03L19.6 3L4.4 3L4.13 3.03L3.86 3.11L3.62 3.24L3.41 3.41L3.24 3.62L3.11 3.86L3.03 4.13L3 4.4L3 19.6L3.03 19.87L3.11 20.14L3.24 20.38L3.41 20.59L3.62 20.76L3.86 20.89L4.13 20.97L4.4 21L19.6 21L19.87 20.97L20.14 20.89L20.38 20.76L20.59 20.59L20.76 20.38L20.89 20.14L20.97 19.87L21 19.6Z", "sets": {"triangle": false}},
+      {"key": "triangle", "label": "Triangle", "icon": "M20.13 18.3L12.76 5.55L12.46 5.31L12.1 5.21L11.72 5.24L11.54 5.31L11.24 5.55L11.13 5.7L3.87 18.3L3.74 18.66L3.76 19.04L3.92 19.38L4.19 19.64L4.36 19.73L4.73 19.8L19.27 19.8L19.64 19.73L19.81 19.64L20.08 19.38L20.18 19.22L20.27 18.85L20.21 18.47Z", "sets": {"triangle": true, "ring": false}},
+      {"key": "ring", "label": "Hue ring", "icon": "M12.45 7.81L12.27 7.67L12.17 7.62L11.94 7.6L11.73 7.67L11.55 7.81L11.48 7.9L7.67 14.5L7.6 14.71L7.61 14.94L7.7 15.15L7.87 15.3L7.97 15.36L8.19 15.4L15.81 15.4L16.03 15.36L16.13 15.3L16.3 15.15L16.39 14.94L16.41 14.83L16.4 14.71L16.33 14.5ZM21.81 10.05L21.57 9.1L21.24 8.17L20.82 7.29L20.31 6.44L19.73 5.66L19.07 4.93L18.34 4.27L17.56 3.69L16.71 3.18L15.83 2.76L14.9 2.43L13.95 2.19L12.98 2.05L12 2L11.02 2.05L10.05 2.19L9.1 2.43L8.17 2.76L7.29 3.18L6.44 3.69L5.66 4.27L4.93 4.93L4.27 5.66L3.69 6.44L3.18 7.29L2.76 8.17L2.43 9.1L2.19 10.05L2.05 11.02L2 12L2.05 12.98L2.19 13.95L2.43 14.9L2.76 15.83L3.18 16.71L3.69 17.56L4.27 18.34L4.93 19.07L5.66 19.73L6.44 20.31L7.29 20.82L8.17 21.24L9.1 21.57L10.05 21.81L11.02 21.95L12 22L12.98 21.95L13.95 21.81L14.9 21.57L15.83 21.24L16.71 20.82L17.56 20.31L18.34 19.73L19.07 19.07L19.73 18.34L20.31 17.56L20.82 16.71L21.24 15.83L21.57 14.9L21.81 13.95L21.95 12.98L22 12L21.95 11.02ZM19.45 13.48L19.27 14.21L19.02 14.91L18.7 15.58L18.32 16.22L17.87 16.82L17.37 17.37L16.82 17.87L16.22 18.32L15.58 18.7L14.91 19.02L14.21 19.27L13.48 19.45L12.74 19.56L12 19.6L11.26 19.56L10.52 19.45L9.79 19.27L9.09 19.02L8.42 18.7L7.78 18.32L7.18 17.87L6.63 17.37L6.13 16.82L5.68 16.22L5.3 15.58L4.98 14.91L4.73 14.21L4.55 13.48L4.44 12.74L4.4 12L4.44 11.26L4.55 10.52L4.73 9.79L4.98 9.09L5.3 8.42L5.68 7.78L6.13 7.18L6.63 6.63L7.18 6.13L7.78 5.68L8.42 5.3L9.09 4.98L9.79 4.73L10.52 4.55L11.26 4.44L12 4.4L12.74 4.44L13.48 4.55L14.21 4.73L14.91 4.98L15.58 5.3L16.22 5.68L16.82 6.13L17.37 6.63L17.87 7.18L18.32 7.78L18.7 8.42L19.02 9.09L19.27 9.79L19.45 10.52L19.56 11.26L19.6 12L19.56 12.74Z", "sets": {"triangle": true, "ring": true}}
+    ]
+  },
+  "replaces": [
+    {"id": "io.github.artcraftandroid.colour-triangle", "switch": "colour_triangle", "controls": {"triangle": "triangle", "ring": "ring", "picker_only": "picker_only"}},
+    {"id": "io.github.artcraftandroid.colour-labels", "switch": "colour_labels", "marks": true},
+    {"id": "io.github.artcraftandroid.colordrop-tools", "switch": "colordrop", "controls": {"all_layers": "all_layers", "gap_closing": "gap_closing"}},
+    {"id": "io.github.artcraftandroid.fill-all-layers", "switch": "all_layers"},
+    {"id": "io.github.artcraftandroid.gap-closing", "switch": "gap_closing"}
+  ]
+}

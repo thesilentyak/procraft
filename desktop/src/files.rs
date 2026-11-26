@@ -100,7 +100,7 @@ pub fn app_dir() -> PathBuf {
 
 /// Shows a passing message with an OK button.
 pub fn say(text: &str) {
-    MessageDialog::new().set_level(MessageLevel::Info).set_title(crate::APP_NAME).set_description(text).show();
+    message().set_level(MessageLevel::Info).set_title(crate::APP_NAME).set_description(text).show();
 }
 
 /// Whether the file at `path` holds brushes, by its name (a zip by what it holds): ours (a brush,
@@ -139,21 +139,19 @@ pub fn keep_pending_brushes(paths: &[PathBuf]) -> bool {
     kept
 }
 
-/// The brush files kept while no canvas was open, oldest first, each with its own name; taken
-/// out of the folder.
-pub fn take_pending_brushes() -> Vec<(Vec<u8>, String)> {
+/// The brush files kept while no canvas was open, oldest first, each with its own name, to be
+/// read where they are and then taken out of the folder.
+pub fn take_pending_brushes() -> Vec<crate::library::BrushFileIn> {
     let Ok(read) = std::fs::read_dir(pending_brushes_dir()) else { return Vec::new() };
     let mut paths: Vec<PathBuf> = read.filter_map(|e| e.ok().map(|e| e.path())).collect();
     paths.sort();
     paths
         .into_iter()
         .filter_map(|path| {
-            let bytes = std::fs::read(&path).ok();
-            let _ = std::fs::remove_file(&path);
             let kept = path.file_name()?.to_string_lossy().into_owned();
             // the name it came with, after the stamp and the number
             let name = kept.splitn(3, '-').nth(2).unwrap_or(&kept).to_owned();
-            Some((bytes?, name))
+            Some(crate::library::BrushFileIn { path, name, taken: true })
         })
         .collect()
 }
@@ -172,7 +170,7 @@ pub fn tell(title: &str, text: &str) {
             return;
         }
     }
-    MessageDialog::new().set_level(MessageLevel::Error).set_title(title).set_description(text).show();
+    message().set_level(MessageLevel::Error).set_title(title).set_description(text).show();
 }
 
 /// Whether `program` can be run here.
@@ -224,6 +222,25 @@ pub fn exporting_since() -> Option<std::time::Instant> {
     writing.iter().filter(|(_, from_canvas, w)| *from_canvas && !w.is_finished()).map(|(since, ..)| *since).min()
 }
 
+/// Keeps `session`'s brushes on a thread of their own (a library with many brushes brought in is
+/// tens of megabytes), among the writes the app waits for as it ends: closed meanwhile, the
+/// library is written whole, not cut short and left as it was before.
+pub fn keep_brushes_meanwhile(session: &Arc<procraft_core::CanvasSession>) {
+    let kept = Arc::clone(session);
+    let thread = std::thread::Builder::new().name("procraft-keep-brushes".to_owned());
+    match thread.spawn(move || keep_brushes(&kept)) {
+        Ok(started) => {
+            let mut writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+            writing.retain(|(.., w)| !w.is_finished());
+            writing.push((std::time::Instant::now(), false, started));
+        }
+        Err(e) => {
+            log::warn!("keeping the brushes on a thread of their own: {e}");
+            keep_brushes(session);
+        }
+    }
+}
+
 /// Waits for the files still being written.
 pub fn finish_writing() {
     let writing = std::mem::take(&mut *WRITING.lock().unwrap_or_else(|e| e.into_inner()));
@@ -266,7 +283,7 @@ pub fn tell_what_was_told() {
 pub fn save_file(bytes: &[u8], name: &str, extension: &str, kind: &str) {
     let safe: String = name.chars().map(|c| if c.is_alphanumeric() || " _-".contains(c) { c } else { '_' }).collect();
     let safe = if safe.trim().is_empty() { "Brush".to_owned() } else { safe };
-    let Some(path) = FileDialog::new()
+    let Some(path) = dialog()
         .set_title(format!("Share {kind}"))
         .add_filter(kind, &[extension])
         .set_file_name(format!("{safe}.{extension}"))
@@ -282,7 +299,29 @@ pub fn save_file(bytes: &[u8], name: &str, extension: &str, kind: &str) {
 
 /// A sound the user picks (titled `title`): a WAV file, read whole, with its name.
 pub fn pick_sound(title: &str) -> Option<(Vec<u8>, String)> {
-    let path = FileDialog::new().set_title(title).add_filter("Sounds", &["wav", "wave"]).pick_file()?;
+    let path = dialog().set_title(title).add_filter("Sounds", &["wav", "wave"]).pick_file()?;
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    match std::fs::read(&path) {
+        Ok(bytes) => Some((bytes, name)),
+        Err(_) => {
+            say("This file could not be read.");
+            None
+        }
+    }
+}
+
+/// A folder the user picks (titled `title`) for a plugin's folder control: where it is, and its
+/// name.
+pub fn pick_plugin_folder(title: &str) -> Option<(String, String)> {
+    let path = dialog().set_title(title).pick_folder()?;
+    let name =
+        path.file_name().map_or_else(|| path.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
+    Some((path.to_string_lossy().into_owned(), name))
+}
+
+/// A picture the user picks (titled `title`), a PNG or a JPEG, read whole, with its name.
+pub fn pick_control_picture(title: &str) -> Option<(Vec<u8>, String)> {
+    let path = dialog().set_title(title).add_filter("Pictures", &["png", "jpg", "jpeg"]).pick_file()?;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     match std::fs::read(&path) {
         Ok(bytes) => Some((bytes, name)),
@@ -294,8 +333,15 @@ pub fn pick_sound(title: &str) -> Option<(Vec<u8>, String)> {
 }
 
 /// A file the user picks (titled `title`), read whole, with its name.
+/// A file the user picks, and its name; none if they pick none.
+pub fn pick_path(title: &str) -> Option<(PathBuf, String)> {
+    let path = dialog().set_title(title).pick_file()?;
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    Some((path, name))
+}
+
 pub fn pick_file(title: &str) -> Option<(Vec<u8>, String)> {
-    let path = FileDialog::new().set_title(title).pick_file()?;
+    let path = dialog().set_title(title).pick_file()?;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     match std::fs::read(&path) {
         Ok(bytes) => Some((bytes, name)),
@@ -342,29 +388,6 @@ pub fn keep_gestures(kept: &KeptGestures) {
     keep_text("gestures", &(lines.join("\n") + "\n"));
 }
 
-/// The brush colour and the one masks paint with as they were last left (hue, saturation and
-/// brightness, 0..1), if they were kept.
-pub fn kept_colours() -> Option<([f32; 3], [f32; 3])> {
-    let text = std::fs::read_to_string(app_dir().join("colour")).ok()?;
-    let v: Vec<f32> = text
-        .split_whitespace()
-        .filter_map(|t| t.parse::<f32>().ok())
-        .filter(|x| x.is_finite())
-        .map(|x| x.clamp(0.0, 1.0))
-        .collect();
-    match v[..] {
-        [h, s, b, mh, ms, mb] => Some(([h, s, b], [mh, ms, mb])),
-        [h, s, b] => Some(([h, s, b], [0.0; 3])),
-        _ => None,
-    }
-}
-
-pub fn keep_colours(brush: [f32; 3], mask: [f32; 3]) {
-    let [h, s, b] = brush;
-    let [mh, ms, mb] = mask;
-    keep_text("colour", &format!("{h} {s} {b} {mh} {ms} {mb}"));
-}
-
 /// The QuickMenu's buttons kept, as the core writes them.
 pub fn kept_quick_menu() -> Option<String> {
     std::fs::read_to_string(app_dir().join("quick_menu")).ok().map(|s| s.trim().to_owned())
@@ -395,8 +418,10 @@ pub fn keep_text(name: &str, text: &str) {
 /// renamed over it, so a write cut short leaves the last one.
 pub fn write_whole(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     let next = path.with_extension("next");
-    std::fs::write(&next, bytes)?;
-    std::fs::rename(&next, path)
+    // (one cut short, the disk full, goes: it would only take room)
+    std::fs::write(&next, bytes).and_then(|()| std::fs::rename(&next, path)).inspect_err(|_| {
+        let _ = std::fs::remove_file(&next);
+    })
 }
 
 /// A new artwork as `preset` says: its size, DPI, background and colour profile.
@@ -417,10 +442,27 @@ pub fn keep_preset_time_lapse(preset: &CanvasPreset, dir: &str) {
     });
 }
 
+/// A new artwork saved into its gallery folder `dir` at once, on a thread of its own, as the
+/// tablets save one: it is in the gallery from the moment it is made, not only from its first
+/// change (the app may be ended before that is kept). One opened from the gallery is there
+/// already: nothing is done. The thread, if one was started.
+pub fn keep_new_artwork(session: &Arc<CanvasSession>, dir: &str) -> Option<std::thread::JoinHandle<()>> {
+    if Path::new(dir).join("artwork.json").exists() {
+        return None;
+    }
+    let (session, dir) = (Arc::clone(session), dir.to_owned());
+    let started = std::thread::Builder::new().name("first save".into()).spawn(move || {
+        if let Err(e) = session.save(dir) {
+            log::error!("saving a new artwork: {e}");
+        }
+    });
+    started.inspect_err(|e| log::error!("saving a new artwork: {e}")).ok()
+}
+
 /// A colour profile the user picks (an .icc file), added to those a canvas can be in; its name, or
 /// none (said so) if it isn't one.
 pub fn import_profile() -> Option<String> {
-    let path = FileDialog::new().set_title("Import").add_filter("Color profiles", &["icc", "icm"]).pick_file()?;
+    let path = dialog().set_title("Import").add_filter("Color profiles", &["icc", "icm"]).pick_file()?;
     let name = std::fs::read(path).ok().and_then(procraft_core::import_profile);
     if name.is_none() {
         tell("Can't import", "This file isn't a color profile.");
@@ -437,16 +479,13 @@ pub fn is_plugin_file(path: &Path) -> bool {
 
 /// A plugin file the user picks.
 pub fn pick_plugin() -> Option<PathBuf> {
-    FileDialog::new()
-        .set_title("Import")
-        .add_filter("ProCraft plugins", &["procraft-plugin", "procraftplugin"])
-        .pick_file()
+    dialog().set_title("Import").add_filter("ProCraft plugins", &["procraft-plugin", "procraftplugin"]).pick_file()
 }
 
 /// A picture the user picks (PNG, JPEG, WebP, GIF, BMP or TIFF), to make a new artwork of
 /// ([`picture_artwork`]).
 pub fn pick_picture() -> Option<PathBuf> {
-    FileDialog::new()
+    dialog()
         .set_title("Photo")
         .add_filter("Pictures", &["png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff"])
         .pick_file()
@@ -517,7 +556,7 @@ pub fn pick_artwork_files(more: &[&str]) -> Option<Vec<PathBuf>> {
         "tiff",
     ];
     let all: Vec<&str> = artworks.iter().chain(more).copied().collect();
-    FileDialog::new().set_title("Import").add_filter("Artworks and models", &all).pick_files()
+    dialog().set_title("Import").add_filter("Artworks and models", &all).pick_files()
 }
 
 /// The artwork in the files `paths` (picked, or dropped on the gallery): a layered package, a
@@ -563,6 +602,10 @@ fn open_model_artwork(path: &Path) -> Result<Arc<CanvasSession>, String> {
         return Err("This file can't be opened.".to_owned());
     }
     let opened = CanvasSession::open(dir).map_err(|e| e.to_string());
+    // its layers' files read before their folder goes (they are read as the canvas is made)
+    if let Ok(session) = &opened {
+        session.hold_opened_files();
+    }
     let _ = std::fs::remove_dir_all(&work);
     opened
 }
@@ -591,7 +634,10 @@ fn open_pdf(path: &Path, name: &str) -> Result<Arc<CanvasSession>, String> {
                 dir.clone(),
                 name.to_owned(),
             ) {
-                PagesOutcome::Imported => CanvasSession::open(dir).map_err(|e| e.to_string()),
+                PagesOutcome::Imported => CanvasSession::open(dir).map_err(|e| e.to_string()).inspect(|s| {
+                    // its layers' files read before their folder goes
+                    s.hold_opened_files();
+                }),
                 PagesOutcome::TooManyPages { most } => {
                     Err(format!("This PDF has more pages than a canvas its size can hold as layers ({most})."))
                 }
@@ -626,8 +672,14 @@ fn open_psd(path: &Path, name: &str) -> Result<Arc<CanvasSession>, String> {
     let _ = std::fs::remove_dir_all(&dir);
     let outcome = import_psd(path.to_string_lossy().into_owned(), dir.to_string_lossy().into_owned(), name.to_owned());
     let opened = match outcome {
-        PsdOutcome::Imported => CanvasSession::open(dir.to_string_lossy().into_owned()).map_err(|e| e.to_string()),
+        PsdOutcome::Imported => {
+            CanvasSession::open(dir.to_string_lossy().into_owned()).map_err(|e| e.to_string()).inspect(|s| {
+                // its layers' files read before their folder goes (they are read as the canvas is made)
+                s.hold_opened_files();
+            })
+        }
         PsdOutcome::TooManyLayers { most } => Err(format!("It has more layers than a canvas its size holds ({most}).")),
+        PsdOutcome::TooLarge => Err("Its canvas is larger than this computer can hold.".into()),
         PsdOutcome::Unsupported => {
             Err("This kind of PSD isn't read (bitmap, indexed, Lab or 32 bits a channel).".into())
         }
@@ -681,7 +733,7 @@ pub fn read_png(path: &Path) -> Result<ThumbnailImage, String> {
 
 /// Shows the app's name and version.
 pub fn about() {
-    MessageDialog::new()
+    message()
         .set_level(MessageLevel::Info)
         .set_title(crate::APP_NAME)
         .set_description(format!("Version {}", env!("PROCRAFT_VERSION")))
@@ -695,7 +747,7 @@ pub fn save(session: &Arc<CanvasSession>, ui: &mut Interface, ask: bool) {
     let path = match ui.path.clone().filter(|_| !ask) {
         Some(p) => p,
         None => {
-            let Some(p) = FileDialog::new()
+            let Some(p) = dialog()
                 .set_title("Save")
                 .add_filter("ProCraft artwork", &["procraft"])
                 .set_file_name(format!("{}.procraft", session.name()))
@@ -718,6 +770,60 @@ pub fn save(session: &Arc<CanvasSession>, ui: &mut Interface, ask: bool) {
 
 /// Writes the artwork as `format` where the user picks, its card showing how far it has come;
 /// cancelled, nothing is left there.
+/// The app's window, which the file dialogs belong to, and the thread that runs it.
+static DIALOG_PARENT: std::sync::OnceLock<(Arc<winit::window::Window>, std::thread::ThreadId)> =
+    std::sync::OnceLock::new();
+
+/// The app's `window`, once it is made (on its own thread): the file dialogs open over it from
+/// then on.
+pub fn dialogs_over(window: &Arc<winit::window::Window>) {
+    let _ = DIALOG_PARENT.set((Arc::clone(window), std::thread::current().id()));
+}
+
+/// The app's window, if this is the thread that runs it: a dialog owned by it from any other
+/// thread could wait on that thread while it waits on the dialog.
+#[cfg(windows)]
+fn dialog_parent() -> Option<&'static winit::window::Window> {
+    DIALOG_PARENT.get().filter(|(_, thread)| *thread == std::thread::current().id()).map(|(window, _)| &**window)
+}
+
+/// A file dialog. On Windows it belongs to the app's window, so it opens in front of it (full
+/// screen too) and the window waits behind it, never left blocked on a dialog that opened unseen
+/// behind it.
+pub fn dialog() -> FileDialog {
+    let dialog = FileDialog::new();
+    #[cfg(windows)]
+    if let Some(window) = dialog_parent() {
+        return dialog.set_parent(window);
+    }
+    dialog
+}
+
+/// Shows the file at `path` in the system's file manager (its folder, on Linux), for the person to
+/// send it on.
+pub fn reveal(path: &Path) {
+    let shown = if cfg!(windows) {
+        std::process::Command::new("explorer").arg("/select,").arg(path).spawn()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg("-R").arg(path).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(path.parent().unwrap_or(path)).spawn()
+    };
+    if let Err(e) = shown {
+        log::warn!("showing the log: {e}");
+    }
+}
+
+/// A message box, belonging to the app's window as [`dialog`]s do.
+fn message() -> MessageDialog {
+    let message = MessageDialog::new();
+    #[cfg(windows)]
+    if let Some(window) = dialog_parent() {
+        return message.set_parent(window);
+    }
+    message
+}
+
 pub fn export(
     session: &Arc<CanvasSession>,
     format: Format,
@@ -732,7 +838,7 @@ pub fn export(
     if matches!(format, Format::LayerPngs | Format::ChosenLayerPngs | Format::ModelTextures) {
         let title =
             if format == Format::ModelTextures { "Share textures as PNG files" } else { "Share layers as PNG files" };
-        let Some(dir) = FileDialog::new().set_title(title).pick_folder() else { return };
+        let Some(dir) = dialog().set_title(title).pick_folder() else { return };
         let dir = dir.to_string_lossy().into_owned();
         writing(session, card, "Can't share", move |session| {
             match format {
@@ -744,7 +850,7 @@ pub fn export(
         });
         return;
     }
-    let Some(path) = FileDialog::new()
+    let Some(path) = dialog()
         .set_title(format!("Export {}", format.name()))
         .add_filter(format.name(), &[format.extension()])
         .set_file_name(format!("{}.{}", export_file_name(session.name(), format.package()), format.extension()))
@@ -788,7 +894,7 @@ pub fn export_plugin(session: &Arc<CanvasSession>, key: &str, card: &mut crate::
     }
     let Some(export) = session.plugin_exports().into_iter().find(|e| e.key == key) else { return };
     let extension = export.extension.clone();
-    let Some(path) = FileDialog::new()
+    let Some(path) = dialog()
         .set_title(format!("Export {}", export.label))
         .add_filter(export.label.as_str(), &[extension.as_str()])
         .set_file_name(format!("{}.{extension}", export_file_name(session.name(), false)))
@@ -821,7 +927,13 @@ fn writing(
     let exporting = card.start(move || following.export_progress());
     let session = Arc::clone(session);
     write_meanwhile(true, move || {
-        let written = write(&session);
+        // a panic on the way (the GPU's driver, or wgpu on a device lost) is said as any failure,
+        // the card let go, not left turning
+        let written =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| write(&session))).unwrap_or_else(|panic| {
+                let reason = format!("it stopped: {}", procraft_gpu::panic_message(panic.as_ref()));
+                Err(procraft_core::MobileError::File { reason })
+            });
         let placed = written.map_err(|e| e.to_string()).and_then(|files| place_written(&files, exporting.cancelled()));
         match placed {
             Ok(made) => exporting.ended(made),
@@ -870,7 +982,7 @@ pub fn share_artworks(
     let extension = format.extension();
     let file_name = |name: &str| export_file_name(name.to_owned(), false);
     let targets: Vec<(procraft_core::GalleryArtwork, PathBuf)> = if let [one] = list {
-        let Some(path) = FileDialog::new()
+        let Some(path) = dialog()
             .set_title(format!("Share {}", format.name()))
             .add_filter(format.name(), &[extension])
             .set_file_name(format!("{}.{extension}", file_name(&one.name)))
@@ -880,7 +992,7 @@ pub fn share_artworks(
         };
         vec![(one.clone(), with_extension(path, extension))]
     } else {
-        let Some(dir) = FileDialog::new().set_title(format!("Share as {}", format.name())).pick_folder() else {
+        let Some(dir) = dialog().set_title(format!("Share as {}", format.name())).pick_folder() else {
             return;
         };
         let mut used = std::collections::HashSet::new();
@@ -921,6 +1033,68 @@ pub fn share_artworks(
             done.store(progress.to_bits(), std::sync::atomic::Ordering::Relaxed);
         }
         match place_written(&written, exporting.cancelled()) {
+            Ok(made) => exporting.ended(made),
+            Err(e) => {
+                exporting.ended(false);
+                tell_later("Can't share", &e);
+            }
+        }
+    });
+}
+
+/// Artworks from the gallery as one PDF where the user picks (first named `group`): a page for
+/// each in their order, each its artwork's picture at its own size, kept at `quality`. One alone
+/// is shared as [`share_artworks`] shares it. `card` shows the pages made, an artwork at a time;
+/// cancelled, nothing is left where it was going.
+pub fn share_pdf(
+    list: &[procraft_core::GalleryArtwork],
+    quality: u8,
+    group: &str,
+    card: &mut crate::export_card::ExportCard,
+) {
+    if list.len() < 2 {
+        share_artworks(list, Format::Pdf, quality, card);
+        return;
+    }
+    if card.busy() {
+        return;
+    }
+    let Some(path) = dialog()
+        .set_title(format!("Share {}", Format::Pdf.name()))
+        .add_filter(Format::Pdf.name(), &["pdf"])
+        .set_file_name(format!("{}.pdf", export_file_name(group.to_owned(), false)))
+        .save_file()
+    else {
+        return;
+    };
+    let path = with_extension(path, "pdf").to_string_lossy().into_owned();
+    let list = list.to_vec();
+    // written on a thread of its own (each artwork opened on a device of its own takes seconds),
+    // a page at a time beside where it goes until all are in
+    let done = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let following = Arc::clone(&done);
+    let exporting = card.start(move || f32::from_bits(following.load(std::sync::atomic::Ordering::Relaxed)));
+    write_meanwhile(false, move || {
+        let count = list.len() as f32;
+        let written = (|| -> Result<bool, String> {
+            let book = procraft_core::PdfBook::create(path, quality).map_err(|e| e.to_string())?;
+            for (i, a) in list.iter().enumerate() {
+                // left unfinished, the book leaves nothing
+                if exporting.cancelled() {
+                    return Ok(false);
+                }
+                let s = CanvasSession::open(a.dir.clone()).map_err(|e| format!("{}: {e}", a.name))?;
+                if !s.prepare_offscreen() {
+                    return Err(format!("{}: There's no GPU device to draw it with.", a.name));
+                }
+                book.add(s).map_err(|e| format!("{}: {e}", a.name))?;
+                let progress = (i + 1) as f32 / count;
+                done.store(progress.to_bits(), std::sync::atomic::Ordering::Relaxed);
+            }
+            book.finish().map_err(|e| e.to_string())?;
+            Ok(true)
+        })();
+        match written {
             Ok(made) => exporting.ended(made),
             Err(e) => {
                 exporting.ended(false);
@@ -1011,6 +1185,36 @@ mod tests {
         let settings = procraft_core::TimeLapse::new(dir.to_string_lossy().into_owned()).settings();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(settings, procraft_core::TimeLapseSettings { resolution: 2, quality: 3, hevc: true });
+    }
+
+    /// A new artwork is in the gallery from the moment it is made, with nothing painted yet (the
+    /// app ended before a change is kept loses nothing of it); one already saved isn't saved again.
+    #[test]
+    fn a_new_artwork_is_in_the_gallery_from_the_start() {
+        let root = folder("new-artwork");
+        let store = procraft_core::ArtworkStore::open(root.to_string_lossy().into_owned());
+        let mut made = Vec::new();
+        for n in 0..5 {
+            let session = CanvasSession::new(64 + n, 48);
+            let dir = store.new_folder(None);
+            keep_new_artwork(&session, &dir).expect("saved on a thread").join().unwrap();
+            assert!(keep_new_artwork(&session, &dir).is_none(), "saved once");
+            made.push(dir);
+        }
+        let shown: Vec<String> = store
+            .list(None)
+            .into_iter()
+            .filter_map(|e| match e {
+                procraft_core::GalleryEntry::Artwork { artwork } => Some(artwork.dir),
+                procraft_core::GalleryEntry::Stack { .. } => None,
+            })
+            .collect();
+        let _ = std::fs::remove_dir_all(&root);
+        println!("new artworks made: {}, in the gallery: {}", made.len(), shown.len());
+        made.sort();
+        let mut shown = shown;
+        shown.sort();
+        assert_eq!(shown, made);
     }
 
     #[test]

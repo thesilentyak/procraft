@@ -67,8 +67,16 @@ pub enum Ended {
     NotMade,
 }
 
+/// What an import card shows besides its pie while it says more (a plugin's brush engine reading a
+/// file): its title in place of the card's, and a line under it (the file's name and size).
+pub type Detail = Box<dyn Fn() -> Option<(&'static str, String)>>;
+
 struct Run {
+    /// What it says it is doing, after its glyph.
+    title: &'static str,
+    glyph: &'static crate::icons::Icon,
     progress: Box<dyn Fn() -> f32>,
+    detail: Option<Detail>,
     exporting: Exporting,
     since: Instant,
     made: Option<Instant>,
@@ -84,9 +92,28 @@ impl ExportCard {
     /// Shows the card for an export whose progress (0..1) `progress` tells; its thread is handed
     /// the [`Exporting`] to read Cancel from and to end it by.
     pub fn start(&mut self, progress: impl Fn() -> f32 + 'static) -> Exporting {
+        self.start_as("Exporting", &crate::icons::TAB_SHARE, progress, None)
+    }
+
+    /// Shows the card for files being brought in ("Importing", as the Android app's import card),
+    /// as [`Self::start`] does; while `detail` says more, its title and its line.
+    pub fn start_importing(&mut self, progress: impl Fn() -> f32 + 'static, detail: Detail) -> Exporting {
+        self.start_as("Importing", &crate::icons::TAB_IMPORT, progress, Some(detail))
+    }
+
+    fn start_as(
+        &mut self,
+        title: &'static str,
+        glyph: &'static crate::icons::Icon,
+        progress: impl Fn() -> f32 + 'static,
+        detail: Option<Detail>,
+    ) -> Exporting {
         let exporting = Exporting { cancel: Arc::new(AtomicBool::new(false)), made: Arc::new(AtomicU8::new(RUNNING)) };
         self.run = Some(Run {
+            title,
+            glyph,
             progress: Box::new(progress),
+            detail,
             exporting: exporting.clone(),
             since: Instant::now(),
             made: None,
@@ -134,6 +161,8 @@ impl ExportCard {
             TSTransform::from_translation(c) * TSTransform::from_scaling(k) * TSTransform::from_translation(-c);
         ctx.set_transform_layer(LayerId::new(Order::Debug, area), transform);
         let progress = (run.progress)().clamp(0.0, 1.0);
+        let detail = run.detail.as_ref().and_then(|d| d());
+        let title = detail.as_ref().map_or(run.title, |(title, _)| *title);
         let check = run.made.map(|m| (m.elapsed().as_secs_f32() / CHECK_DRAW).clamp(0.0, 1.0));
         let mut cancel = false;
         egui::Area::new(area).fixed_pos(screen.min).order(Order::Debug).show(ctx, |ui| {
@@ -148,10 +177,17 @@ impl ExportCard {
             // the title after the share glyph (22 tall: 18.6 of its 50 frame), 13 between
             let title_y = card.top() + 21.0 + 31.0 / 2.0;
             let ink = argb(INK);
-            let words = painter.layout_no_wrap("Exporting".into(), Weight::Bold.font(26.0), ink).size().x;
+            let words = painter.layout_no_wrap(title.into(), Weight::Bold.font(26.0), ink).size().x;
             let left = card.center().x - (22.0 + 13.0 + words) / 2.0;
-            look.icon(ui, &crate::icons::TAB_SHARE, pos2(left + 11.0, title_y), 59.0, argb(pc::ACCENT));
-            text(ui.painter(), pos2(left + 35.0, title_y), Align2::LEFT_CENTER, "Exporting", 26.0, Weight::Bold, ink);
+            look.icon(ui, run.glyph, pos2(left + 11.0, title_y), 59.0, argb(pc::ACCENT));
+            text(ui.painter(), pos2(left + 35.0, title_y), Align2::LEFT_CENTER, title, 26.0, Weight::Bold, ink);
+            // the line under it, in the gap over the pie, cut short in the middle to fit
+            if let Some((_, line)) = &detail {
+                let fits = WIDTH - SIDE * 2.0;
+                let shown = fitted(ui.painter(), line, fits);
+                let at = pos2(card.center().x, card.top() + 21.0 + 31.0 + 20.0);
+                text(ui.painter(), at, Align2::CENTER_CENTER, &shown, 15.0, Weight::Regular, ink);
+            }
             let centre = pos2(card.center().x, card.top() + 21.0 + 31.0 + 40.0 + PIE / 2.0);
             let accent = argb(pc::ACCENT);
             let painter = ui.painter();
@@ -192,6 +228,24 @@ impl ExportCard {
         }
         None
     }
+}
+
+/// `line` as it fits in `width` at the card's line's size: whole, or with its middle left out.
+fn fitted(painter: &egui::Painter, line: &str, width: f32) -> String {
+    let wide = |s: &str| painter.layout_no_wrap(s.to_owned(), Weight::Regular.font(15.0), Color32::WHITE).size().x;
+    if wide(line) <= width {
+        return line.to_owned();
+    }
+    let chars: Vec<char> = line.chars().collect();
+    for keep in (1..chars.len()).rev() {
+        let front: String = chars.iter().take(keep.div_ceil(2)).collect();
+        let back: String = chars.iter().skip(chars.len() - keep / 2).collect();
+        let shown = format!("{front}…{back}");
+        if wide(&shown) <= width {
+            return shown;
+        }
+    }
+    "…".to_owned()
 }
 
 /// The pie's filled part: `done` of a full turn clockwise from the top, as a fan of triangles.

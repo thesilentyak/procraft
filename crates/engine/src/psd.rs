@@ -5,16 +5,30 @@
 //!
 //! What comes in is each layer's own pixels: effects, vector masks (beyond the mask the file
 //! renders from one), adjustments and fill opacity are left out, and so is a layer with no pixels
-//! on the canvas. A bottom layer of one colour becomes the canvas's background colour; otherwise
-//! the background is hidden. A file with no layers to bring comes in as one layer of its
-//! flattened picture.
+//! on the canvas. A bottom layer of one opaque colour over the whole canvas becomes the canvas's
+//! background colour; otherwise the background is hidden. A file with no layers to bring, or whose
+//! layers can't be read, comes in as one layer of its flattened picture.
+//!
+//! A file is never read whole ([`Source`]): its layers' records first, then each layer's pixels as
+//! they are asked for, and of those only the part on the canvas, so what reading holds at once is
+//! a layer or two whatever the file's size and number of layers. Damage is read past: a channel cut
+//! short, or that doesn't unpack, comes in as far as it reads.
 
 mod text;
 
+#[cfg(test)]
+mod tests;
+
 use std::sync::Arc;
 
+use miniz_oxide::inflate::stream::{InflateState, inflate};
+use miniz_oxide::{DataFormat, MZError, MZFlush, MZStatus};
+
 use crate::cms::{CanvasIcc, IccProfile, Space};
-use crate::document::{BlendMode, Document, Layer, LayerId, LayerKind, LayerText, MAX_CANVAS_EDGE};
+use crate::document::{
+    BlendMode, Document, Layer, LayerId, LayerKind, LayerText, MAX_CANVAS_EDGE, canvas_edge_most, layer_cap_for,
+    layer_room_for,
+};
 use crate::native::Imported;
 use crate::profile::Profile;
 
@@ -25,6 +39,8 @@ pub enum PsdError {
     /// A kind of picture not read here (bitmap, indexed, Lab, 32 bits a channel...).
     Unsupported(&'static str),
     Damaged(&'static str),
+    /// Larger than a canvas can be on this device: its sides, or a layer's memory beyond what the
+    /// layers may take.
     TooLarge,
     /// More layers than a canvas this size holds (it holds this many).
     TooManyLayers(usize),
@@ -33,6 +49,91 @@ pub enum PsdError {
 /// Whether `bytes` start as a PSD or PSB does.
 pub fn is_psd(bytes: &[u8]) -> bool {
     bytes.starts_with(b"8BPS")
+}
+
+/// Where a PSD is read from: bytes in memory, or a file read a part at a time ([`FileSource`]).
+pub trait Source: Sync {
+    /// How many bytes there are.
+    fn size(&self) -> u64;
+    /// Fills `buf` with the bytes from `at`: false if they run past the end or can't be read.
+    fn read_at(&self, at: u64, buf: &mut [u8]) -> bool;
+}
+
+impl Source for [u8] {
+    fn size(&self) -> u64 {
+        self.len() as u64
+    }
+
+    fn read_at(&self, at: u64, buf: &mut [u8]) -> bool {
+        let from = usize::try_from(at).ok();
+        match from.and_then(|f| self.get(f..f.checked_add(buf.len())?)) {
+            Some(part) => {
+                buf.copy_from_slice(part);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// A file read a part at a time where it is needed, never whole.
+pub struct FileSource {
+    file: std::fs::File,
+    size: u64,
+    /// One read at a time where the system has no reading at a place.
+    #[cfg(not(any(unix, windows)))]
+    turn: std::sync::Mutex<()>,
+}
+
+impl FileSource {
+    pub fn open(path: &std::path::Path) -> std::io::Result<FileSource> {
+        let file = std::fs::File::open(path)?;
+        let size = file.metadata()?.len();
+        Ok(FileSource {
+            file,
+            size,
+            #[cfg(not(any(unix, windows)))]
+            turn: std::sync::Mutex::new(()),
+        })
+    }
+}
+
+impl Source for FileSource {
+    fn size(&self) -> u64 {
+        self.size
+    }
+
+    fn read_at(&self, at: u64, buf: &mut [u8]) -> bool {
+        if at.checked_add(buf.len() as u64).is_none_or(|end| end > self.size) {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.file.read_exact_at(buf, at).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileExt;
+            let mut done = 0;
+            while let Some(rest) = buf.get_mut(done..).filter(|r| !r.is_empty()) {
+                match self.file.seek_read(rest, at + done as u64) {
+                    Ok(0) => return false,
+                    Ok(n) => done += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => return false,
+                }
+            }
+            true
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            use std::io::{Read, Seek, SeekFrom};
+            let _turn = self.turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut file = &self.file;
+            file.seek(SeekFrom::Start(at)).is_ok() && file.read_exact(buf).is_ok()
+        }
+    }
 }
 
 /// What a file is, as far as reading its pixels goes.
@@ -47,6 +148,12 @@ struct Format {
     palette: [[u8; 3]; 256],
     /// PSB: some lengths take eight bytes.
     big: bool,
+}
+
+impl Format {
+    fn canvas(&self) -> (usize, usize) {
+        (self.width as usize, self.height as usize)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -110,98 +217,115 @@ fn row_bytes(w: usize, sample: usize) -> Option<usize> {
     if sample == 0 { Some(w.div_ceil(8)) } else { w.checked_mul(sample) }
 }
 
-/// A bitmap's rows of packed bits (`w` x `h`) as a byte a pixel: black (a bit set) 0, white 255.
-fn spread_bits(packed: &[u8], w: usize, h: usize) -> Vec<u8> {
-    let row = w.div_ceil(8);
-    let mut out = Vec::with_capacity(w * h);
-    for y in 0..h {
-        for x in 0..w {
-            let bit = packed.get(y * row + x / 8).is_some_and(|b| b >> (7 - x % 8) & 1 == 1);
-            out.push(if bit { 0 } else { 255 });
-        }
-    }
-    out
+/// The most of a block of additional information that is read for a layer's name.
+const MOST_NAME: u64 = 1 << 17;
+/// The most of a text layer's block that is read (more: it stays pixels).
+const MOST_TEXT: u64 = 16 << 20;
+/// The most of a colour profile that is read.
+const MOST_PROFILE: u64 = 16 << 20;
+
+/// A PSD's layers, as they come into a canvas: the document, and each layer's pixels read from the
+/// file as they are asked for ([`PsdArtwork::pixels`]).
+pub struct PsdArtwork<'s, S: Source + ?Sized> {
+    psd: Parsed<'s, S>,
+    pub document: Document,
+    /// Where each layer with pixels of its own gets them, bottom first.
+    sources: Vec<(LayerId, Pixels)>,
+    /// The flattened picture, premultiplied, when it is the one layer.
+    flat: Option<Vec<u8>>,
+    /// The layers' records couldn't be read: the flattened picture came in instead.
+    pub salvaged: bool,
 }
 
-/// Reads a PSD or PSB.
-pub fn read(bytes: &[u8]) -> Result<Imported, PsdError> {
-    let damaged = PsdError::Damaged;
-    let mut r = Reader::new(bytes);
-    if r.take(4) != Some(b"8BPS".as_slice()) {
-        return Err(PsdError::NotAPsd);
+/// Where a layer's pixels come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pixels {
+    /// A record's own.
+    Record(usize),
+    /// A record's mask's.
+    Mask(usize),
+    /// The flattened picture.
+    Flat,
+}
+
+impl<S: Source + ?Sized> PsdArtwork<'_, S> {
+    /// The layers that have pixels of their own to read, bottom first (the others start clear).
+    pub fn layers_with_pixels(&self) -> Vec<LayerId> {
+        self.sources.iter().map(|(id, _)| *id).collect()
     }
-    let big = match r.u16().ok_or(damaged("header"))? {
-        1 => false,
-        2 => true,
-        _ => return Err(damaged("version")),
-    };
-    r.take(6).ok_or(damaged("header"))?;
-    let channels = r.u16().ok_or(damaged("header"))?;
-    let height = r.u32().ok_or(damaged("header"))?;
-    let width = r.u32().ok_or(damaged("header"))?;
-    let depth = r.u16().ok_or(damaged("header"))?;
-    let mode = r.u16().ok_or(damaged("header"))?;
-    if width == 0 || height == 0 {
-        return Err(damaged("size"));
+
+    /// Layer `id`'s pixels on the canvas, premultiplied RGBA (a mask's grey in every channel,
+    /// opaque), read from the file now; none if it has none (it is clear).
+    pub fn pixels(&self, id: LayerId) -> Option<Vec<u8>> {
+        let (_, from) = self.sources.iter().find(|(i, _)| *i == id)?;
+        match *from {
+            Pixels::Record(i) => self.psd.records.get(i).and_then(|r| self.psd.layer_pixels(r)),
+            Pixels::Mask(i) => self.psd.records.get(i).and_then(|r| self.psd.mask_pixels(r)),
+            Pixels::Flat => self.flat.clone(),
+        }
     }
-    if width > MAX_CANVAS_EDGE || height > MAX_CANVAS_EDGE {
+
+    /// The flattened picture the file carries (straight RGBA, the canvas's size), if it does.
+    pub fn flattened(&self) -> Option<Vec<u8>> {
+        merged(self.psd.src, self.psd.flat, &self.psd.format, self.psd.channels)
+    }
+
+    /// The flattened picture the file carries on white, made small to fit `side` (read a row at a
+    /// time, never held whole): its size and opaque RGBA; none if it carries none.
+    pub fn thumbnail(&self, side: u32) -> Option<(u32, u32, Vec<u8>)> {
+        merged_thumbnail(self.psd.src, self.psd.flat, &self.psd.format, self.psd.channels, side)
+    }
+}
+
+/// Opens a PSD or PSB from `src`: its document, its layers' pixels read as they are asked for.
+pub fn open<S: Source + ?Sized>(src: &S) -> Result<PsdArtwork<'_, S>, PsdError> {
+    let psd = parse(src)?;
+    let (w, h) = (psd.format.width, psd.format.height);
+    // a canvas this device can't hold (its sides, or not one layer's worth of memory for it) is
+    // turned away whole, as its layers would be on opening it
+    let most = canvas_edge_most();
+    if w > most || h > most || layer_room_for(w, h) == 0 {
         return Err(PsdError::TooLarge);
     }
-    // colour mode data: an indexed file's table (a duotone's inks are left out)
-    let n = r.u32().ok_or(damaged("colour data"))?;
-    let data = r.take(n as usize).ok_or(damaged("colour data"))?;
-    let (colour, sample, palette) = format_of(mode, depth, data)?;
-    let format = Format { width, height, sample, colour, palette, big };
-    let n = r.u32().ok_or(damaged("resources"))?;
-    let resources = resources(r.take(n as usize).ok_or(damaged("resources"))?);
+    open_within(psd, layer_cap_for(w, h))
+}
 
-    let n = r.len(big).ok_or(damaged("layers"))?;
-    let mut section = Reader::new(r.take(n).ok_or(damaged("layers"))?);
-    let mut records = Vec::new();
-    if n > 0 {
-        let info = section.len(big).ok_or(damaged("layers"))?;
-        let info = section.take(info).ok_or(damaged("layers"))?;
-        if !info.is_empty() {
-            records = layer_info(info, &format)?;
-        }
-        // the global mask, then blocks; 16- and 32-bit files keep their layers in one of them
-        let global = section.u32().unwrap_or(0) as usize;
-        section.take(global);
-        while records.is_empty() {
-            let Some(block) = block(&mut section, big) else { break };
-            if [*b"Lr16", *b"Lr32", *b"Layr"].contains(&block.key) {
-                records = layer_info(block.data, &format)?;
-            }
-        }
+/// [`open`] past the device's checks: `cap` layers with pixels at most, or none of it comes in.
+fn open_within<S: Source + ?Sized>(psd: Parsed<'_, S>, cap: usize) -> Result<PsdArtwork<'_, S>, PsdError> {
+    let f = psd.format;
+    let (w, h) = (f.width, f.height);
+    // too many layers: the whole file turned away (a bottom layer that is the background doesn't
+    // count, so only that one is looked at before)
+    let counted = plan(&psd.records, &f, false).pixels.len();
+    if counted > cap.saturating_add(1) {
+        return Err(PsdError::TooManyLayers(cap));
     }
-    let flat = merged(&mut r, &format, channels);
-
-    let doc = Document::new(width, height);
-    let mut built = build(&records, &format);
-    // nothing to bring: the flattened picture
-    if built.layers.is_empty() {
-        let rgba = flat.as_ref().map(|f| premultiplied(f)).ok_or(damaged("picture"))?;
+    let background = psd.records.first().and_then(|r| psd.uniform(r));
+    let mut made = plan(&psd.records, &f, background.is_some());
+    if made.pixels.len() > cap {
+        return Err(PsdError::TooManyLayers(cap));
+    }
+    // nothing to bring, or the records unread: the flattened picture
+    let mut flat = None;
+    if made.layers.is_empty() {
+        let picture = merged(psd.src, psd.flat, &f, psd.channels).ok_or(PsdError::Damaged("picture"))?;
         let id = LayerId(1);
-        built = Built {
+        made = Plan {
             layers: vec![paint_layer(id, "Layer 1".to_owned(), None)],
-            pixels: vec![(id, rgba)],
-            top: id,
-            ..built
+            pixels: vec![(id, Pixels::Flat)],
+            top: Some(id),
         };
+        flat = Some(premultiplied(&picture));
     }
-    let Built { layers, pixels, top: current, background } = built;
-    let with_pixels = layers.iter().filter(|l| l.kind != LayerKind::Group).count();
-    if with_pixels > doc.layer_cap() {
-        return Err(PsdError::TooManyLayers(doc.layer_cap()));
-    }
-    let mut document = Document::from_layers(width, height, layers, current);
+    let Plan { layers, pixels, top } = made;
+    let mut document = Document::from_layers(w, h, layers, top.unwrap_or(LayerId(1)));
     // white and hidden unless the bottom layer was all one colour
     document.background = background.map_or([1.0; 3], |c| c.map(|v| f32::from(v) / 255.0));
     document.background_visible = background.is_some();
-    if let Some(dpi) = resources.dpi {
+    if let Some(dpi) = psd.resources.dpi {
         document.dpi = dpi;
     }
-    if let Some(icc) = resources.icc.as_deref().and_then(IccProfile::parse) {
+    if let Some(icc) = psd.resources.icc.as_deref().and_then(IccProfile::parse) {
         match Profile::from_name(&icc.name) {
             Some(builtin) => document.profile = builtin,
             None if icc.space == Space::Rgb => {
@@ -211,15 +335,20 @@ pub fn read(bytes: &[u8]) -> Result<Imported, PsdError> {
             None => {}
         }
     }
-    // a layer the document gained (when only groups came) starts empty
+    // a layer the document gained (when only groups came) starts clear
     let document = document.repaired();
-    let mut pixels = pixels;
-    pixels.retain(|(id, _)| document.layer(*id).is_some());
-    for l in document.layers() {
-        if l.kind != LayerKind::Group && !pixels.iter().any(|(id, _)| *id == l.id) {
-            pixels.push((l.id, vec![0; width as usize * height as usize * 4]));
-        }
-    }
+    let sources: Vec<(LayerId, Pixels)> = pixels.into_iter().filter(|(id, _)| document.layer(*id).is_some()).collect();
+    let salvaged = psd.records_damaged;
+    Ok(PsdArtwork { psd, document, sources, flat, salvaged })
+}
+
+/// Reads a PSD or PSB in memory whole: its document and every layer's pixels.
+pub fn read(bytes: &[u8]) -> Result<Imported, PsdError> {
+    let art = open(bytes)?;
+    let size = art.document.width() as usize * art.document.height() as usize * 4;
+    let ids: Vec<LayerId> = art.document.pixel_layer_ids().collect();
+    let pixels = ids.into_iter().map(|id| (id, art.pixels(id).unwrap_or_else(|| vec![0; size]))).collect();
+    let PsdArtwork { document, .. } = art;
     Ok(Imported {
         document,
         pixels,
@@ -234,27 +363,9 @@ pub fn read(bytes: &[u8]) -> Result<Imported, PsdError> {
 
 /// The flattened picture a PSD carries (straight RGBA, the canvas's size), if it has one.
 pub fn flattened(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
-    let mut r = Reader::new(bytes);
-    if r.take(4)? != b"8BPS" {
-        return None;
-    }
-    let big = r.u16()? == 2;
-    r.take(6)?;
-    let channels = r.u16()?;
-    let height = r.u32()?;
-    let width = r.u32()?;
-    let depth = r.u16()?;
-    let mode = r.u16()?;
-    if width == 0 || height == 0 || width > MAX_CANVAS_EDGE || height > MAX_CANVAS_EDGE {
-        return None;
-    }
-    let n = r.u32()?;
-    let (colour, sample, palette) = format_of(mode, depth, r.take(n as usize)?).ok()?;
-    let n = r.u32()?;
-    r.take(n as usize)?;
-    let n = r.len(big)?;
-    r.take(n)?;
-    merged(&mut r, &Format { width, height, sample, colour, palette, big }, channels).map(|rgba| (width, height, rgba))
+    let head = head(bytes).ok()?;
+    let f = head.format;
+    merged(bytes, head.flat, &f, head.channels).map(|rgba| (f.width, f.height, rgba))
 }
 
 /// What the image resources say.
@@ -264,26 +375,28 @@ struct Resources {
     icc: Option<Vec<u8>>,
 }
 
-fn resources(bytes: &[u8]) -> Resources {
+fn resources<S: Source + ?Sized>(mut c: Cursor<'_, S>) -> Resources {
     let mut out = Resources::default();
-    let mut r = Reader::new(bytes);
-    while r.take(4) == Some(b"8BIM".as_slice()) {
-        let Some(id) = r.u16() else { break };
-        // a name, padded to an even length with its length byte
-        let Some(name) = r.u8() else { break };
-        if r.take(usize::from(name) + usize::from(name % 2 == 0)).is_none() {
+    while let Some(sig) = c.array::<4>() {
+        // the usual signature, and the others some writers use
+        if ![*b"8BIM", *b"MeSa", *b"AgHg", *b"PHUT", *b"DCSR"].contains(&sig) {
             break;
         }
-        let Some(size) = r.u32() else { break };
-        let Some(data) = r.take(size as usize) else { break };
+        let Some(id) = c.u16() else { break };
+        // a name, padded to an even length with its length byte
+        let Some(name) = c.u8() else { break };
+        if c.skip(u64::from(name) + u64::from(name % 2 == 0)).is_none() {
+            break;
+        }
+        let Some(size) = c.u32().map(u64::from) else { break };
+        let Some(mut data) = c.sub(size) else { break };
         if size % 2 == 1 {
-            r.take(1);
+            let _ = c.skip(1);
         }
         match id {
             // horizontal resolution, 16.16, per inch (unit 1) or per centimetre (2)
             0x03ED => {
-                let mut d = Reader::new(data);
-                if let (Some(fixed), Some(unit)) = (d.u32(), d.u16()) {
+                if let (Some(fixed), Some(unit)) = (data.u32(), data.u16()) {
                     let per = fixed as f32 / 65536.0;
                     let dpi = if unit == 2 { per * 2.54 } else { per };
                     if dpi.is_finite() && dpi >= 1.0 {
@@ -291,25 +404,81 @@ fn resources(bytes: &[u8]) -> Resources {
                     }
                 }
             }
-            0x040F => out.icc = Some(data.to_vec()),
+            0x040F if size <= MOST_PROFILE => out.icc = data.bytes(size),
             _ => {}
         }
     }
     out
 }
 
-/// A layer as the file has it.
-struct Record {
+/// A rectangle as a file gives it.
+#[derive(Clone, Copy, Debug, Default)]
+struct Rect {
     top: i32,
     left: i32,
     bottom: i32,
     right: i32,
-    /// Each channel's id (0.. colours, -1 alpha, -2 mask) and its decoded samples (8 bits).
-    channels: Vec<(i16, Vec<u8>)>,
+}
+
+impl Rect {
+    fn width(self) -> usize {
+        span(self.left, self.right)
+    }
+
+    fn height(self) -> usize {
+        span(self.top, self.bottom)
+    }
+
+    /// Where it and the canvas meet; none if nowhere.
+    fn on_canvas(self, f: &Format) -> Option<Window> {
+        let x0 = i64::from(self.left).max(0);
+        let y0 = i64::from(self.top).max(0);
+        let x1 = (i64::from(self.left) + self.width() as i64).min(i64::from(f.width));
+        let y1 = (i64::from(self.top) + self.height() as i64).min(i64::from(f.height));
+        (x1 > x0 && y1 > y0).then_some(Window { x0: x0 as usize, y0: y0 as usize, x1: x1 as usize, y1: y1 as usize })
+    }
+}
+
+/// A rectangle's extent along one side (none if back to front or too big).
+fn span(from: i32, to: i32) -> usize {
+    usize::try_from(i64::from(to) - i64::from(from)).ok().filter(|&n| n <= 1 << 20).unwrap_or(0)
+}
+
+/// Part of the canvas: columns `x0..x1` of rows `y0..y1`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Window {
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+}
+
+impl Window {
+    fn width(self) -> usize {
+        self.x1.saturating_sub(self.x0)
+    }
+
+    fn height(self) -> usize {
+        self.y1.saturating_sub(self.y0)
+    }
+
+    /// The whole canvas.
+    fn whole(self, f: &Format) -> bool {
+        (self.x0, self.y0, self.x1, self.y1) == (0, 0, f.width as usize, f.height as usize)
+    }
+}
+
+/// A layer as the file has it.
+struct Record {
+    rect: Rect,
+    /// Each channel (0.. colours, -1 alpha, -2 mask) and where its data is.
+    channels: Vec<Channel>,
     blend: [u8; 4],
     opacity: u8,
     clipped: bool,
     hidden: bool,
+    /// Its flags lock its transparency.
+    flagged_lock: bool,
     mask: Option<MaskRect>,
     name: String,
     /// A group's marker: 1 open, 2 closed, 3 the end of one (below its layers).
@@ -320,6 +489,14 @@ struct Record {
     text: Option<LayerText>,
 }
 
+/// A channel: its id, and where its data is in the file (its compression, then its samples).
+#[derive(Clone, Copy, Debug)]
+struct Channel {
+    id: i16,
+    at: u64,
+    len: u64,
+}
+
 impl Record {
     /// Locked against changes: its pixels or position, or all of it.
     fn locked(&self) -> bool {
@@ -328,200 +505,454 @@ impl Record {
 
     /// Its transparency locked.
     fn alpha_locked(&self) -> bool {
-        self.protection & 1 != 0 || self.protection > 6
+        self.protection & 1 != 0 || self.protection > 6 || self.flagged_lock
+    }
+
+    fn channel(&self, id: i16) -> Option<&Channel> {
+        self.channels.iter().find(|c| c.id == id)
+    }
+
+    /// Where its pixels lie on the canvas: none if no part of them does, or one of its colour
+    /// channels is missing.
+    fn window(&self, f: &Format) -> Option<Window> {
+        let colours = (0..f.colour.channels()).all(|c| i16::try_from(c).is_ok_and(|c| self.channel(c).is_some()));
+        if colours { self.rect.on_canvas(f) } else { None }
+    }
+
+    /// Its mask, if it has one with pixels.
+    fn mask(&self) -> Option<MaskRect> {
+        self.mask.filter(|m| m.rect.width() * m.rect.height() > 0 && self.channel(-2).is_some())
     }
 }
 
 #[derive(Clone, Copy)]
 struct MaskRect {
-    top: i32,
-    left: i32,
-    bottom: i32,
-    right: i32,
+    rect: Rect,
     /// The mask outside its rectangle.
     outside: u8,
     /// Turned off: kept, hidden.
     hidden: bool,
 }
 
-/// The layer records, bottom first, each with its channels decoded.
-fn layer_info(bytes: &[u8], f: &Format) -> Result<Vec<Record>, PsdError> {
+/// A PSD's parts, as read before any pixels: its format, its layers' records, and where its
+/// flattened picture is.
+struct Parsed<'s, S: Source + ?Sized> {
+    src: &'s S,
+    format: Format,
+    channels: u16,
+    resources: Resources,
+    records: Vec<Record>,
+    /// The records couldn't be read.
+    records_damaged: bool,
+    /// Where the flattened picture starts.
+    flat: u64,
+}
+
+/// A PSD's header and image resources, and where its layers' section and flattened picture are.
+struct Head {
+    format: Format,
+    channels: u16,
+    resources: Resources,
+    /// The layers' section, from and to.
+    section: (u64, u64),
+    flat: u64,
+}
+
+fn head<S: Source + ?Sized>(src: &S) -> Result<Head, PsdError> {
     let damaged = PsdError::Damaged;
-    let mut r = Reader::new(bytes);
-    let count = usize::from(r.i16().ok_or(damaged("layers"))?.unsigned_abs());
-    let mut records = Vec::with_capacity(count);
-    let mut lengths = Vec::with_capacity(count);
-    for _ in 0..count {
-        let (top, left, bottom, right) = (r.i32(), r.i32(), r.i32(), r.i32());
-        let (Some(top), Some(left), Some(bottom), Some(right)) = (top, left, bottom, right) else {
-            return Err(damaged("layer"));
-        };
-        let n = r.u16().ok_or(damaged("layer"))?;
-        let mut ids = Vec::with_capacity(usize::from(n));
-        for _ in 0..n {
-            let id = r.i16().ok_or(damaged("layer"))?;
-            ids.push((id, r.len(f.big).ok_or(damaged("layer"))?));
-        }
-        if r.take(4) != Some(b"8BIM".as_slice()) {
-            return Err(damaged("layer"));
-        }
-        let blend: [u8; 4] = r.take(4).and_then(|b| b.try_into().ok()).ok_or(damaged("layer"))?;
-        let opacity = r.u8().ok_or(damaged("layer"))?;
-        let clipping = r.u8().ok_or(damaged("layer"))?;
-        let flags = r.u8().ok_or(damaged("layer"))?;
-        r.u8().ok_or(damaged("layer"))?;
-        let extra = r.u32().ok_or(damaged("layer"))?;
-        let mut x = Reader::new(r.take(extra as usize).ok_or(damaged("layer"))?);
-        // the mask's rectangle and settings: a plain mask's, or with a vector mask's after (the
-        // first rectangle is then the one the vector mask was drawn into); masks with density or
-        // feather settings are left out
-        let n = x.u32().unwrap_or(0) as usize;
-        let mask = x.take(n).filter(|_| n == 20 || n == 36).and_then(|m| {
-            let mut m = Reader::new(m);
-            let (top, left, bottom, right) = (m.i32()?, m.i32()?, m.i32()?, m.i32()?);
-            let outside = m.u8()?;
-            let flags = m.u8()?;
-            Some(MaskRect { top, left, bottom, right, outside, hidden: flags & 2 != 0 })
-        });
-        // blending ranges
-        let n = x.u32().unwrap_or(0) as usize;
-        x.take(n);
-        // the name, padded to four with its length byte (what isn't UTF-8 left out)
-        let len = usize::from(x.u8().unwrap_or(0));
-        let mut name = String::from_utf8_lossy(x.take(len).unwrap_or_default()).replace('\u{FFFD}', "");
-        x.take((4 - (len + 1) % 4) % 4);
-        let mut record = Record {
-            top,
-            left,
-            bottom,
-            right,
-            channels: Vec::new(),
-            blend,
-            opacity,
-            clipped: clipping == 1,
-            hidden: flags & 2 != 0,
-            mask,
-            name: String::new(),
-            section: None,
-            protection: 0,
-            text: None,
-        };
-        // of the additional information, only the name, group marker, locks and text are kept:
-        // effects, vector masks, adjustments, fill opacity and the rest are left out
-        while let Some(b) = block(&mut x, f.big) {
-            let mut d = Reader::new(b.data);
-            match &b.key {
-                b"luni" => {
-                    let n = d.u32().unwrap_or(0) as usize;
-                    let units: Vec<u16> = (0..n).map_while(|_| d.u16()).take_while(|&u| u != 0).collect();
-                    let unicode = String::from_utf16_lossy(&units);
-                    if !unicode.trim().is_empty() {
-                        name = unicode;
-                    }
-                }
-                b"lsct" => record.section = d.u32(),
-                b"lspf" => record.protection = d.u32().unwrap_or(0),
-                b"TySh" => record.text = text::layer_text(b.data),
-                _ => {}
-            }
-        }
-        record.name = name;
-        records.push(record);
-        lengths.push(ids);
+    let mut c = Cursor::new(src, 0, src.size());
+    if c.array::<4>() != Some(*b"8BPS") {
+        return Err(PsdError::NotAPsd);
     }
-    // each layer's channels, in the order its record listed them: found in turn, then unpacked
-    // side by side
-    let mut found = Vec::new();
-    for (i, (record, ids)) in records.iter().zip(lengths).enumerate() {
-        for (id, len) in ids {
-            let data = r.take(len).ok_or(damaged("channel"))?;
-            let (w, h) = match (id, record.mask) {
-                (-2, Some(m)) => (span(m.left, m.right), span(m.top, m.bottom)),
-                (-2 | -3, _) => (0, 0),
-                _ => (span(record.left, record.right), span(record.top, record.bottom)),
-            };
-            if id == -3 || w == 0 || h == 0 {
-                continue;
-            }
-            found.push((i, id, data, w, h));
-        }
-    }
-    let unpack = |&(_, id, data, w, h): &(usize, i16, &[u8], usize, usize)| {
-        let mut d = Reader::new(data);
-        let compression = d.u16()?;
-        plane(&mut d, compression, w, h, f, usize::try_from(id).is_ok_and(|c| c < f.colour.channels()))
+    let big = match c.u16().ok_or(damaged("header"))? {
+        1 => false,
+        2 => true,
+        _ => return Err(damaged("version")),
     };
-    let planes = crate::par::side_by_side(&found, unpack);
-    for (&(i, id, ..), plane) in found.iter().zip(planes) {
-        let plane = plane.flatten().ok_or(damaged("channel"))?;
-        if let Some(record) = records.get_mut(i) {
-            record.channels.push((id, plane));
+    c.skip(6).ok_or(damaged("header"))?;
+    let channels = c.u16().ok_or(damaged("header"))?;
+    let height = c.u32().ok_or(damaged("header"))?;
+    let width = c.u32().ok_or(damaged("header"))?;
+    let depth = c.u16().ok_or(damaged("header"))?;
+    let mode = c.u16().ok_or(damaged("header"))?;
+    if width == 0 || height == 0 {
+        return Err(damaged("size"));
+    }
+    if width > MAX_CANVAS_EDGE || height > MAX_CANVAS_EDGE {
+        return Err(PsdError::TooLarge);
+    }
+    // colour mode data: an indexed file's table (a duotone's inks are left out)
+    let n = u64::from(c.u32().ok_or(damaged("colour data"))?);
+    let mut data = c.sub(n).ok_or(damaged("colour data"))?;
+    let table = if mode == 2 { data.bytes(n.min(768)).unwrap_or_default() } else { Vec::new() };
+    let (colour, sample, palette) = format_of(mode, depth, &table)?;
+    let format = Format { width, height, sample, colour, palette, big };
+    let n = u64::from(c.u32().ok_or(damaged("resources"))?);
+    let resources = resources(c.sub(n).ok_or(damaged("resources"))?);
+    // the layers' section; cut short, what of it there is (and no flattened picture after it)
+    let n = c.len(big).ok_or(damaged("layers"))?;
+    let from = c.at;
+    let to = from.saturating_add(n).min(c.end);
+    let flat = from.saturating_add(n);
+    Ok(Head { format, channels, resources, section: (from, to), flat })
+}
+
+fn parse<S: Source + ?Sized>(src: &S) -> Result<Parsed<'_, S>, PsdError> {
+    let Head { format, channels, resources, section, flat } = head(src)?;
+    let (records, records_damaged) = match layers_of(Cursor::new(src, section.0, section.1), &format) {
+        Ok(records) => (records, false),
+        Err(_) => (Vec::new(), true),
+    };
+    Ok(Parsed { src, format, channels, resources, records, records_damaged, flat })
+}
+
+/// The layers' records from the layers' section, bottom first: in its layer info, or (16- and
+/// 32-bit files) in a block after the global mask.
+fn layers_of<S: Source + ?Sized>(mut section: Cursor<'_, S>, f: &Format) -> Result<Vec<Record>, PsdError> {
+    if section.remaining() == 0 {
+        return Ok(Vec::new());
+    }
+    let n = section.len(f.big).ok_or(PsdError::Damaged("layers"))?;
+    // cut short: what of it there is
+    let info = section.sub(n.min(section.remaining())).ok_or(PsdError::Damaged("layers"))?;
+    let mut records = if n > 0 { layer_info(info, f)? } else { Vec::new() };
+    // the global mask, then blocks
+    if let Some(global) = section.u32() {
+        let _ = section.skip(u64::from(global));
+    }
+    while records.is_empty() {
+        let Some(block) = next_block(&mut section, f.big) else { break };
+        if [*b"Lr16", *b"Lr32", *b"Layr"].contains(&block.key) {
+            records = layer_info(block.data, f)?;
         }
     }
     Ok(records)
 }
 
-/// A rectangle's extent along one side (none if back to front or too big).
-fn span(from: i32, to: i32) -> usize {
-    usize::try_from(i64::from(to) - i64::from(from)).ok().filter(|&n| n <= 1 << 20).unwrap_or(0)
+/// The layer records in a layer info, bottom first, with where each channel's data is.
+fn layer_info<S: Source + ?Sized>(mut c: Cursor<'_, S>, f: &Format) -> Result<Vec<Record>, PsdError> {
+    let damaged = PsdError::Damaged;
+    // (negative: the flattened picture's alpha is the first layer's transparency)
+    let count = usize::from(c.i16().ok_or(damaged("layers"))?.unsigned_abs());
+    let mut records = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        let (top, left, bottom, right) = (c.i32(), c.i32(), c.i32(), c.i32());
+        let (Some(top), Some(left), Some(bottom), Some(right)) = (top, left, bottom, right) else {
+            return Err(damaged("layer"));
+        };
+        let n = c.u16().ok_or(damaged("layer"))?;
+        let mut channels = Vec::with_capacity(usize::from(n).min(64));
+        for _ in 0..n {
+            let id = c.i16().ok_or(damaged("layer"))?;
+            let len = c.len(f.big).ok_or(damaged("layer"))?;
+            channels.push(Channel { id, at: 0, len });
+        }
+        let sig = c.array::<4>().ok_or(damaged("layer"))?;
+        if sig != *b"8BIM" && sig != *b"8B64" {
+            return Err(damaged("layer"));
+        }
+        let blend = c.array::<4>().ok_or(damaged("layer"))?;
+        let opacity = c.u8().ok_or(damaged("layer"))?;
+        let clipping = c.u8().ok_or(damaged("layer"))?;
+        let flags = c.u8().ok_or(damaged("layer"))?;
+        c.u8().ok_or(damaged("layer"))?;
+        let extra = u64::from(c.u32().ok_or(damaged("layer"))?);
+        let extra = c.sub(extra).ok_or(damaged("layer"))?;
+        let rect = Rect { top, left, bottom, right };
+        let mut record = Record {
+            rect,
+            channels,
+            blend,
+            opacity,
+            clipped: clipping == 1,
+            hidden: flags & 2 != 0,
+            flagged_lock: flags & 1 != 0,
+            mask: None,
+            name: String::new(),
+            section: None,
+            protection: 0,
+            text: None,
+        };
+        read_extra(extra, f, &mut record);
+        records.push(record);
+    }
+    // each layer's channels' data follows the records, in their order: a channel running past the
+    // end is cut to what of it is there
+    let end = c.end;
+    let mut at = c.at;
+    for ch in records.iter_mut().flat_map(|r| r.channels.iter_mut()) {
+        ch.at = at;
+        at = at.saturating_add(ch.len);
+        ch.len = ch.len.min(end.saturating_sub(ch.at));
+    }
+    Ok(records)
+}
+
+/// A record's extra data: its mask, name, and of the additional information only the name,
+/// group marker, locks and text (effects, vector masks, adjustments, fill opacity and the rest
+/// are left out).
+fn read_extra<S: Source + ?Sized>(mut x: Cursor<'_, S>, f: &Format, record: &mut Record) {
+    // the mask's rectangle and settings: a plain mask's, or with a vector mask's after (the first
+    // rectangle is then the one the vector mask was drawn into); masks with density or feather
+    // settings are left out
+    let n = x.u32().map_or(0, u64::from);
+    let mask = x.sub(n.min(x.remaining()));
+    if let Some(mut m) = mask.filter(|_| n == 20 || n == 36) {
+        let (top, left, bottom, right) = (m.i32(), m.i32(), m.i32(), m.i32());
+        if let (Some(top), Some(left), Some(bottom), Some(right), Some(outside), Some(flags)) =
+            (top, left, bottom, right, m.u8(), m.u8())
+        {
+            let rect = Rect { top, left, bottom, right };
+            record.mask = Some(MaskRect { rect, outside, hidden: flags & 2 != 0 });
+        }
+    }
+    // blending ranges
+    let n = x.u32().map_or(0, u64::from);
+    let _ = x.skip(n.min(x.remaining()));
+    // the name, padded to four with its length byte (what isn't UTF-8 left out)
+    let len = x.u8().unwrap_or(0);
+    let pascal = x.bytes(u64::from(len)).unwrap_or_default();
+    record.name = String::from_utf8_lossy(&pascal).replace('\u{FFFD}', "");
+    let _ = x.skip(u64::from((4 - (u32::from(len) + 1) % 4) % 4));
+    while let Some(mut b) = next_block(&mut x, f.big) {
+        match &b.key {
+            b"luni" if b.data.remaining() <= MOST_NAME => {
+                let data = b.data.bytes(b.data.remaining()).unwrap_or_default();
+                let mut d = Reader::new(&data);
+                let n = d.u32().unwrap_or(0) as usize;
+                let units: Vec<u16> = (0..n).map_while(|_| d.u16()).take_while(|&u| u != 0).collect();
+                let unicode = String::from_utf16_lossy(&units);
+                if !unicode.trim().is_empty() {
+                    record.name = unicode;
+                }
+            }
+            // a group's marker, or (a group in a group, as some write it) a nested one's
+            b"lsct" | b"lsdk" => record.section = b.data.u32(),
+            b"lspf" => record.protection = b.data.u32().unwrap_or(0),
+            b"TySh" if b.data.remaining() <= MOST_TEXT => {
+                record.text = b.data.bytes(b.data.remaining()).and_then(|data| text::layer_text(&data));
+            }
+            _ => {}
+        }
+    }
 }
 
 /// One block of additional information: its key and data.
-struct Block<'a> {
+struct Block<'s, S: Source + ?Sized> {
     key: [u8; 4],
-    data: &'a [u8],
+    data: Cursor<'s, S>,
 }
 
-fn block<'a>(r: &mut Reader<'a>, big: bool) -> Option<Block<'a>> {
-    let sig = r.take(4)?;
-    if sig != b"8BIM" && sig != b"8B64" {
-        return None;
+/// The next block of additional information in `c`, if there is one.
+fn next_block<'s, S: Source + ?Sized>(c: &mut Cursor<'s, S>, big: bool) -> Option<Block<'s, S>> {
+    // its signature, past the padding some writers leave after the block before (to an even
+    // length, or to four bytes) and others don't
+    let mut tries = 0;
+    loop {
+        let at = c.at;
+        let sig = c.array::<4>()?;
+        if sig == *b"8BIM" || sig == *b"8B64" {
+            break;
+        }
+        tries += 1;
+        if tries > 3 {
+            return None;
+        }
+        c.at = at + 1;
     }
-    let key: [u8; 4] = r.take(4)?.try_into().ok()?;
+    let key = c.array::<4>()?;
     // in a PSB these keep eight-byte lengths
     const LONG: [&[u8; 4]; 13] = [
         b"LMsk", b"Lr16", b"Lr32", b"Layr", b"Mt16", b"Mt32", b"Mtrn", b"Alph", b"FMsk", b"lnk2", b"FEid", b"FXid",
         b"PxSD",
     ];
-    let n = if big && LONG.contains(&&key) { usize::try_from(r.u64()?).ok()? } else { r.u32()? as usize };
-    let data = r.take(n)?;
+    let n = if big && LONG.contains(&&key) { c.u64()? } else { u64::from(c.u32()?) };
+    let data = c.sub(n)?;
     Some(Block { key, data })
 }
 
-/// A channel's samples, `w` x `h`, decoded and brought to 8 bits (a `colour` one's floats through
-/// the sRGB tone curve; transparency and masks as they are).
-fn plane(r: &mut Reader<'_>, compression: u16, w: usize, h: usize, f: &Format, colour: bool) -> Option<Vec<u8>> {
-    let row = row_bytes(w, f.sample)?;
-    let size = row.checked_mul(h)?;
-    let raw = match compression {
-        0 => r.take(size)?.to_vec(),
-        1 => {
-            let counts: Vec<usize> = (0..h)
-                .map(|_| if f.big { r.u32().map(|c| c as usize) } else { r.u16().map(usize::from) })
-                .collect::<Option<_>>()?;
-            let mut out = Vec::with_capacity(size);
-            for c in counts {
-                unpack(r.take(c)?, row, &mut out);
+impl<S: Source + ?Sized> Parsed<'_, S> {
+    /// A layer's pixels on the canvas, premultiplied: none if no part of it is there, a colour
+    /// channel is missing, or it is all clear.
+    fn layer_pixels(&self, r: &Record) -> Option<Vec<u8>> {
+        let f = &self.format;
+        let win = r.window(f)?;
+        let alpha = r.channel(-1).map(|ch| channel_window(self.src, ch, r.rect, win, f, false, 0));
+        if alpha.as_ref().is_some_and(|a| a.iter().all(|&v| v == 0)) {
+            return None;
+        }
+        let planes: Vec<Vec<u8>> = (0..f.colour.channels())
+            .map(|c| {
+                let ch = i16::try_from(c).ok().and_then(|c| r.channel(c));
+                ch.map(|ch| channel_window(self.src, ch, r.rect, win, f, true, 0)).unwrap_or_default()
+            })
+            .collect();
+        let (w, h) = f.canvas();
+        let mut out = vec![0u8; w * h * 4];
+        let ww = win.width();
+        for wy in 0..win.height() {
+            let at = ((win.y0 + wy) * w + win.x0) * 4;
+            let Some(row) = out.get_mut(at..at + ww * 4) else { continue };
+            for (wx, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                let i = wy * ww + wx;
+                let s = |c: usize| planes.get(c).and_then(|p| p.get(i)).copied().unwrap_or(0);
+                // no alpha channel: opaque (as a background layer is)
+                let a = alpha.as_ref().map_or(255, |p| p.get(i).copied().unwrap_or(0));
+                let [r, g, b] = rgb(f, s);
+                *px = premultiply([r, g, b, a]);
             }
-            out
+        }
+        Some(out)
+    }
+
+    /// A layer's mask on the canvas: its grey in every channel, opaque.
+    fn mask_pixels(&self, r: &Record) -> Option<Vec<u8>> {
+        let f = &self.format;
+        let m = r.mask()?;
+        let ch = r.channel(-2)?;
+        let (w, h) = f.canvas();
+        let mut out: Vec<u8> = std::iter::repeat_n([m.outside, m.outside, m.outside, 255], w * h).flatten().collect();
+        if let Some(win) = m.rect.on_canvas(f) {
+            let plane = channel_window(self.src, ch, m.rect, win, f, false, m.outside);
+            let ww = win.width();
+            for wy in 0..win.height() {
+                let at = ((win.y0 + wy) * w + win.x0) * 4;
+                let Some(row) = out.get_mut(at..at + ww * 4) else { continue };
+                for (wx, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                    let v = plane.get(wy * ww + wx).copied().unwrap_or(m.outside);
+                    *px = [v, v, v, 255];
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// The colour of a layer that shows as one opaque colour over the whole canvas: a background.
+    fn uniform(&self, r: &Record) -> Option<[u8; 3]> {
+        let f = &self.format;
+        let shown_as_is = !r.hidden && r.opacity == 255 && r.text.is_none() && r.section.is_none_or(|s| s == 0);
+        let unmasked = r.mask().is_none_or(|m| m.hidden);
+        let win = r.window(f).filter(|w| w.whole(f) && shown_as_is && unmasked)?;
+        let alpha = r.channel(-1).map(|ch| channel_window(self.src, ch, r.rect, win, f, false, 0));
+        if alpha.as_ref().is_some_and(|a| a.iter().any(|&v| v != 255)) {
+            return None;
+        }
+        let planes: Vec<Vec<u8>> = (0..f.colour.channels())
+            .map(|c| {
+                let ch = i16::try_from(c).ok().and_then(|c| r.channel(c));
+                ch.map(|ch| channel_window(self.src, ch, r.rect, win, f, true, 0)).unwrap_or_default()
+            })
+            .collect();
+        let first: Vec<u8> = planes.iter().map(|p| p.first().copied().unwrap_or(0)).collect();
+        if planes.iter().zip(&first).any(|(p, v)| p.iter().any(|s| s != v)) {
+            return None;
+        }
+        Some(rgb(f, |c| first.get(c).copied().unwrap_or(0)))
+    }
+}
+
+/// The samples of channel `ch` (a plane the size of `rect`, placed as it says on the canvas)
+/// within `win`, in 8 bits, a row of the window after another; what is missing or doesn't unpack
+/// is `fill`. Only the rows the window needs are unpacked, and only its columns kept.
+fn channel_window<S: Source + ?Sized>(
+    src: &S,
+    ch: &Channel,
+    rect: Rect,
+    win: Window,
+    f: &Format,
+    colour: bool,
+    fill: u8,
+) -> Vec<u8> {
+    let (ww, wh) = (win.width(), win.height());
+    let mut out = vec![fill; ww * wh];
+    let (w, h) = (rect.width(), rect.height());
+    // the window in the plane's own columns and rows
+    let px0 = usize::try_from(win.x0 as i64 - i64::from(rect.left)).unwrap_or(0);
+    let py0 = usize::try_from(win.y0 as i64 - i64::from(rect.top)).unwrap_or(0);
+    let Some(row) = row_bytes(w, f.sample) else { return out };
+    if px0 + ww > w || py0 + wh > h {
+        return out;
+    }
+    let mut c = Cursor::new(src, ch.at, ch.at.saturating_add(ch.len));
+    let Some(compression) = c.u16() else { return out };
+    let mut put = |y: usize, raw: &[u8], skip: usize| {
+        if let Some(dst) = out.get_mut(y * ww..(y + 1) * ww) {
+            samples_to8(raw, skip, f.sample, colour, dst);
+        }
+    };
+    match compression {
+        0 => {
+            // the bytes of the window's columns in each of its rows
+            let (from, to, skip) = if f.sample == 0 {
+                (px0 / 8, (px0 + ww).div_ceil(8), px0 % 8)
+            } else {
+                (px0 * f.sample, (px0 + ww) * f.sample, 0)
+            };
+            let rows_at = c.at;
+            for y in 0..wh {
+                let at = rows_at.saturating_add((py0 + y) as u64 * row as u64 + from as u64);
+                if c.seek(at).is_none() {
+                    break;
+                }
+                let Some(raw) = c.slice(to - from) else { break };
+                put(y, raw, skip);
+            }
+        }
+        1 => {
+            let size = if f.big { 4 } else { 2 };
+            let counts_at = c.at;
+            let data_at = counts_at.saturating_add(h as u64 * size);
+            let mut counts = Cursor::new(src, counts_at, data_at.min(c.end));
+            let mut data = Cursor::new(src, data_at, c.end);
+            let mut line = Vec::with_capacity(row);
+            for py in 0..py0 + wh {
+                let Some(n) = next_count(&mut counts, f.big) else { break };
+                if py < py0 {
+                    if data.skip(n).is_none() {
+                        break;
+                    }
+                    continue;
+                }
+                if !packed_row(&mut data, n, row, &mut line) {
+                    break;
+                }
+                put(py - py0, &line, px0);
+            }
         }
         2 | 3 => {
-            let rest = r.take(r.remaining())?;
-            let mut out = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(rest, size).ok()?;
-            if compression == 3 {
-                undo_prediction(&mut out, row, f.sample);
+            let mut z = Inflater::new(c, row);
+            for py in 0..py0 + wh {
+                let Some(line) = z.next_row() else { break };
+                if py < py0 {
+                    continue;
+                }
+                if compression == 3 {
+                    undo_prediction(line, row, f.sample);
+                }
+                put(py - py0, line, px0);
             }
-            out
         }
-        _ => return None,
-    };
-    if raw.len() < size {
-        return None;
+        _ => {}
     }
-    if f.sample == 0 {
-        return Some(spread_bits(&raw, w, h));
-    }
-    Some(to8(raw, f.sample, colour).into_iter().take(w * h).collect())
+    out
+}
+
+/// The number of packed bytes of the next row.
+fn next_count<S: Source + ?Sized>(counts: &mut Cursor<'_, S>, big: bool) -> Option<u64> {
+    if big { counts.u32().map(u64::from) } else { counts.u16().map(u64::from) }
+}
+
+/// A row of `row` bytes unpacked into `line` from the next `n` packed bytes of `data`; false if
+/// they aren't there. No more is read than a row can take packed: a count past that is damage,
+/// and what is past it is passed over.
+fn packed_row<S: Source + ?Sized>(data: &mut Cursor<'_, S>, n: u64, row: usize, line: &mut Vec<u8>) -> bool {
+    let most = (row as u64).saturating_mul(2).saturating_add(2);
+    let take = n.min(most).min(data.remaining());
+    let Some(packed) = usize::try_from(take).ok().and_then(|t| data.slice(t)) else { return false };
+    line.clear();
+    unpack(packed, row, line);
+    let _ = data.skip(n - take);
+    true
 }
 
 /// PackBits: a row of `row` bytes unpacked onto `out` (short rows filled with zeros).
@@ -541,6 +972,83 @@ fn unpack(packed: &[u8], row: usize, out: &mut Vec<u8>) {
         }
     }
     out.resize(end, 0);
+}
+
+/// A zlib stream unpacked a row at a time, held no more than a row and a buffer of its input.
+struct Inflater<'s, S: Source + ?Sized> {
+    data: Cursor<'s, S>,
+    state: Box<InflateState>,
+    line: Vec<u8>,
+    ended: bool,
+}
+
+impl<'s, S: Source + ?Sized> Inflater<'s, S> {
+    fn new(data: Cursor<'s, S>, row: usize) -> Self {
+        Inflater { data, state: InflateState::new_boxed(DataFormat::Zlib), line: vec![0; row], ended: false }
+    }
+
+    /// The next row; none once the stream has ended or doesn't unpack.
+    fn next_row(&mut self) -> Option<&mut [u8]> {
+        let Inflater { data, state, line, ended } = self;
+        let mut filled = 0;
+        while filled < line.len() {
+            if *ended {
+                return None;
+            }
+            let input = data.peek(AHEAD);
+            let out = line.get_mut(filled..).unwrap_or_default();
+            let r = inflate(state, input, out, MZFlush::None);
+            filled += r.bytes_written;
+            let consumed = r.bytes_consumed as u64;
+            let _ = data.skip(consumed);
+            match r.status {
+                Ok(MZStatus::StreamEnd) => *ended = true,
+                // (wanting more input: it is read next time round)
+                Ok(_) | Err(MZError::Buf) => {}
+                Err(_) => return None,
+            }
+            // nothing read and nothing made: the input has run out, or doesn't unpack
+            if consumed == 0 && r.bytes_written == 0 && !*ended {
+                return None;
+            }
+        }
+        Some(line.as_mut_slice())
+    }
+}
+
+/// `dst.len()` samples from `raw` (from its `skip`th) in 8 bits: a bitmap's bits black (set) or
+/// white, 16-bit ones rounded, 32-bit floats (linear light) a `colour` channel's through the sRGB
+/// tone curve, transparency's as they are, both clamped. Those `raw` hasn't are 0.
+fn samples_to8(raw: &[u8], skip: usize, sample: usize, colour: bool, dst: &mut [u8]) {
+    if sample == 1
+        && let Some(part) = raw.get(skip..skip + dst.len())
+    {
+        dst.copy_from_slice(part);
+        return;
+    }
+    for (i, v) in dst.iter_mut().enumerate() {
+        let k = skip + i;
+        *v = match sample {
+            0 => {
+                if raw.get(k / 8).is_some_and(|b| b >> (7 - k % 8) & 1 == 1) {
+                    0
+                } else {
+                    255
+                }
+            }
+            2 => raw
+                .get(2 * k..)
+                .and_then(|s| s.first_chunk::<2>())
+                .map_or(0, |&s| ((u32::from(u16::from_be_bytes(s)) * 255 + 32767) / 65535) as u8),
+            4 => raw.get(4 * k..).and_then(|s| s.first_chunk::<4>()).map_or(0, |&s| {
+                let v = f32::from_be_bytes(s);
+                let v = if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
+                let v = if colour { crate::profile::encode(v) } else { v };
+                (v * 255.0).round() as u8
+            }),
+            _ => raw.get(k).copied().unwrap_or(0),
+        };
+    }
 }
 
 /// ZIP with prediction keeps each sample as its difference from the one before it in the row; a
@@ -579,78 +1087,166 @@ fn undo_prediction(data: &mut [u8], row: usize, sample: usize) {
     }
 }
 
-/// The flattened picture at the end of the file (straight RGBA), if it is there.
-fn merged(r: &mut Reader<'_>, f: &Format, channels: u16) -> Option<Vec<u8>> {
-    let (w, h) = (f.width as usize, f.height as usize);
-    let count = usize::from(channels).max(f.colour.channels());
-    let colours = f.colour.channels();
-    let compression = r.u16()?;
-    let planes: Vec<Vec<u8>> = match compression {
-        1 => {
-            // every row's length first, all channels', then the rows
-            let rows = h.checked_mul(count)?;
-            let counts: Vec<usize> = (0..rows)
-                .map(|_| if f.big { r.u32().map(|c| c as usize) } else { r.u16().map(usize::from) })
-                .collect::<Option<_>>()?;
-            let row = row_bytes(w, f.sample)?;
-            let mut planes = Vec::with_capacity(count);
-            for chunk in counts.chunks(h.max(1)) {
-                let mut raw = Vec::with_capacity(row * h);
-                for &c in chunk {
-                    unpack(r.take(c)?, row, &mut raw);
-                }
-                planes.push(if f.sample == 0 {
-                    spread_bits(&raw, w, h)
-                } else {
-                    to8(raw, f.sample, planes.len() < colours)
-                });
-            }
-            planes
-        }
-        0 => {
-            let size = row_bytes(w, f.sample)?.checked_mul(h)?;
-            (0..count)
-                .map(|c| {
-                    let raw = r.take(size)?;
-                    Some(if f.sample == 0 { spread_bits(raw, w, h) } else { to8(raw.to_vec(), f.sample, c < colours) })
-                })
-                .collect::<Option<_>>()?
-        }
-        _ => return None,
-    };
-    let alpha = planes.get(colours);
+/// The flattened picture at `at` (straight RGBA, the canvas's size), as far as it reads; none if
+/// it isn't there at all.
+fn merged<S: Source + ?Sized>(src: &S, at: u64, f: &Format, channels: u16) -> Option<Vec<u8>> {
+    let (w, h) = f.canvas();
     let mut rgba = vec![0u8; w * h * 4];
-    for (i, px) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-        let s = |c: usize| planes.get(c).and_then(|p| p.get(i)).copied().unwrap_or(0);
-        let [r, g, b] = rgb(f, s);
-        *px = [r, g, b, alpha.and_then(|a| a.get(i)).copied().unwrap_or(255)];
-    }
-    Some(rgba)
+    let read = merged_rows(src, at, f, channels, |y, row| {
+        if let Some(dst) = rgba.get_mut(y * w * 4..(y + 1) * w * 4) {
+            dst.copy_from_slice(row);
+        }
+    });
+    read.then_some(rgba)
 }
 
-/// Samples of `sample` bytes as 8 bits: 16-bit ones rounded, 32-bit floats (linear light) a
-/// `colour` channel's through the sRGB tone curve, transparency's as they are, both clamped.
-fn to8(raw: Vec<u8>, sample: usize, colour: bool) -> Vec<u8> {
-    match sample {
-        2 => raw
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|&s| ((u32::from(u16::from_be_bytes(s)) * 255 + 32767) / 65535) as u8)
-            .collect(),
-        4 => raw
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|&s| {
-                let v = f32::from_be_bytes(s);
-                let v = if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
-                let v = if colour { crate::profile::encode(v) } else { v };
-                (v * 255.0).round() as u8
-            })
-            .collect(),
-        _ => raw,
+/// What hands over a channel's next row, unpacked (false once there are none).
+type RowReader<'a> = Box<dyn FnMut(&mut Vec<u8>) -> bool + 'a>;
+
+/// The flattened picture at `at`, a row at a time (straight RGBA, top first) to `row`, holding a
+/// row of each channel (a stream packed whole, which no writer is known to use for it, is unpacked
+/// whole first); false if none of it reads. Rows past what reads come clear.
+fn merged_rows<S: Source + ?Sized>(
+    src: &S,
+    at: u64,
+    f: &Format,
+    channels: u16,
+    mut row: impl FnMut(usize, &[u8]),
+) -> bool {
+    let (w, h) = f.canvas();
+    let colours = f.colour.channels();
+    let count = usize::from(channels).max(colours);
+    // the colours and transparency (the rest, spot colours and the like, left out)
+    let wanted = count.min(colours + 1);
+    let Some(bytes) = row_bytes(w, f.sample) else { return false };
+    let mut c = Cursor::new(src, at, src.size());
+    let Some(compression) = c.u16() else { return false };
+    // each channel's next row, unpacked: its rows one after another, the channels one after another
+    // (a stream packed whole is unpacked into these first)
+    let mut planes: Vec<Vec<u8>> = Vec::new();
+    let mut readers: Vec<RowReader<'_>> = Vec::with_capacity(wanted);
+    match compression {
+        0 => {
+            for k in 0..wanted {
+                let start = c.at.saturating_add((k * h) as u64 * bytes as u64);
+                let mut d = Cursor::new(src, start, c.end);
+                readers.push(Box::new(move |line: &mut Vec<u8>| {
+                    let Some(raw) = d.slice(bytes) else { return false };
+                    line.clear();
+                    line.extend_from_slice(raw);
+                    true
+                }));
+            }
+        }
+        1 => {
+            // every row's count first, all the channels', then the rows: where each channel's rows
+            // start is the sum of the counts before it
+            let size = if f.big { 4 } else { 2 };
+            let data_at = c.at.saturating_add((count * h) as u64 * size);
+            let mut counts = Cursor::new(src, c.at, data_at.min(c.end));
+            let mut start = data_at;
+            for _ in 0..wanted {
+                let from = counts.at;
+                let mut sum = 0u64;
+                for _ in 0..h {
+                    sum = sum.saturating_add(next_count(&mut counts, f.big).unwrap_or(0));
+                }
+                let mut own = Cursor::new(src, from, counts.at);
+                let mut data = Cursor::new(src, start, c.end);
+                start = start.saturating_add(sum);
+                readers.push(Box::new(move |line: &mut Vec<u8>| {
+                    let Some(n) = next_count(&mut own, f.big) else { return false };
+                    packed_row(&mut data, n, bytes, line)
+                }));
+            }
+        }
+        2 | 3 => {
+            planes.extend((0..wanted).map(|_| Vec::with_capacity(bytes * h)));
+            let mut z = Inflater::new(c, bytes);
+            'all: for plane in &mut planes {
+                for _ in 0..h {
+                    let Some(line) = z.next_row() else { break 'all };
+                    if compression == 3 {
+                        undo_prediction(line, bytes, f.sample);
+                    }
+                    plane.extend_from_slice(line);
+                }
+            }
+            for plane in &planes {
+                let mut rows = plane.chunks(bytes.max(1));
+                readers.push(Box::new(move |line: &mut Vec<u8>| {
+                    let Some(raw) = rows.next() else { return false };
+                    line.clear();
+                    line.extend_from_slice(raw);
+                    true
+                }));
+            }
+        }
+        _ => return false,
     }
+    let mut lines: Vec<Vec<u8>> = (0..wanted).map(|_| Vec::with_capacity(bytes)).collect();
+    let mut samples: Vec<Vec<u8>> = (0..wanted).map(|_| vec![0u8; w]).collect();
+    let mut rgba = vec![0u8; w * 4];
+    let mut any = false;
+    for y in 0..h {
+        for (k, ((next, line), out)) in readers.iter_mut().zip(&mut lines).zip(&mut samples).enumerate() {
+            if next(line) {
+                samples_to8(line, 0, f.sample, k < colours, out);
+                any |= k == 0;
+            } else {
+                out.fill(0);
+            }
+        }
+        let alpha = samples.get(colours);
+        for (x, px) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let s = |c: usize| samples.get(c).and_then(|p| p.get(x)).copied().unwrap_or(0);
+            let [r, g, b] = rgb(f, s);
+            *px = [r, g, b, alpha.and_then(|a| a.get(x)).copied().unwrap_or(255)];
+        }
+        row(y, &rgba);
+    }
+    any
+}
+
+/// The flattened picture at `at` on white, made small to fit `side` (each pixel the average of
+/// those it covers), read a row at a time: its size and opaque RGBA; none if it isn't there.
+fn merged_thumbnail<S: Source + ?Sized>(
+    src: &S,
+    at: u64,
+    f: &Format,
+    channels: u16,
+    side: u32,
+) -> Option<(u32, u32, Vec<u8>)> {
+    let (w, h) = (f.width, f.height);
+    let scale = (side as f32 / w.max(h).max(1) as f32).min(1.0);
+    let (tw, th) = (((w as f32 * scale).round() as u32).max(1), ((h as f32 * scale).round() as u32).max(1));
+    let (tw_, th_) = (tw as usize, th as usize);
+    // each target pixel's sums of red, green and blue on white, and how many it covers
+    let mut sums = vec![[0u32; 4]; tw_ * th_];
+    // the target column each column falls in
+    let columns: Vec<usize> = (0..w as usize).map(|x| (x * tw_ / w.max(1) as usize).min(tw_ - 1)).collect();
+    let read = merged_rows(src, at, f, channels, |y, row| {
+        let ty = (y * th_ / h.max(1) as usize).min(th_ - 1);
+        let Some(target) = sums.get_mut(ty * tw_..(ty + 1) * tw_) else { return };
+        for (&[r, g, b, a], &tx) in row.as_chunks::<4>().0.iter().zip(&columns) {
+            let over = |c: u8| (u32::from(c) * u32::from(a) + 255 * (255 - u32::from(a)) + 127) / 255;
+            if let Some(t) = target.get_mut(tx) {
+                let [sr, sg, sb, n] = *t;
+                *t = [sr + over(r), sg + over(g), sb + over(b), n + 1];
+            }
+        }
+    });
+    if !read {
+        return None;
+    }
+    let rgba = sums
+        .iter()
+        .flat_map(|&[r, g, b, n]| {
+            let n = n.max(1);
+            [r, g, b].map(|v| ((v + n / 2) / n) as u8).into_iter().chain([255])
+        })
+        .collect();
+    Some((tw, th, rgba))
 }
 
 /// A pixel's colour from its samples (CMYK's kept inverted, as PSDs keep them).
@@ -685,16 +1281,15 @@ fn lab_to_srgb(l: u8, a: u8, b: u8) -> [u8; 3] {
     linear.map(|c| (crate::profile::encode(c.clamp(0.0, 1.0)) * 255.0).round() as u8)
 }
 
+/// A straight RGBA pixel premultiplied.
+fn premultiply([r, g, b, a]: [u8; 4]) -> [u8; 4] {
+    let m = |c: u8| ((u16::from(c) * u16::from(a) + 127) / 255) as u8;
+    [m(r), m(g), m(b), a]
+}
+
 /// Straight RGBA made premultiplied.
 fn premultiplied(straight: &[u8]) -> Vec<u8> {
-    let mut out = straight.to_vec();
-    for px in out.as_chunks_mut::<4>().0 {
-        let a = u16::from(px[3]);
-        for c in px.iter_mut().take(3) {
-            *c = ((u16::from(*c) * a + 127) / 255) as u8;
-        }
-    }
-    out
+    straight.as_chunks::<4>().0.iter().flat_map(|&px| premultiply(px)).collect()
 }
 
 fn paint_layer(id: LayerId, name: String, parent: Option<LayerId>) -> Layer {
@@ -716,29 +1311,20 @@ fn paint_layer(id: LayerId, name: String, parent: Option<LayerId>) -> Layer {
         assisted: false,
         control: None,
         plugin: None,
+        filter: None,
+        marks: Default::default(),
     }
 }
 
-/// The document's layers (bottom first) and pixels, the top layer and the background colour (if
-/// the bottom layer was all one colour).
-struct Built {
+/// The document's layers (bottom first), where each one's pixels come from, and the top layer.
+struct Plan {
     layers: Vec<Layer>,
-    pixels: Vec<(LayerId, Vec<u8>)>,
-    top: LayerId,
-    background: Option<[u8; 3]>,
+    pixels: Vec<(LayerId, Pixels)>,
+    top: Option<LayerId>,
 }
 
-/// The document's layers and pixels from the records.
-/// What a record's pixels came to: nothing on the canvas, the one colour the bottom layer is
-/// all of, or its pixels on the canvas.
-enum Made {
-    Nothing,
-    Uniform([u8; 3]),
-    Pixels(Vec<u8>),
-}
-
-fn build(records: &[Record], f: &Format) -> Built {
-    let (w, h) = (f.width as usize, f.height as usize);
+/// The document's layers from the records; the bottom one left out if it is the `background`.
+fn plan(records: &[Record], f: &Format, background: bool) -> Plan {
     let mut layers = Vec::new();
     let mut pixels = Vec::new();
     let mut next = 1u64;
@@ -749,22 +1335,6 @@ fn build(records: &[Record], f: &Format) -> Built {
     // the groups open around the records being read
     let mut open: Vec<LayerId> = Vec::new();
     let mut top = None;
-    let mut background = None;
-    // each record's pixels worked out side by side (on the canvas, or the bottom layer's one
-    // colour), then the records gone through in order
-    let numbers: Vec<usize> = (0..records.len()).collect();
-    let made_of = |&i: &usize| -> Made {
-        let Some(r) = records.get(i).filter(|r| !matches!(r.section, Some(1..=3))) else { return Made::Nothing };
-        match picture(r, f) {
-            None => Made::Nothing,
-            Some(p) => match p.uniform() {
-                Some(colour) if i == 0 => Made::Uniform(colour),
-                _ => Made::Pixels(p.on_canvas(w, h)),
-            },
-        }
-    };
-    // each holds its picture apart while it is placed on the canvas
-    let mut made: Vec<Option<Made>> = crate::par::side_by_side_within(&numbers, w * h * 4, made_of);
     for (i, r) in records.iter().enumerate() {
         // a layer without a name is numbered by where it is, counting from 2 at the bottom
         let name = if r.name.is_empty() { format!("Layer {}", i + 2) } else { r.name.clone() };
@@ -788,17 +1358,15 @@ fn build(records: &[Record], f: &Format) -> Built {
             }
             _ => {}
         }
-        let on_canvas = match made.get_mut(i).and_then(Option::take).unwrap_or_else(|| made_of(&i)) {
-            // the bottom layer all of one colour: the background
-            Made::Uniform(colour) => {
-                background = Some(colour);
-                continue;
-            }
-            Made::Pixels(px) => px,
-            // nothing on the canvas and no text: left out, its mask too
-            Made::Nothing if r.text.is_none() => continue,
-            Made::Nothing => vec![0; w * h * 4],
-        };
+        // the bottom layer all of one colour: the background
+        if i == 0 && background {
+            continue;
+        }
+        // nothing on the canvas and no text: left out, its mask too
+        let on_canvas = r.window(f).is_some();
+        if !on_canvas && r.text.is_none() {
+            continue;
+        }
         let id = new_id();
         layers.push(Layer {
             visible: !r.hidden,
@@ -810,11 +1378,12 @@ fn build(records: &[Record], f: &Format) -> Built {
             text: r.text.clone(),
             ..paint_layer(id, name, open.last().copied())
         });
-        pixels.push((id, on_canvas));
+        if on_canvas {
+            pixels.push((id, Pixels::Record(i)));
+        }
         top = Some(id);
         // its mask, just above it (hidden if turned off)
-        let mask = r.mask.filter(|m| span(m.left, m.right) * span(m.top, m.bottom) > 0);
-        if let (Some(m), Some((_, plane))) = (mask, r.channels.iter().find(|(c, _)| *c == -2)) {
+        if let Some(m) = r.mask() {
             let mid = new_id();
             layers.push(Layer {
                 kind: LayerKind::Mask,
@@ -822,91 +1391,10 @@ fn build(records: &[Record], f: &Format) -> Built {
                 visible: !m.hidden,
                 ..paint_layer(mid, String::new(), Some(id))
             });
-            let mut grey = vec![m.outside; w * h];
-            let (mw, mh) = (span(m.left, m.right), span(m.top, m.bottom));
-            blit(&mut grey, w, h, m.left, m.top, mw, mh, |i| plane.get(i).copied().unwrap_or(m.outside));
-            pixels.push((mid, grey.into_iter().flat_map(|v| [v, v, v, 255]).collect()));
+            pixels.push((mid, Pixels::Mask(i)));
         }
     }
-    Built { layers, pixels, top: top.unwrap_or(LayerId(1)), background }
-}
-
-/// The part of a layer on the canvas: where it is and its straight RGBA.
-struct Picture {
-    left: usize,
-    top: usize,
-    width: usize,
-    rgba: Vec<u8>,
-}
-
-impl Picture {
-    /// Its colour, if every pixel of it is the same.
-    fn uniform(&self) -> Option<[u8; 3]> {
-        let mut px = self.rgba.as_chunks::<4>().0.iter();
-        let first = *px.next()?;
-        px.all(|p| *p == first).then_some([first[0], first[1], first[2]])
-    }
-
-    /// Premultiplied, on a transparent canvas `w` x `h`.
-    fn on_canvas(&self, w: usize, h: usize) -> Vec<u8> {
-        let mut out = vec![0u8; w * h * 4];
-        for (y, row) in self.rgba.chunks(self.width.max(1) * 4).enumerate() {
-            let at = ((self.top + y) * w + self.left) * 4;
-            if let Some(dst) = out.get_mut(at..at + row.len()) {
-                dst.copy_from_slice(&premultiplied(row));
-            }
-        }
-        out
-    }
-}
-
-/// A layer's pixels where it lies on the canvas: none if no part of it does, or one of its colour
-/// channels is missing.
-fn picture(r: &Record, f: &Format) -> Option<Picture> {
-    let (w, h) = (i64::from(f.width), i64::from(f.height));
-    let lw = span(r.left, r.right);
-    let (x0, y0) = (i64::from(r.left).max(0), i64::from(r.top).max(0));
-    let x1 = (i64::from(r.left) + lw as i64).min(w);
-    let y1 = (i64::from(r.top) + span(r.top, r.bottom) as i64).min(h);
-    if x1 <= x0 || y1 <= y0 {
-        return None;
-    }
-    let channel = |id: i16| r.channels.iter().find(|(c, _)| *c == id).map(|(_, p)| p);
-    let colours: Vec<&Vec<u8>> = (0..f.colour.channels() as i16).map(channel).collect::<Option<_>>()?;
-    let alpha = channel(-1);
-    let mut rgba = Vec::with_capacity(((x1 - x0) * (y1 - y0) * 4) as usize);
-    for cy in y0..y1 {
-        for cx in x0..x1 {
-            let j = (cy - i64::from(r.top)) as usize * lw + (cx - i64::from(r.left)) as usize;
-            let s = |c: usize| colours.get(c).and_then(|p| p.get(j)).copied().unwrap_or(0);
-            // no alpha channel: opaque (as a background layer is)
-            let a = alpha.map_or(255, |p| p.get(j).copied().unwrap_or(0));
-            let [r, g, b] = rgb(f, s);
-            rgba.extend_from_slice(&[r, g, b, a]);
-        }
-    }
-    Some(Picture { left: x0 as usize, top: y0 as usize, width: (x1 - x0) as usize, rgba })
-}
-
-/// Copies a `pw` x `ph` patch whose top left is at (`left`, `top`) onto a `w` x `h` grid, taking
-/// each of its samples from `sample` (by index in the patch); the part off the grid is left out.
-#[allow(clippy::too_many_arguments)]
-fn blit(grid: &mut [u8], w: usize, h: usize, left: i32, top: i32, pw: usize, ph: usize, sample: impl Fn(usize) -> u8) {
-    for y in 0..ph {
-        let gy = i64::from(top) + y as i64;
-        if gy < 0 || gy >= h as i64 {
-            continue;
-        }
-        for x in 0..pw {
-            let gx = i64::from(left) + x as i64;
-            if gx < 0 || gx >= w as i64 {
-                continue;
-            }
-            if let Some(v) = grid.get_mut(gy as usize * w + gx as usize) {
-                *v = sample(y * pw + x);
-            }
-        }
-    }
+    Plan { layers, pixels, top }
 }
 
 /// A blend mode from its key (pass-through groups, dissolve and anything unknown: normal).
@@ -941,29 +1429,101 @@ fn blend_mode(key: &[u8; 4]) -> BlendMode {
     }
 }
 
-/// Reads big-endian numbers and runs of bytes in order; None past the end.
-struct Reader<'a> {
-    bytes: &'a [u8],
-    at: usize,
+/// How much a cursor reads ahead at once.
+const AHEAD: usize = 64 << 10;
+
+/// Reads big-endian numbers and runs of bytes in order from part of a source (`at` up to `end`),
+/// a buffer's worth read ahead at a time; None past its end.
+struct Cursor<'s, S: Source + ?Sized> {
+    src: &'s S,
+    at: u64,
+    end: u64,
+    /// Bytes read ahead, from `ahead_at`.
+    ahead: Vec<u8>,
+    ahead_at: u64,
 }
 
-impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Reader<'a> {
-        Reader { bytes, at: 0 }
+impl<'s, S: Source + ?Sized> Cursor<'s, S> {
+    fn new(src: &'s S, at: u64, end: u64) -> Self {
+        let end = end.min(src.size());
+        Cursor { src, at: at.min(end), end, ahead: Vec::new(), ahead_at: 0 }
     }
 
-    fn remaining(&self) -> usize {
-        self.bytes.len().saturating_sub(self.at)
+    fn remaining(&self) -> u64 {
+        self.end.saturating_sub(self.at)
     }
 
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let s = self.bytes.get(self.at..self.at.checked_add(n)?)?;
+    fn skip(&mut self, n: u64) -> Option<()> {
+        (n <= self.remaining()).then(|| self.at += n)
+    }
+
+    /// Goes to `at` (up to the end).
+    fn seek(&mut self, at: u64) -> Option<()> {
+        (at <= self.end).then(|| self.at = at)
+    }
+
+    /// A cursor over the next `n` bytes, passed over here.
+    fn sub(&mut self, n: u64) -> Option<Cursor<'s, S>> {
+        let at = self.at;
+        self.skip(n)?;
+        Some(Cursor::new(self.src, at, at + n))
+    }
+
+    /// Whether the next `n` bytes are read ahead (reading them, and a buffer's worth after, if
+    /// they aren't); false if they aren't there.
+    fn hold(&mut self, n: usize) -> bool {
+        let from = self.at.checked_sub(self.ahead_at).and_then(|o| usize::try_from(o).ok());
+        if from.and_then(|f| f.checked_add(n)).is_some_and(|e| e <= self.ahead.len()) {
+            return true;
+        }
+        let len = usize::try_from(self.remaining()).unwrap_or(usize::MAX).min(n.max(AHEAD));
+        if len < n {
+            return false;
+        }
+        self.ahead.resize(len, 0);
+        if !self.src.read_at(self.at, &mut self.ahead) {
+            self.ahead.clear();
+            return false;
+        }
+        self.ahead_at = self.at;
+        true
+    }
+
+    /// The next `n` bytes.
+    fn slice(&mut self, n: usize) -> Option<&[u8]> {
+        if !self.hold(n) {
+            return None;
+        }
+        let from = usize::try_from(self.at.checked_sub(self.ahead_at)?).ok()?;
+        self.at += n as u64;
+        self.ahead.get(from..from.checked_add(n)?)
+    }
+
+    /// Up to `most` of the next bytes, without passing over them (none at the end).
+    fn peek(&mut self, most: usize) -> &[u8] {
+        let n = usize::try_from(self.remaining()).unwrap_or(usize::MAX).min(most);
+        if n == 0 || !self.hold(n) {
+            return &[];
+        }
+        let from = self.at.checked_sub(self.ahead_at).and_then(|o| usize::try_from(o).ok()).unwrap_or(0);
+        self.ahead.get(from..from + n).unwrap_or_default()
+    }
+
+    /// The next `n` bytes, as they are (for runs a caller has kept small).
+    fn bytes(&mut self, n: u64) -> Option<Vec<u8>> {
+        if n > self.remaining() {
+            return None;
+        }
+        let mut out = vec![0; usize::try_from(n).ok()?];
+        if !self.src.read_at(self.at, &mut out) {
+            return None;
+        }
         self.at += n;
-        Some(s)
+        Some(out)
     }
 
     fn array<const N: usize>(&mut self) -> Option<[u8; N]> {
-        self.take(N)?.try_into().ok()
+        self.slice(N)?.first_chunk::<N>().copied()
     }
 
     fn u8(&mut self) -> Option<u8> {
@@ -990,564 +1550,50 @@ impl<'a> Reader<'a> {
         self.array().map(u64::from_be_bytes)
     }
 
-    fn f64(&mut self) -> Option<f64> {
-        self.u64().map(f64::from_bits)
-    }
-
     /// A length: four bytes, or eight in a PSB.
-    fn len(&mut self, big: bool) -> Option<usize> {
-        if big { usize::try_from(self.u64()?).ok() } else { self.u32().map(|n| n as usize) }
+    fn len(&mut self, big: bool) -> Option<u64> {
+        if big { self.u64() } else { self.u32().map(u64::from) }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::formats::{PsdKind, PsdLayer, psd};
+/// Reads big-endian numbers and runs of bytes in order from bytes in memory; None past the end.
+struct Reader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
 
-    /// A `w` x `h` picture of one straight RGBA colour.
-    fn solid(w: u32, h: u32, px: [u8; 4]) -> Vec<u8> {
-        std::iter::repeat_n(px, (w * h) as usize).flatten().collect()
+impl<'a> Reader<'a> {
+    fn new(bytes: &'a [u8]) -> Reader<'a> {
+        Reader { bytes, at: 0 }
     }
 
-    #[test]
-    fn layers_groups_and_masks_come_back_as_they_were_written() {
-        let (w, h) = (4, 3);
-        let mut blue = solid(w, h, [0, 0, 255, 255]);
-        blue[4..8].copy_from_slice(&[0, 255, 255, 255]);
-        // red on the left half only, half covered
-        let mut red = solid(w, h, [0, 0, 0, 0]);
-        for y in 0..h as usize {
-            for x in 0..2 {
-                red[(y * w as usize + x) * 4..][..4].copy_from_slice(&[255, 0, 0, 128]);
-            }
-        }
-        let mask: Vec<u8> = (0..w * h).map(|i| if i % 2 == 0 { 255 } else { 0 }).collect();
-        let layers = [
-            PsdLayer {
-                name: "Group",
-                kind: PsdKind::GroupStart { open: false },
-                opacity: 1.0,
-                visible: true,
-                blend: BlendMode::Normal,
-                clipped: false,
-            },
-            PsdLayer {
-                name: "Red",
-                kind: PsdKind::Pixels { rgba: &red, mask: Some(&mask) },
-                opacity: 1.0,
-                visible: true,
-                blend: BlendMode::Screen,
-                clipped: false,
-            },
-            PsdLayer {
-                name: "",
-                kind: PsdKind::GroupEnd,
-                opacity: 1.0,
-                visible: true,
-                blend: BlendMode::Normal,
-                clipped: false,
-            },
-            PsdLayer {
-                name: "Bläu",
-                kind: PsdKind::Pixels { rgba: &blue, mask: None },
-                opacity: 0.5,
-                visible: false,
-                blend: BlendMode::Multiply,
-                clipped: false,
-            },
-        ];
-        let bytes = psd(w, h, 300.0, &[], &layers, &blue, None);
-        let got = read(&bytes).unwrap();
-        let doc = &got.document;
-        assert_eq!((doc.width(), doc.height()), (w, h));
-        assert!((doc.dpi - 300.0).abs() < 0.01);
-        let names: Vec<(&str, LayerKind)> = doc.layers().iter().map(|l| (l.name.as_str(), l.kind)).collect();
-        assert_eq!(
-            names,
-            [
-                ("Bläu", LayerKind::Paint),
-                ("Red", LayerKind::Paint),
-                ("Mask", LayerKind::Mask),
-                ("Group", LayerKind::Group)
-            ]
-        );
-        let [bottom, red_layer, mask_layer, group] = doc.layers() else { panic!() };
-        // the background hidden: no bottom layer of one colour
-        assert!(!doc.background_visible);
-        assert!(!bottom.visible);
-        assert_eq!(bottom.blend, BlendMode::Multiply);
-        assert!((bottom.opacity - 0.5).abs() < 0.01);
-        assert_eq!(red_layer.blend, BlendMode::Screen);
-        assert_eq!(red_layer.parent, Some(group.id));
-        assert!(mask_layer.visible);
-        assert_eq!(mask_layer.parent, Some(red_layer.id));
-        assert!(group.collapsed);
-        // pixels premultiplied, placed where they were
-        let px = |id: LayerId| got.pixels.iter().find(|(i, _)| *i == id).map(|(_, p)| p.clone()).unwrap();
-        let reds = px(red_layer.id);
-        assert_eq!(&reds[0..4], &[128, 0, 0, 128]);
-        assert_eq!(&reds[8..12], &[0, 0, 0, 0]);
-        assert_eq!(&px(bottom.id)[0..4], &[0, 0, 255, 255]);
-        let m = px(mask_layer.id);
-        assert_eq!(&m[0..8], &[255, 255, 255, 255, 0, 0, 0, 255]);
-        // the flattened picture is there too
-        let (fw, fh, flat) = flattened(&bytes).unwrap();
-        assert_eq!((fw, fh), (w, h));
-        assert_eq!(&flat[0..4], &[0, 0, 255, 255]);
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let s = self.bytes.get(self.at..self.at.checked_add(n)?)?;
+        self.at += n;
+        Some(s)
     }
 
-    #[test]
-    fn a_file_without_layers_is_one_layer_and_bad_files_are_turned_away() {
-        let (w, h) = (3, 2);
-        let flat = solid(w, h, [10, 20, 30, 255]);
-        let mut bytes = psd(w, h, 72.0, &[], &[], &flat, None);
-        let got = read(&bytes).unwrap();
-        assert_eq!(got.document.layers().len(), 1);
-        assert_eq!(&got.pixels[0].1[0..4], &[10, 20, 30, 255]);
-        assert_eq!(read(b"PNG.").err(), Some(PsdError::NotAPsd));
-        // multichannel
-        bytes[25] = 7;
-        assert_eq!(read(&bytes).err(), Some(PsdError::Unsupported("colour mode")));
-        bytes[25] = 3;
-        bytes.truncate(40);
-        assert!(read(&bytes).is_err());
+    fn array<const N: usize>(&mut self) -> Option<[u8; N]> {
+        self.take(N)?.try_into().ok()
     }
 
-    /// A layer record for a PSD made by hand: its rectangle (top, left, bottom, right), channels
-    /// (id and samples, kept raw), mask data and additional information.
-    struct Raw<'a> {
-        rect: [i32; 4],
-        channels: Vec<(i16, Vec<u8>)>,
-        blend: &'a [u8; 4],
-        opacity: u8,
-        /// Bit 1: hidden.
-        flags: u8,
-        mask: Vec<u8>,
-        name: &'a str,
-        blocks: Vec<(&'a [u8; 4], Vec<u8>)>,
+    fn u8(&mut self) -> Option<u8> {
+        self.array::<1>().map(|[b]| b)
     }
 
-    impl Default for Raw<'_> {
-        fn default() -> Self {
-            Raw {
-                rect: [0; 4],
-                channels: Vec::new(),
-                blend: b"norm",
-                opacity: 255,
-                flags: 0,
-                mask: Vec::new(),
-                name: "Layer",
-                blocks: Vec::new(),
-            }
-        }
+    fn u16(&mut self) -> Option<u16> {
+        self.array().map(u16::from_be_bytes)
     }
 
-    impl Raw<'_> {
-        /// RGBA samples of one colour over its rectangle.
-        fn filled(mut self, px: [u8; 4]) -> Self {
-            let [top, left, bottom, right] = self.rect;
-            let n = ((bottom - top) * (right - left)).max(0) as usize;
-            self.channels = [(-1, 3), (0, 0), (1, 1), (2, 2)].map(|(id, c)| (id, vec![px[c]; n])).to_vec();
-            self
-        }
+    fn u32(&mut self) -> Option<u32> {
+        self.array().map(u32::from_be_bytes)
     }
 
-    fn u32s(values: &[u32]) -> Vec<u8> {
-        values.iter().flat_map(|v| v.to_be_bytes()).collect()
+    fn i32(&mut self) -> Option<i32> {
+        self.array().map(i32::from_be_bytes)
     }
 
-    /// Mask data: a rectangle, the colour outside it and flags, `len` bytes long.
-    fn mask_data([top, left, bottom, right]: [i32; 4], outside: u8, flags: u8, len: usize) -> Vec<u8> {
-        let mut m: Vec<u8> = [top, left, bottom, right].iter().flat_map(|v| v.to_be_bytes()).collect();
-        m.extend([outside, flags]);
-        m.resize(len, 0);
-        m
-    }
-
-    /// An RGB PSD `w` x `h` of `records` (bottom first) and a flattened picture of one colour.
-    fn raw_psd(w: u32, h: u32, records: &[Raw<'_>], flat: [u8; 4]) -> Vec<u8> {
-        let mut out = b"8BPS".to_vec();
-        out.extend(1u16.to_be_bytes());
-        out.extend([0; 6]);
-        out.extend(4u16.to_be_bytes());
-        out.extend(u32s(&[h, w]));
-        out.extend(8u16.to_be_bytes());
-        out.extend(3u16.to_be_bytes());
-        out.extend(u32s(&[0, 0]));
-        let mut info = (records.len() as u16).to_be_bytes().to_vec();
-        let mut data = Vec::new();
-        for r in records {
-            info.extend(r.rect.iter().flat_map(|v| v.to_be_bytes()));
-            info.extend((r.channels.len() as u16).to_be_bytes());
-            for (id, samples) in &r.channels {
-                info.extend(id.to_be_bytes());
-                info.extend((samples.len() as u32 + 2).to_be_bytes());
-                data.extend([0, 0]);
-                data.extend(samples);
-            }
-            info.extend(b"8BIM");
-            info.extend(r.blend);
-            info.extend([r.opacity, 0, r.flags, 0]);
-            let mut extra = (r.mask.len() as u32).to_be_bytes().to_vec();
-            extra.extend(&r.mask);
-            extra.extend(0u32.to_be_bytes());
-            extra.push(r.name.len() as u8);
-            extra.extend(r.name.as_bytes());
-            while !extra.len().is_multiple_of(4) {
-                extra.push(0);
-            }
-            for (key, block) in &r.blocks {
-                extra.extend(b"8BIM");
-                extra.extend(*key);
-                extra.extend((block.len() as u32).to_be_bytes());
-                extra.extend(block);
-            }
-            info.extend((extra.len() as u32).to_be_bytes());
-            info.extend(extra);
-        }
-        info.extend(data);
-        let mut section = (info.len() as u32).to_be_bytes().to_vec();
-        section.extend(info);
-        section.extend(0u32.to_be_bytes());
-        out.extend((section.len() as u32).to_be_bytes());
-        out.extend(section);
-        // the flattened picture, raw: four planes
-        out.extend(0u16.to_be_bytes());
-        for c in flat {
-            out.extend(std::iter::repeat_n(c, (w * h) as usize));
-        }
-        out
-    }
-
-    #[test]
-    fn effects_vector_masks_adjustments_and_fill_are_left_out_and_empty_layers_dropped() {
-        let (w, h) = (6, 4);
-        let mut bottom = Raw { rect: [0, 0, 4, 6], name: "Paper", ..Raw::default() }.filled([200, 10, 10, 255]);
-        // not all of one colour
-        bottom.channels[1].1[0] = 0;
-        let records = [
-            bottom,
-            // its own pixels, at its full opacity; the effects, fill and vector mask unread
-            Raw {
-                rect: [1, 1, 3, 4],
-                opacity: 128,
-                name: "Shape",
-                blocks: vec![
-                    (b"iOpa", vec![0, 0, 0, 0]),
-                    (b"lrFX", vec![0, 0, 0, 0]),
-                    (b"lfx2", vec![0; 8]),
-                    (b"vmsk", vec![0; 8]),
-                    (b"SoCo", vec![0; 8]),
-                ],
-                ..Raw::default()
-            }
-            .filled([0, 0, 255, 255]),
-            // an adjustment has no pixels: left out with its mask
-            Raw {
-                mask: mask_data([0, 0, 0, 0], 255, 0, 20),
-                channels: vec![(-2, vec![])],
-                name: "Curves 1",
-                blocks: vec![(b"curv", vec![0; 4])],
-                ..Raw::default()
-            },
-            // so is an empty layer, and one off the canvas
-            Raw { name: "Empty", ..Raw::default() },
-            Raw { rect: [10, 10, 12, 12], name: "Away", ..Raw::default() }.filled([1, 2, 3, 255]),
-            // a fill layer keeps the pixels drawn for it
-            Raw { rect: [0, 0, 4, 6], name: "Fill", blocks: vec![(b"SoCo", vec![0; 8])], ..Raw::default() }
-                .filled([0, 255, 0, 255]),
-        ];
-        let got = read(&raw_psd(w, h, &records, [9, 9, 9, 255])).unwrap();
-        let names: Vec<&str> = got.document.layers().iter().map(|l| l.name.as_str()).collect();
-        assert_eq!(names, ["Paper", "Shape", "Fill"]);
-        let shape = &got.document.layers()[1];
-        assert!((shape.opacity - 128.0 / 255.0).abs() < 1e-6);
-        let px = &got.pixels[1].1;
-        assert_eq!(&px[(6 + 1) * 4..][..4], &[0, 0, 255, 255]);
-        assert_eq!(&px[0..4], &[0, 0, 0, 0]);
-        // nothing on the canvas at all: the flattened picture
-        let got = read(&raw_psd(w, h, &records[2..5], [9, 9, 9, 255])).unwrap();
-        assert_eq!(got.document.layers().len(), 1);
-        assert_eq!(&got.pixels[0].1[0..4], &[9, 9, 9, 255]);
-    }
-
-    #[test]
-    fn a_bottom_layer_of_one_colour_becomes_the_background() {
-        let (w, h) = (4, 4);
-        let records = [
-            // part of the canvas only, but all of one colour
-            Raw { rect: [1, 1, 3, 3], name: "Background", ..Raw::default() }.filled([10, 20, 30, 255]),
-            Raw { rect: [0, 0, 1, 1], name: "Dot", ..Raw::default() }.filled([255, 0, 0, 255]),
-        ];
-        let got = read(&raw_psd(w, h, &records, [0; 4])).unwrap();
-        let doc = &got.document;
-        assert!(doc.background_visible);
-        assert_eq!(doc.background, [10.0 / 255.0, 20.0 / 255.0, 30.0 / 255.0]);
-        let names: Vec<&str> = doc.layers().iter().map(|l| l.name.as_str()).collect();
-        assert_eq!(names, ["Dot"]);
-        // above a bottom layer of two colours it stays a layer
-        let mut two = Raw { rect: [0, 0, 1, 2], name: "Two", ..Raw::default() }.filled([255, 0, 0, 255]);
-        two.channels[1].1[1] = 0;
-        let [solid, _] = records;
-        let got = read(&raw_psd(w, h, &[two, solid], [0; 4])).unwrap();
-        assert!(!got.document.background_visible);
-        assert_eq!(got.document.background, [1.0; 3]);
-        assert_eq!(got.document.layers().len(), 2);
-    }
-
-    #[test]
-    fn locks_groups_masks_and_names_come_in_as_the_file_has_them() {
-        let (w, h) = (4, 4);
-        let mut base = Raw { rect: [0, 0, 4, 4], name: "Base", ..Raw::default() }.filled([0, 0, 0, 255]);
-        base.channels[1].1[3] = 9;
-        // transparency, position and everything locked
-        base.blocks = vec![(b"lspf", u32s(&[1]))];
-        let lsct = |kind: u32| (b"lsct", u32s(&[kind]));
-        let records = [
-            base,
-            Raw { name: "</Layer group>", blocks: vec![lsct(3)], ..Raw::default() },
-            Raw {
-                rect: [0, 0, 2, 2],
-                name: "",
-                blocks: vec![(b"lspf", u32s(&[4]))],
-                // turned off: kept, hidden
-                mask: mask_data([0, 0, 2, 2], 0, 2, 20),
-                ..Raw::default()
-            }
-            .filled([5, 5, 5, 255]),
-            Raw {
-                rect: [2, 2, 4, 4],
-                name: "Feathered",
-                blocks: vec![(b"lspf", u32s(&[0x8000_0000]))],
-                // density or feather settings: the mask left out
-                mask: mask_data([2, 2, 4, 4], 0, 0x10, 28),
-                ..Raw::default()
-            }
-            .filled([6, 6, 6, 255]),
-            // its blend mode and opacity are left out
-            Raw {
-                blend: b"mul ",
-                opacity: 51,
-                flags: 2,
-                name: "Folder",
-                blocks: vec![lsct(2), (b"lspf", u32s(&[2]))],
-                ..Raw::default()
-            },
-        ];
-        let mut records = records;
-        records[2].channels.push((-2, vec![255, 0, 0, 255]));
-        records[3].channels.push((-2, vec![255; 4]));
-        let got = read(&raw_psd(w, h, &records, [0; 4])).unwrap();
-        let doc = &got.document;
-        let names: Vec<(&str, LayerKind)> = doc.layers().iter().map(|l| (l.name.as_str(), l.kind)).collect();
-        assert_eq!(
-            names,
-            [
-                ("Base", LayerKind::Paint),
-                ("Layer 4", LayerKind::Paint),
-                ("Mask", LayerKind::Mask),
-                ("Feathered", LayerKind::Paint),
-                ("Folder", LayerKind::Group)
-            ]
-        );
-        let [base, unnamed, mask, feathered, folder] = doc.layers() else { panic!() };
-        assert!(base.alpha_lock && !base.locked);
-        assert!(unnamed.locked && !unnamed.alpha_lock);
-        assert!(!mask.visible);
-        assert_eq!(&got.pixels[2].1[0..8], &[255, 255, 255, 255, 0, 0, 0, 255]);
-        assert!(feathered.locked && feathered.alpha_lock);
-        assert!(folder.collapsed && !folder.visible && folder.locked);
-        assert_eq!((folder.blend, folder.opacity), (BlendMode::Normal, 1.0));
-        assert_eq!((unnamed.parent, feathered.parent), (Some(folder.id), Some(folder.id)));
-    }
-
-    #[test]
-    fn a_text_layer_keeps_its_text_and_pixels() {
-        let (w, h) = (8, 4);
-        let tool = text::tests::type_tool(
-            "Hello",
-            "Helvetica-Bold",
-            10.0,
-            [0.0, 0.0, 1.0],
-            0,
-            [1.0, 0.0, 0.0, 1.0, 2.0, 3.0],
-            [0.0, -3.0, 5.0, 1.0],
-            false,
-        );
-        let mut paper = Raw { rect: [0, 0, 4, 8], name: "Paper", ..Raw::default() }.filled([255; 4]);
-        paper.channels[1].1[0] = 0;
-        let records = [
-            paper,
-            Raw { rect: [0, 2, 3, 6], name: "Hello", blocks: vec![(b"TySh", tool.clone())], ..Raw::default() }
-                .filled([0, 0, 255, 255]),
-            // turned: pixels only
-            Raw {
-                rect: [0, 2, 3, 6],
-                name: "Turned",
-                blocks: vec![(
-                    b"TySh",
-                    text::tests::type_tool(
-                        "Hi",
-                        "F",
-                        10.0,
-                        [0.0; 3],
-                        0,
-                        [0.0, 1.0, -1.0, 0.0, 2.0, 3.0],
-                        [0.0, -3.0, 5.0, 1.0],
-                        false,
-                    ),
-                )],
-                ..Raw::default()
-            }
-            .filled([0, 0, 0, 255]),
-            // text with nothing drawn yet still comes in
-            Raw { name: "Blank", blocks: vec![(b"TySh", tool)], ..Raw::default() },
-        ];
-        let got = read(&raw_psd(w, h, &records, [0; 4])).unwrap();
-        let [_, hello, turned, blank] = got.document.layers() else { panic!() };
-        let t = hello.text.as_ref().unwrap();
-        assert_eq!((t.text.as_str(), t.font.as_str(), t.style.as_str()), ("Hello", "Helvetica", "Bold"));
-        assert_eq!(t.origin, [2.0, 0.0]);
-        assert_eq!(t.color, [0.0, 0.0, 1.0]);
-        assert_eq!(hello.name, "Hello");
-        assert_eq!(&got.pixels[1].1[2 * 4..][..4], &[0, 0, 255, 255]);
-        assert!(turned.text.is_none());
-        assert!(blank.text.is_some());
-        assert!(got.pixels[3].1.iter().all(|&v| v == 0));
-    }
-
-    /// Real PSDs, when a folder of them is given (`PSD_CORPUS=folder`, never committed): each one
-    /// reads or is turned away as a kind not read, and what reads holds together.
-    #[test]
-    fn a_corpus_of_real_psds_reads() {
-        let Ok(root) = std::env::var("PSD_CORPUS") else { return };
-        let mut files = Vec::new();
-        let mut folders = vec![std::path::PathBuf::from(&root)];
-        while let Some(folder) = folders.pop() {
-            for entry in std::fs::read_dir(&folder).unwrap().flatten() {
-                let path = entry.path();
-                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
-                if path.is_dir() {
-                    folders.push(path);
-                } else if ext == "psd" || ext == "psb" {
-                    files.push(path);
-                }
-            }
-        }
-        files.sort();
-        assert!(!files.is_empty(), "no PSDs in {root}");
-        let (mut read_ok, mut refused, mut layers, mut texts, mut backgrounds, mut masks) = (0, 0, 0, 0, 0, 0);
-        let mut failures = Vec::new();
-        for path in &files {
-            let bytes = std::fs::read(path).unwrap();
-            match read(&bytes) {
-                Ok(got) => {
-                    read_ok += 1;
-                    let doc = &got.document;
-                    layers += doc.layers().len();
-                    texts += doc.layers().iter().filter(|l| l.text.is_some()).count();
-                    masks += doc.layers().iter().filter(|l| l.kind == LayerKind::Mask).count();
-                    backgrounds += usize::from(doc.background_visible);
-                    let size = doc.width() as usize * doc.height() as usize * 4;
-                    let painted = doc.layers().iter().filter(|l| l.kind != LayerKind::Group).count();
-                    if got.pixels.len() != painted || got.pixels.iter().any(|(_, p)| p.len() != size) {
-                        failures.push(format!("{}: pixels don't match the layers", path.display()));
-                    }
-                    if let Ok(dump) = std::env::var("PSD_CORPUS_LIST") {
-                        let mut out = format!("== {}\n", path.display());
-                        if doc.background_visible {
-                            out += &format!("   background {:?}\n", doc.background);
-                        }
-                        for l in doc.layers().iter().rev() {
-                            let text = l.text.as_ref().map(|t| {
-                                format!(
-                                    " text {:?} {} {} {:.1} {:?} w{:.0}",
-                                    t.text, t.font, t.style, t.size, t.origin, t.width
-                                )
-                            });
-                            out += &format!(
-                                "   {:?} {:?} {:?} vis={} op={:.2} lock={} alpha={}{}\n",
-                                l.kind,
-                                l.name,
-                                l.blend,
-                                l.visible,
-                                l.opacity,
-                                l.locked,
-                                l.alpha_lock,
-                                text.unwrap_or_default()
-                            );
-                        }
-                        use std::io::Write;
-                        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&dump).unwrap();
-                        f.write_all(out.as_bytes()).unwrap();
-                    }
-                }
-                Err(PsdError::Unsupported(_)) => refused += 1,
-                Err(e) => failures.push(format!("{}: {e:?}", path.display())),
-            }
-        }
-        eprintln!(
-            "{} files: {read_ok} read ({layers} layers, {texts} text, {masks} masks, {backgrounds} backgrounds), {refused} not read",
-            files.len()
-        );
-        assert!(failures.is_empty(), "{} failed:\n{}", failures.len(), failures.join("\n"));
-    }
-
-    #[test]
-    fn thirty_two_bit_samples_undo_their_prediction_and_come_to_eight_bits() {
-        // two floats a row: 0.5 and 1.0, laid out as byte planes, each byte the difference from
-        // the one before it
-        let (a, b) = (0.5f32.to_be_bytes(), 1.0f32.to_be_bytes());
-        let planar = [a[0], b[0], a[1], b[1], a[2], b[2], a[3], b[3]];
-        let mut row: Vec<u8> = planar
-            .iter()
-            .scan(0u8, |last, &v| {
-                let d = v.wrapping_sub(*last);
-                *last = v;
-                Some(d)
-            })
-            .collect();
-        undo_prediction(&mut row, 8, 4);
-        assert_eq!(row, [a, b].concat());
-        // colour through the sRGB curve (linear 0.5 shows as 188), transparency as it is
-        assert_eq!(to8(row.clone(), 4, true), [188, 255]);
-        assert_eq!(to8(row, 4, false), [128, 255]);
-        // out of range and not a number: clamped, nothing
-        let odd = [2.0f32, -1.0, f32::NAN].iter().flat_map(|v| v.to_be_bytes()).collect();
-        assert_eq!(to8(odd, 4, true), [255, 0, 0]);
-    }
-
-    #[test]
-    fn bitmaps_indexed_colours_and_lab_come_to_rgb() {
-        // set bits are black; a row's bits end at a byte
-        assert_eq!(spread_bits(&[0b1010_0000, 0b0100_0000], 3, 2), [0, 255, 0, 255, 0, 255]);
-        // an indexed file's table: its reds, greens and blues one after another
-        let mut table = vec![0u8; 768];
-        (table[5], table[256 + 5], table[512 + 5]) = (10, 20, 30);
-        let (colour, sample, palette) = format_of(2, 8, &table).unwrap_or_else(|e| panic!("{e:?}"));
-        assert!(colour == Colour::Indexed && sample == 1);
-        assert_eq!(palette[5], [10, 20, 30]);
-        assert_eq!(format_of(2, 8, &[0; 10]).err(), Some(PsdError::Damaged("colour data")));
-        // white, black and middle grey (L* 50 is sRGB 119)
-        assert_eq!(lab_to_srgb(255, 128, 128), [255, 255, 255]);
-        assert_eq!(lab_to_srgb(0, 128, 128), [0, 0, 0]);
-        let grey = lab_to_srgb(128, 128, 128);
-        assert!(grey.iter().all(|&c| (118..=120).contains(&c)), "{grey:?}");
-        // duotones read as their grey, bitmaps only as bits; multichannel files not at all
-        assert!(format_of(8, 8, &[]).is_ok_and(|(c, ..)| c == Colour::Grey));
-        assert_eq!(format_of(0, 8, &[]).err(), Some(PsdError::Unsupported("bit depth")));
-        assert_eq!(format_of(7, 8, &[]).err(), Some(PsdError::Unsupported("colour mode")));
-    }
-
-    #[test]
-    fn packbits_and_prediction_decode() {
-        let mut out = Vec::new();
-        // three literal bytes, then 9 repeated four times
-        unpack(&[2, 1, 2, 3, 0xFD, 9], 7, &mut out);
-        assert_eq!(out, [1, 2, 3, 9, 9, 9, 9]);
-        let mut d = [1u8, 1, 1, 5, 0, 0];
-        undo_prediction(&mut d, 3, 1);
-        assert_eq!(d, [1, 2, 3, 5, 5, 5]);
+    fn f64(&mut self) -> Option<f64> {
+        self.array().map(u64::from_be_bytes).map(f64::from_bits)
     }
 }

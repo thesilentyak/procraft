@@ -7,8 +7,12 @@ use serde::{Deserialize, Serialize};
 /// picture between them.
 const BARS: f32 = 64.0 + 45.0;
 
-/// The picture's size until the window is sized (points).
+/// The picture's size until the window is sized (points), on a canvas the shape of the screen it
+/// was measured on (1488 x 2266): see [`first_size`].
 const FIRST_SIZE: [f32; 2] = [350.0, 423.0];
+
+/// How wide the window is until it is sized (points).
+const FIRST_WIDTH: f32 = 350.0;
 
 /// The least and the most the window is sized to by its handles (points, its bars included).
 const LEAST: [f32; 2] = [282.0, 230.0];
@@ -25,6 +29,19 @@ pub fn fitted_size(size: [f32; 2], room: [f32; 2]) -> [f32; 2] {
         v.clamp(least, most.max(least))
     };
     [side(width, least_w, most_w, room_w), side(height + BARS, least_h, most_h, room_h) - BARS]
+}
+
+/// The picture's size until the window is sized, on a canvas `canvas` pixels big: 350 wide, and
+/// the whole window (its bars included, which lie over the picture) the canvas's shape, so the
+/// canvas fills it; within the window's least and most. A canvas with no size has the first size
+/// of a screen-shaped one.
+pub fn first_size(canvas: [u32; 2]) -> [f32; 2] {
+    let [width, height] = canvas;
+    if width == 0 || height == 0 {
+        return FIRST_SIZE;
+    }
+    let tall = FIRST_WIDTH * height as f32 / width as f32;
+    fitted_size([FIRST_WIDTH, tall - BARS], [f32::NAN; 2])
 }
 
 /// What the window shows.
@@ -150,6 +167,23 @@ mod tests {
         assert_eq!(fitted_size([f32::NAN, 9.0], big), FIRST_SIZE);
         assert_eq!(fitted_size([300.0, 300.0], [f32::INFINITY, -f32::INFINITY]), [300.0, 300.0]);
         assert_eq!(fitted_size([300.0, 300.0], [-5.0, 0.0]), [282.0, 230.0 - BARS]);
+    }
+
+    #[test]
+    fn the_first_window_takes_the_canvas_s_shape_bars_and_all() {
+        // a square canvas: 350 square with the bars, 241 of picture between them (349 measured)
+        assert_eq!(first_size([2048, 2048]), [350.0, 350.0 - BARS]);
+        // a screen-shaped one: 533 with the bars (532 measured)
+        let [w, h] = first_size([1488, 2266]);
+        assert_eq!(w, 350.0);
+        assert!((h + BARS - 533.0).abs() < 0.5, "{h}");
+        // the canvas fills it: the window's shape is the canvas's
+        assert!(((h + BARS) / w - 2266.0 / 1488.0).abs() < 1e-4);
+        // a wide one stops at the least, a tall one at the most
+        assert_eq!(first_size([4000, 1000]), [350.0, 230.0 - BARS]);
+        assert_eq!(first_size([1000, 4000]), [350.0, 650.0 - BARS]);
+        // none: the first size as it always was
+        assert_eq!(first_size([0, 500]), FIRST_SIZE);
     }
 
     #[test]

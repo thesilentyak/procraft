@@ -3,7 +3,8 @@
 struct DisplayUniform {
     // the map from the canvas's 0..1 coordinates to clip space: (a, b, c, d) ...
     m0: vec4<f32>,
-    // ... (e, f), then 1 when the target encodes sRGB itself, then unused
+    // ... (e, f), then 1 when the target encodes sRGB itself, then 1 to show the colours through
+    // the look below
     m1: vec4<f32>,
     // the canvas's colours to the target's, in linear light: three rows, c0.w 1 to apply them
     c0: vec4<f32>,
@@ -12,6 +13,11 @@ struct DisplayUniform {
     // how far the quad reaches past the canvas's sides (its 0..1 across and down), then 1 to
     // smooth the edge over that; all 0 for a quad drawn exactly
     edge: vec4<f32>,
+    // a look the colours go through, in linear light (the display only): rows red, green and
+    // blue, each three weights and what is added
+    l0: vec4<f32>,
+    l1: vec4<f32>,
+    l2: vec4<f32>,
 }
 
 @group(0) @binding(0) var composite: texture_2d<f32>;
@@ -73,12 +79,16 @@ fn shown(c: vec4<f32>) -> vec4<f32> {
         return vec4<f32>(0.0);
     }
     var rgb = c.rgb / c.a;
-    // in perceptual greys, as a soft proof to a grey profile (sRGB's tone curve) shows it: each
-    // colour as the grey of its luminance (Rec. 709 on linear light, as the colour panel's HSY′
-    // luma is, so colours of one Y′ show as one grey), keeping its CIE lightness
+    // through the look (perceptual greys, say: each colour as the grey of its luminance, as a
+    // soft proof to a grey profile shows it), on linear light, clipped
     if (du.m1.w > 0.5) {
-        let y = dot(vec3<f32>(0.2126, 0.7152, 0.0722), srgb_to_linear(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0))));
-        rgb = linear_to_srgb(vec3<f32>(clamp(y, 0.0, 1.0)));
+        let lin = srgb_to_linear(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)));
+        let looked = vec3<f32>(
+            dot(du.l0.xyz, lin) + du.l0.w,
+            dot(du.l1.xyz, lin) + du.l1.w,
+            dot(du.l2.xyz, lin) + du.l2.w,
+        );
+        rgb = linear_to_srgb(clamp(looked, vec3<f32>(0.0), vec3<f32>(1.0)));
     }
     // into the target's colour space (another profile's primaries), clipped to it
     if (du.c0.w > 0.5) {
@@ -109,39 +119,77 @@ struct VeilUniform {
     surround: vec4<f32>,
     // the hole's outline in canvas pixels, two points an entry
     points: array<vec4<f32>, 32>,
+    // how each of the 64 x 64 cells across the rectangle is drawn, two bits a cell row by row
+    // (16 a word): 0 wholly in the hole (not drawn), 1 wholly veiled, 2 its pixels tested
+    cells: array<vec4<u32>, 64>,
 }
 
 @group(3) @binding(0) var<uniform> vu: VeilUniform;
+
+const VEIL_GRID: u32 = 64u;
 
 fn hole_point(k: u32) -> vec2<f32> {
     let e = vu.points[k / 2u];
     return select(e.xy, e.zw, (k & 1u) == 1u);
 }
 
+// how cell `i` is drawn
+fn veil_cell(i: u32) -> u32 {
+    let word = vu.cells[i / 64u][(i / 16u) % 4u];
+    return (word >> ((i % 16u) * 2u)) & 3u;
+}
+
+struct VeilOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) @interpolate(flat) cell: u32,
+}
+
+// one cell of the veil's rectangle an instance (one wholly in the hole drawn as nothing)
+@vertex
+fn vs_veil(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VeilOut {
+    var corners = array<vec2<f32>, 6>(
+        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0),
+        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 1.0),
+    );
+    let cell = veil_cell(ii);
+    let corner = select(corners[vi % 6u], vec2<f32>(0.0), cell == 0u);
+    let uv = (vec2<f32>(f32(ii % VEIL_GRID), f32(ii / VEIL_GRID)) + corner) / f32(VEIL_GRID);
+    var o: VeilOut;
+    o.pos = vec4<f32>(du.m0.x * uv.x + du.m0.z * uv.y + du.m1.x, du.m0.y * uv.x + du.m0.w * uv.y + du.m1.y, 0.0, 1.0);
+    o.uv = uv;
+    o.cell = cell;
+    return o;
+}
+
 @fragment
-fn fs_veil(i: Out) -> @location(0) vec4<f32> {
+fn fs_veil(i: VeilOut) -> @location(0) vec4<f32> {
     let c = textureSample(composite, smp, i.uv);
     let p = vu.rect.xy + i.uv * vu.rect.zw;
     // the canvas pixels a target pixel spans: the hole's edge is smoothed over one target pixel
     let across = max(length(dpdx(p)), 1e-4);
     let n = min(u32(vu.surround.w), 64u);
-    var inside = false;
-    var near = 1e9;
-    for (var k = 0u; k < n; k++) {
-        let a = hole_point(k);
-        let b = hole_point((k + 1u) % n);
-        if ((a.y > p.y) != (b.y > p.y)) {
-            let x = a.x + (p.y - a.y) / (b.y - a.y) * (b.x - a.x);
-            if (p.x < x) {
-                inside = !inside;
+    // how much of this pixel is outside the hole: all of it in a cell wholly veiled, else as
+    // far as it is from the hole's edge, which side of it
+    var cover = 1.0;
+    if (i.cell == 2u && n >= 3u) {
+        var inside = false;
+        var near = 1e9;
+        for (var k = 0u; k < n; k++) {
+            let a = hole_point(k);
+            let b = hole_point((k + 1u) % n);
+            if ((a.y > p.y) != (b.y > p.y)) {
+                let x = a.x + (p.y - a.y) / (b.y - a.y) * (b.x - a.x);
+                if (p.x < x) {
+                    inside = !inside;
+                }
             }
+            let ab = b - a;
+            let t = clamp(dot(p - a, ab) / max(dot(ab, ab), 1e-12), 0.0, 1.0);
+            near = min(near, length(p - a - ab * t));
         }
-        let ab = b - a;
-        let t = clamp(dot(p - a, ab) / max(dot(ab, ab), 1e-12), 0.0, 1.0);
-        near = min(near, length(p - a - ab * t));
+        cover = clamp(select(near, -near, inside) / across + 0.5, 0.0, 1.0);
     }
-    // how much of this pixel is outside the hole (all of it with no hole)
-    let cover = select(clamp(select(near, -near, inside) / across + 0.5, 0.0, 1.0), 1.0, n < 3u);
     if (cover <= 0.0) {
         return vec4<f32>(0.0);
     }

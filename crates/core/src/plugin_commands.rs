@@ -3,6 +3,9 @@
 //! what its permissions give, with the types written here, or the file is refused. The functions
 //! work only while the plugin runs one of its actions (a tap on its card), never inside a hook,
 //! which only answers; what an action changes is one step undo takes back.
+//!
+//! Besides them, any plugin may import the utilities (interface 4): work on bytes it hands over,
+//! done by the app faster than its own code would, at a hook as in an action.
 
 use std::sync::Arc;
 
@@ -11,7 +14,7 @@ use procraft_engine::geom::IRect;
 use wasmi::{Caller, Extern, Linker, Memory, Module, StoreLimits, ValType};
 
 use crate::CanvasSession;
-use crate::plugin_panel::{PluginPanel, read_panel};
+use crate::plugin_panel::{PluginPanel, read_panel_with};
 
 /// What a plugin may ask to do besides answering hooks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -26,6 +29,10 @@ pub enum PluginPermission {
     Notice,
     /// A panel of its own.
     Panel,
+    /// The data of a brush its own brush engine made, to read and change: its brush studio's.
+    BrushData,
+    /// How the canvas is turned on the screen, to read and set (interface 8).
+    View,
 }
 
 impl PluginPermission {
@@ -37,6 +44,8 @@ impl PluginPermission {
             "brush" => Some(PluginPermission::Brush),
             "notice" => Some(PluginPermission::Notice),
             "panel" => Some(PluginPermission::Panel),
+            "brush.data" => Some(PluginPermission::BrushData),
+            "view" => Some(PluginPermission::View),
             _ => None,
         }
     }
@@ -46,11 +55,17 @@ impl PluginPermission {
         match self {
             PluginPermission::ArtworkRead => "It can read your artwork: its size, its layers and their pixels.",
             PluginPermission::ArtworkWrite => {
-                "It can change your artwork when you tap one of its actions: add layers, name them, set how they show and paint on them, one step undo takes back."
+                "It can change your artwork when you tap one of its actions: add layers, name and mark them, set how they show and paint on them, one step undo takes back."
             }
-            PluginPermission::Brush => "It can read and set the brush's colour, size and opacity.",
+            PluginPermission::Brush => {
+                "It can read and set the brush's colour, size and opacity, read your recent colours and brushes, and choose a brush."
+            }
             PluginPermission::Notice => "It can show a short message.",
             PluginPermission::Panel => "It can show a panel of its own when you tap one of its actions.",
+            PluginPermission::BrushData => {
+                "It can read and change the settings of brushes it draws, in a studio of its own."
+            }
+            PluginPermission::View => "It can turn the canvas on the screen when you tap one of its actions.",
         }
     }
 }
@@ -63,11 +78,55 @@ pub(crate) struct Host {
     pub(crate) session: Option<Arc<dyn std::any::Any + Send + Sync>>,
     pub(crate) panel: Option<PluginPanel>,
     pub(crate) close_panel: bool,
+    /// Its own controls it set while its action ran or its panel was touched, by their place: set
+    /// as on its card once that ends.
+    pub(crate) set_controls: Vec<(usize, f32)>,
+    /// The plugin's id, for what only its own may reach (its brushes' data).
+    pub(crate) owner: String,
+    /// The id the marks it keeps with layers go by: its own, or that of a plugin it took the place
+    /// of whose marks it keeps (interface 16).
+    pub(crate) marks: String,
+    /// What the last utility made, until the plugin reads it.
+    pub(crate) answer: Vec<u8>,
+    /// While it makes brushes of a file: set when that is no longer wanted (a long call stops at
+    /// its next slice of steps); where the file is in its memory (start, length), and how far into
+    /// it the bytes it has handed the utilities reach.
+    pub(crate) cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pub(crate) file_span: Option<(usize, usize)>,
+    pub(crate) read: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl Host {
     pub(crate) fn new(limits: StoreLimits) -> Host {
-        Host { limits, session: None, panel: None, close_panel: false }
+        Host {
+            limits,
+            session: None,
+            panel: None,
+            close_panel: false,
+            set_controls: Vec::new(),
+            owner: String::new(),
+            marks: String::new(),
+            answer: Vec::new(),
+            cancel: None,
+            file_span: None,
+            read: None,
+        }
+    }
+
+    /// Whether what it is doing is no longer wanted.
+    pub(crate) fn cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// The `len` bytes at `from` were handed a utility: how far into the file it makes brushes of
+    /// they reach, if they are of it.
+    fn reads(&self, from: i32, len: i32) {
+        let (Some((start, size)), Some(read)) = (self.file_span, self.read.as_ref()) else { return };
+        let (Ok(from), Ok(len)) = (usize::try_from(from), usize::try_from(len)) else { return };
+        let end = from.saturating_add(len);
+        if from >= start && end <= start.saturating_add(size) {
+            read.fetch_max((end - start) as u64, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -78,6 +137,8 @@ const MOST_PIXELS: u64 = 4096 * 4096;
 const MOST_TEXT: usize = 200;
 /// The most bytes of a panel's description.
 const MOST_PANEL: usize = 16 * 1024;
+/// Past the most controls a plugin may have, of every kind.
+const MOST_CONTROL: usize = 64;
 
 use ValType::{F32, I32, I64};
 
@@ -93,27 +154,113 @@ const COMMANDS: &[(&str, PluginPermission, &[ValType], &[ValType])] = &[
     ("set_layer_name", PluginPermission::ArtworkWrite, &[I64, I32, I32], &[I32]),
     ("set_layer_opacity", PluginPermission::ArtworkWrite, &[I64, F32], &[I32]),
     ("set_layer_visible", PluginPermission::ArtworkWrite, &[I64, I32], &[I32]),
+    ("layer_mark", PluginPermission::ArtworkRead, &[I64], &[I64]),
+    ("set_layer_mark", PluginPermission::ArtworkWrite, &[I64, I64], &[I32]),
     ("brush_colour", PluginPermission::Brush, &[], &[I32]),
     ("set_brush_colour", PluginPermission::Brush, &[I32], &[]),
     ("brush_size", PluginPermission::Brush, &[], &[F32]),
     ("set_brush_size", PluginPermission::Brush, &[F32], &[]),
     ("brush_opacity", PluginPermission::Brush, &[], &[F32]),
     ("set_brush_opacity", PluginPermission::Brush, &[F32], &[]),
+    ("recent_colour", PluginPermission::Brush, &[I32], &[I32]),
+    ("recent_brush", PluginPermission::Brush, &[I32], &[I64]),
+    ("current_brush", PluginPermission::Brush, &[], &[I64]),
+    ("choose_brush", PluginPermission::Brush, &[I64], &[I32]),
     ("notice", PluginPermission::Notice, &[I32, I32], &[]),
     ("show_panel", PluginPermission::Panel, &[I32, I32], &[I32]),
     ("close_panel", PluginPermission::Panel, &[], &[]),
+    ("set_control", PluginPermission::Panel, &[I32, F32], &[I32]),
+    ("brush_data_len", PluginPermission::BrushData, &[], &[I32]),
+    ("read_brush_data", PluginPermission::BrushData, &[I32], &[I32]),
+    ("write_brush_data", PluginPermission::BrushData, &[I32, I32], &[I32]),
+    ("view_turn", PluginPermission::View, &[], &[F32]),
+    ("turn_view", PluginPermission::View, &[F32], &[]),
 ];
 
-/// Whether everything `module` imports is one of the app's functions `granted` gives, with its
-/// types.
+/// The most bytes of a brush's data a plugin may hand back.
+const MOST_BRUSH_DATA: usize = 64 << 20;
+
+/// The utilities, which need no permission: their names, parameters and results.
+const UTILITIES: &[(&str, &[ValType], &[ValType])] =
+    &[("inflate", &[I32, I32, I32], &[I32]), ("decode_image", &[I32, I32], &[I64]), ("read_answer", &[I32], &[I32])];
+
+/// The most bytes a utility makes (what unpacks to more, or a larger picture, is refused), and
+/// the most a plugin may hand one.
+const MOST_ANSWER: usize = 256 << 20;
+const MOST_HANDED: usize = 256 << 20;
+
+/// Whether everything `module` imports is a utility or one of the app's functions `granted` gives,
+/// with its types.
 pub(crate) fn imports_fit(module: &Module, granted: &[PluginPermission]) -> bool {
     module.imports().all(|import| {
-        let found = COMMANDS.iter().find(|(name, ..)| import.module() == FROM && import.name() == *name);
-        found.is_some_and(|(_, needs, params, results)| {
-            granted.contains(needs)
-                && import.ty().func().is_some_and(|func| func.params() == *params && func.results() == *results)
-        })
+        let typed = |params: &[ValType], results: &[ValType]| {
+            import.ty().func().is_some_and(|func| func.params() == params && func.results() == results)
+        };
+        if import.module() != FROM {
+            return false;
+        }
+        if let Some((_, params, results)) = UTILITIES.iter().find(|(name, ..)| import.name() == *name) {
+            return typed(params, results);
+        }
+        let found = COMMANDS.iter().find(|(name, ..)| import.name() == *name);
+        found.is_some_and(|(_, needs, params, results)| granted.contains(needs) && typed(params, results))
     })
+}
+
+/// `bytes` unpacked: raw deflate (`kind` 0) or zlib (1); none if they don't unpack, or unpack to
+/// more than a utility makes.
+pub(crate) fn inflated(bytes: &[u8], kind: i32) -> Option<Vec<u8>> {
+    use miniz_oxide::inflate::{decompress_to_vec_with_limit, decompress_to_vec_zlib_with_limit};
+    match kind {
+        0 => decompress_to_vec_with_limit(bytes, MOST_ANSWER).ok(),
+        1 => decompress_to_vec_zlib_with_limit(bytes, MOST_ANSWER).ok(),
+        _ => None,
+    }
+}
+
+/// A PNG or JPEG decoded: its width, height and pixels, straight RGBA8, rows from the top.
+pub(crate) fn decoded_image(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let (w, h, channels, picture) = crate::brush_files::decode_picture(bytes)?;
+    if w.checked_mul(h)?.checked_mul(4)? > MOST_ANSWER {
+        return None;
+    }
+    let rgba = match channels {
+        1 => picture.iter().flat_map(|&g| [g, g, g, 255]).collect(),
+        2 => picture.as_chunks::<2>().0.iter().flat_map(|&[g, a]| [g, g, g, a]).collect(),
+        3 => picture.as_chunks::<3>().0.iter().flat_map(|&[r, g, b]| [r, g, b, 255]).collect(),
+        4 => picture,
+        _ => return None,
+    };
+    let (width, height) = (u32::try_from(w).ok()?, u32::try_from(h).ok()?);
+    (rgba.len() == w * h * 4).then_some((width, height, rgba))
+}
+
+/// The utilities, put in `linker` for any plugin's module to import.
+fn link_utilities(linker: &mut Linker<Host>) -> Result<(), wasmi::Error> {
+    fn handed(caller: &Caller<'_, Host>, from: i32, len: i32) -> Option<Vec<u8>> {
+        let len = usize::try_from(len).ok().filter(|&n| n <= MOST_HANDED)?;
+        read_bytes(caller, from, len)
+    }
+    linker.func_wrap(FROM, "inflate", |mut caller: Caller<'_, Host>, from: i32, len: i32, kind: i32| -> i32 {
+        caller.data().reads(from, len);
+        let made = handed(&caller, from, len).and_then(|bytes| inflated(&bytes, kind));
+        let length = made.as_ref().map_or(-1, |m| i32::try_from(m.len()).unwrap_or(-1));
+        caller.data_mut().answer = made.unwrap_or_default();
+        length
+    })?;
+    linker.func_wrap(FROM, "decode_image", |mut caller: Caller<'_, Host>, from: i32, len: i32| -> i64 {
+        caller.data().reads(from, len);
+        let made = handed(&caller, from, len).and_then(|bytes| decoded_image(&bytes));
+        let size = made.as_ref().map_or(0, |(w, h, _)| (u64::from(*w) | (u64::from(*h) << 32)) as i64);
+        caller.data_mut().answer = made.map(|(_, _, pixels)| pixels).unwrap_or_default();
+        size
+    })?;
+    linker.func_wrap(FROM, "read_answer", |mut caller: Caller<'_, Host>, to: i32| -> i32 {
+        let answer = std::mem::take(&mut caller.data_mut().answer);
+        let (Some(memory), Ok(at)) = (memory(&caller), usize::try_from(to)) else { return 0 };
+        i32::from(memory.write(&mut caller, at, &answer).is_ok())
+    })?;
+    Ok(())
 }
 
 /// The artwork the running action works on, if one is running.
@@ -219,8 +366,24 @@ impl CanvasSession {
     }
 }
 
-/// The app's functions `granted` gives, put in `linker` for a plugin's module to import.
+/// The utilities and the app's functions `granted` gives, put in `linker` for a plugin's module
+/// to import.
 pub(crate) fn link(linker: &mut Linker<Host>, granted: &[PluginPermission]) -> Result<(), wasmi::Error> {
+    link_utilities(linker)?;
+    if granted.contains(&PluginPermission::View) {
+        // how far the canvas is turned on the screen, clockwise, in radians (-pi to pi)
+        linker.func_wrap(FROM, "view_turn", |caller: Caller<'_, Host>| -> f32 {
+            session(&caller).map_or(0.0, |s| s.view_turn())
+        })?;
+        // turned to `radians` about the window's middle, its zoom and the canvas there kept
+        linker.func_wrap(FROM, "turn_view", |caller: Caller<'_, Host>, radians: f32| {
+            if let Some(s) = session(&caller)
+                && radians.is_finite()
+            {
+                s.turn_view_to(radians);
+            }
+        })?;
+    }
     let read = granted.contains(&PluginPermission::ArtworkRead);
     let write = granted.contains(&PluginPermission::ArtworkWrite);
     if read {
@@ -236,6 +399,10 @@ pub(crate) fn link(linker: &mut Linker<Host>, granted: &[PluginPermission]) -> R
         linker.func_wrap(FROM, "layer_at", |caller: Caller<'_, Host>, index: i32| -> i64 {
             let found = session(&caller).and_then(|s| s.layers().get(usize::try_from(index).ok()?).map(|l| l.id));
             found.map_or(0, |id| id as i64)
+        })?;
+        // the number the plugin keeps with a layer, 0 for none (interface 10)
+        linker.func_wrap(FROM, "layer_mark", |caller: Caller<'_, Host>, layer: i64| -> i64 {
+            session(&caller).map_or(0, |s| s.layer_mark(&caller.data().marks, layer as u64))
         })?;
         linker.func_wrap(FROM, "current_layer", |caller: Caller<'_, Host>| -> i64 {
             let found = session(&caller).and_then(|s| s.layers().iter().find(|l| l.current).map(|l| l.id));
@@ -280,6 +447,10 @@ pub(crate) fn link(linker: &mut Linker<Host>, granted: &[PluginPermission]) -> R
         linker.func_wrap(FROM, "set_layer_visible", |caller: Caller<'_, Host>, layer: i64, on: i32| -> i32 {
             session(&caller).map_or(0, |s| i32::from(s.set_layer_visible(layer as u64, on != 0)))
         })?;
+        // a number kept with a layer for the plugin, saved with the artwork, 0 taking it off
+        linker.func_wrap(FROM, "set_layer_mark", |caller: Caller<'_, Host>, layer: i64, mark: i64| -> i32 {
+            session(&caller).map_or(0, |s| i32::from(s.set_layer_mark(&caller.data().marks, layer as u64, mark)))
+        })?;
     }
     if granted.contains(&PluginPermission::Brush) {
         linker.func_wrap(FROM, "brush_colour", |caller: Caller<'_, Host>| -> i32 {
@@ -311,13 +482,36 @@ pub(crate) fn link(linker: &mut Linker<Host>, granted: &[PluginPermission]) -> R
                 s.set_brush_opacity(opacity);
             }
         })?;
+        // the colour history's colour at `at` (0 the latest), -1 past its end (interface 11)
+        linker.func_wrap(FROM, "recent_colour", |caller: Caller<'_, Host>, at: i32| -> i32 {
+            let found = session(&caller).zip(usize::try_from(at).ok()).and_then(|(s, at)| s.plugin_recent_colour(at));
+            found.map_or(-1, |rgb| rgb as i32)
+        })?;
+        // the key of the Recent set's brush at `at` (pinned first), 0 past its end
+        linker.func_wrap(FROM, "recent_brush", |caller: Caller<'_, Host>, at: i32| -> i64 {
+            session(&caller).zip(usize::try_from(at).ok()).map_or(0, |(s, at)| s.plugin_recent_brush(at))
+        })?;
+        linker.func_wrap(FROM, "current_brush", |caller: Caller<'_, Host>| -> i64 {
+            session(&caller).map_or(0, |s| s.plugin_current_brush())
+        })?;
+        linker.func_wrap(FROM, "choose_brush", |caller: Caller<'_, Host>, key: i64| -> i32 {
+            session(&caller).map_or(0, |s| i32::from(s.plugin_choose_brush(key)))
+        })?;
     }
     if granted.contains(&PluginPermission::Panel) {
         // shown once the action or the touch ends (one that doesn't hold up shows nothing: 0)
         linker.func_wrap(FROM, "show_panel", |mut caller: Caller<'_, Host>, at: i32, len: i32| -> i32 {
             let Some(len) = usize::try_from(len).ok().filter(|&n| n <= MOST_PANEL) else { return 0 };
             let read = read_bytes(&caller, at, len).and_then(|b| String::from_utf8(b).ok());
-            let Some(panel) = read.as_deref().and_then(read_panel) else { return 0 };
+            // its brushes found by their keys, as the library is now
+            let s = session(&caller);
+            let brush = |key: i64| s.as_ref().and_then(|s| s.plugin_brush(key));
+            // its own controls by their keys, under its id (interface 15)
+            let owner = caller.data().owner.clone();
+            let control = |key: &str| crate::plugin_file::valid_key(key).then(|| format!("{owner}.{key}"));
+            let Some(panel) = read.as_deref().and_then(|json| read_panel_with(json, &brush, &control)) else {
+                return 0;
+            };
             // one that asks for a key press has somewhere for it to go
             let takes = |name: &str| caller.get_export(name).and_then(Extern::into_func).is_some();
             if panel.key_press && !(takes(crate::plugin_run::PANEL_KEY) && takes(crate::plugin_run::KEY_BUFFER)) {
@@ -332,6 +526,34 @@ pub(crate) fn link(linker: &mut Linker<Host>, granted: &[PluginPermission]) -> R
             let host = caller.data_mut();
             host.panel = None;
             host.close_panel = true;
+        })?;
+        // one of its own switches or sliders, set as on its card once the action or touch ends
+        linker.func_wrap(FROM, "set_control", |mut caller: Caller<'_, Host>, at: i32, value: f32| -> i32 {
+            let Some(at) = usize::try_from(at).ok().filter(|&at| at < MOST_CONTROL && value.is_finite()) else {
+                return 0;
+            };
+            let set = &mut caller.data_mut().set_controls;
+            set.retain(|(was, _)| *was != at);
+            set.push((at, value));
+            1
+        })?;
+    }
+    if granted.contains(&PluginPermission::BrushData) {
+        linker.func_wrap(FROM, "brush_data_len", |caller: Caller<'_, Host>| -> i32 {
+            let Some(s) = session(&caller) else { return -1 };
+            s.edited_brush_data(&caller.data().owner).map_or(-1, |d| i32::try_from(d.len()).unwrap_or(-1))
+        })?;
+        linker.func_wrap(FROM, "read_brush_data", |mut caller: Caller<'_, Host>, to: i32| -> i32 {
+            let Some(s) = session(&caller) else { return 0 };
+            let Some(data) = s.edited_brush_data(&caller.data().owner) else { return 0 };
+            let (Some(memory), Ok(at)) = (memory(&caller), usize::try_from(to)) else { return 0 };
+            i32::from(memory.write(&mut caller, at, &data).is_ok())
+        })?;
+        linker.func_wrap(FROM, "write_brush_data", |caller: Caller<'_, Host>, from: i32, len: i32| -> i32 {
+            let Some(s) = session(&caller) else { return 0 };
+            let Some(len) = usize::try_from(len).ok().filter(|&n| n > 0 && n <= MOST_BRUSH_DATA) else { return 0 };
+            let Some(data) = read_bytes(&caller, from, len) else { return 0 };
+            i32::from(s.set_edited_brush_data(&caller.data().owner, data))
         })?;
     }
     if granted.contains(&PluginPermission::Notice) {

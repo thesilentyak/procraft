@@ -1,6 +1,7 @@
 //! Adjustments: the current layer redrawn through a filter while its values are dragged, kept as
 //! one undo step or put back; only what is selected changes.
 
+use procraft_engine::document::LayerId;
 use procraft_engine::geom::Vec2;
 use procraft_engine::selection::feather_radius;
 use procraft_engine::tone;
@@ -187,10 +188,15 @@ impl State {
         };
         self.strokes = self.strokes.wrapping_add(1);
         let seed = self.strokes.wrapping_mul(0x9e37_79b9);
-        let mut builder = StrokeBuilder::with_seed(brush.clone(), brush.diameter(sliders.size), pointer.into(), seed)
+        let builder = StrokeBuilder::with_seed(brush.clone(), brush.diameter(sliders.size), pointer.into(), seed)
             .with_input(self.input.clone())
             .on_view_turned(self.view.map_or(0.0, |v| v.rotation()))
+            .on_canvas_made_turned(self.doc.made_turns)
             .seen_at(self.view.map_or(1.0, |v| v.zoom()) / self.display_scale);
+        let mut builder = self.pressing.applied(builder, self.canvas_per_point());
+        if let Some(zoom) = self.whole_pixels(samples) {
+            builder = builder.read_in_whole_pixels(zoom);
+        }
         let canvas_samples = self.to_canvas(samples);
         if let (Some(source), None, Some(first)) = (self.clone_source, self.clone_offset, canvas_samples.first()) {
             let offset = source - first.pos;
@@ -206,7 +212,7 @@ impl State {
         }
         canvas.begin_pencil_stroke(current, style);
         canvas.add_stamps(&stamps);
-        self.stroke = Some(builder);
+        self.stroke = Some(Box::new(builder));
         self.redraw_painted_on();
     }
 
@@ -261,6 +267,18 @@ impl State {
         if self.heed_filter_run() {
             return;
         }
+        // Liquify: its last step closed, and set aside to come back as it ends (kept, or undone
+        // past its first step), with how many canvas steps there were before
+        let liquifying = self.liquify_open();
+        let set_aside = liquifying && (commit || self.liquify_set_aside);
+        let made = if liquifying {
+            self.liquify.halt();
+            self.close_liquify_step();
+            self.flush();
+            self.canvas.as_deref().map_or(0, Canvas::steps_made)
+        } else {
+            0
+        };
         self.pencil = false;
         self.cloning = false;
         self.clone_source = None;
@@ -270,6 +288,7 @@ impl State {
         {
             // perspective blur's step goes unnamed
             let name = match self.last_filter {
+                _ if liquifying => Some(crate::liquify_steps::LIQUIFY_STEP),
                 Some(Filter::Hsb { .. }) => Some("adjust HSB"),
                 Some(Filter::Curves) => Some("adjust Curves"),
                 Some(Filter::ColorBalance { .. }) => Some("change Color Balance"),
@@ -281,6 +300,9 @@ impl State {
             if let (true, Some(name)) = (commit, filter.as_deref().or(name)) {
                 canvas.name_next_step(name);
             }
+            if set_aside {
+                canvas.keep_liquify();
+            }
             // only where it changed is kept
             match within {
                 Some(within) => canvas.end_transform_within(commit, within),
@@ -289,6 +311,9 @@ impl State {
             if self.simplified_undos {
                 canvas.collapse_steps();
             }
+        }
+        if liquifying {
+            self.liquify_ended(commit, set_aside, made);
         }
     }
 
@@ -308,9 +333,11 @@ impl Shared {
         if steps.is_empty() {
             return;
         }
+        // with Drawing Assist on the layer, the symmetry's copies too, as a stroke's
+        let guide = st.doc.stroke_guide();
         if let Some(canvas) = st.canvas.as_mut() {
             for step in &steps {
-                canvas.liquify_stamps(step);
+                canvas.liquify_stamps(&crate::guide::mirrored_liquify(&guide, step));
             }
             if let Some(f) = st.last_filter {
                 canvas.set_filter(f);
@@ -523,22 +550,36 @@ impl CanvasSession {
         self.shared.frame(st);
     }
 
-    /// Starts liquifying the current layer; false when it cannot be.
+    /// Starts liquifying what is chosen: the current layer, or with several chosen or a group
+    /// current, every layer chosen or in a chosen group, pushed the same way; false when there is
+    /// none that can change. An adjustment already open is kept first.
     pub fn liquify_begin(&self) -> bool {
-        if !self.adjust_begin() {
-            return false;
-        }
         let mut guard = self.shared.lock();
         let st = &mut *guard;
-        st.liquify = LiquifyRun::default();
-        if let Some(canvas) = st.canvas.as_mut() {
-            // the layer's mask is pushed along with it
-            if let Some(mask) = st.doc.mask_of(st.doc.current()) {
-                canvas.transform_also(mask);
-            }
-            canvas.begin_liquify();
+        st.finish_stroke();
+        st.settle();
+        let layers = st.edited_layers();
+        let Some((&first, _)) = layers.split_first() else { return false };
+        let alpha_locked = layers.len() == 1 && st.doc.layer(first).is_some_and(|l| l.alpha_lock);
+        // each layer's mask is pushed along with it
+        let along: Vec<LayerId> =
+            layers.iter().skip(1).copied().chain(layers.iter().filter_map(|&id| st.doc.mask_of(id))).collect();
+        let along_kept = along.clone();
+        let Some(canvas) = st.canvas.as_mut() else { return false };
+        canvas.mark_steps();
+        canvas.set_filter_keeps_alpha(alpha_locked);
+        canvas.begin_transform(first);
+        for id in along {
+            canvas.transform_also(id);
         }
+        canvas.begin_liquify();
+        st.adjusting = true;
+        st.last_filter = None;
+        st.liquify = LiquifyRun::default();
+        st.liquify_steps = crate::liquify_steps::Steps::new(layers.iter().copied().take(1).chain(along_kept).collect());
+        st.liquify_kept = None;
         st.adjust(Filter::Liquify { amount: 1.0 });
+        self.shared.frame(st);
         true
     }
 
@@ -550,6 +591,7 @@ impl CanvasSession {
         let st = &mut *guard;
         let Some(view) = st.view else { return };
         if start {
+            st.liquify_stroke_begins(brush.kind);
             st.liquify.begin();
             if let (Some(Filter::Liquify { amount }), Some(canvas)) = (st.last_filter, st.canvas.as_mut())
                 && amount < 1.0
@@ -587,6 +629,22 @@ impl CanvasSession {
         true
     }
 
+    /// The pen's barrel rolled `turn` radians with the liquify brush at window point (`x`, `y`): a
+    /// twirl turns as far with it, right or left as the barrel went. False if `brush` isn't a twirl.
+    pub fn liquify_rolled(&self, x: f32, y: f32, turn: f32, mut brush: LiquifyBrush) -> bool {
+        if !matches!(brush.kind, LiquifyKind::TwirlRight | LiquifyKind::TwirlLeft) {
+            return false;
+        }
+        brush.kind = if turn > 0.0 { LiquifyKind::TwirlRight } else { LiquifyKind::TwirlLeft };
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        let Some(view) = st.view else { return true };
+        let Some(at) = view.screen_to_canvas(Vec2::new(x, y)).filter(|p| p.is_finite()) else { return true };
+        let steps = st.liquify.rolled(at, turn.abs(), brush);
+        self.shared.lay_liquify(st, steps);
+        true
+    }
+
     /// The liquify brush lifts: it carries on as it was going, for as long as `momentum` (0..1)
     /// lets it. True if something goes on, which needs [`CanvasSession::liquify_tick`].
     pub fn liquify_lift(&self, momentum: f32, brush: LiquifyBrush) -> bool {
@@ -605,24 +663,28 @@ impl CanvasSession {
         st.liquify.going()
     }
 
-    /// How much of the liquify shows (0..1): the adjust slider.
+    /// How much of the liquify shows (0..1): the adjust slider. A drag of it is one undo step,
+    /// ended by [`CanvasSession::adjustment_liquify_amount_end`] (or by whatever is done next).
     pub fn liquify_amount(&self, amount: f32) {
         let a = if amount.is_finite() { amount.clamp(0.0, 1.0) } else { 1.0 };
         let mut guard = self.shared.lock();
         let st = &mut *guard;
+        st.liquify_adjusts();
         st.adjust(Filter::Liquify { amount: a });
         self.shared.frame(st);
     }
 
-    /// Everything liquified goes back to where it was.
+    /// Everything liquified goes back to where it was: an undo step of its own.
     pub fn liquify_reset(&self) {
         let mut guard = self.shared.lock();
         let st = &mut *guard;
+        st.liquify_resets();
         st.liquify = LiquifyRun::default();
         if let Some(canvas) = st.canvas.as_mut() {
             canvas.liquify_clear();
         }
         st.adjust(Filter::Liquify { amount: 1.0 });
+        st.close_liquify_step();
         self.shared.frame(st);
     }
 
@@ -630,6 +692,19 @@ impl CanvasSession {
     pub fn adjust_end(&self, commit: bool) {
         let mut guard = self.shared.lock();
         let st = &mut *guard;
+        // a filter layer's settings: kept as a step, or put back
+        if let Some(edit) = st.filters.layer.as_ref() {
+            let (layer, added) = (edit.layer, edit.added);
+            st.end_layer_edit(commit);
+            self.shared.frame(st);
+            drop(guard);
+            // Cancel in the settings a filter layer opened with as it was added: it goes again,
+            // its adding undone and nothing left to redo, as if it was never added
+            if added && !commit {
+                self.take_back_added(layer);
+            }
+            return;
+        }
         if st.adjusting {
             st.end_adjustment(commit);
             st.flush();

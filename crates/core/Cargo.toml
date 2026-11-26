@@ -33,6 +33,8 @@ pollster = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 png = { workspace = true }
+# what plugins hand the app to unpack (see plugin_commands.rs)
+miniz_oxide = { workspace = true }
 # the time-lapse's frames, kept as JPEG; a model's textures, PNG or JPEG
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 # text laid out and drawn alike in both apps: shaping, wrapping and glyphs, and the outline's stroke
@@ -52,6 +54,8 @@ wasmi = { version = "2", default-features = false, features = ["std", "validate"
 android_logger = { version = "0.15", default-features = false }
 ndk = { version = "0.9", default-features = false }
 jni-sys = "0.3"
+# the choreographer's newer calls looked up as the app runs, and the clock its times are on
+libc = "0.2"
 raw-window-handle = "0.6"
 
 # The iPad app's CAMetalLayer, handed over from Swift (layer.rs)
@@ -61,3 +65,5 @@ objc2 = "0.6"
 [dev-dependencies]
 # hostile modules, written out in the tests
 wat = "1"
+# the heap at its fullest, in the test of reading a big brush file
+dhat = "0.3"

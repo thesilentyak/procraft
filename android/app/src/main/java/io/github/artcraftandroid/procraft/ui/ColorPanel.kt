@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -182,9 +183,10 @@ internal class BrushColor(private val vm: CanvasViewModel) : ColorPick {
 
 /**
  * A colour of its own, starting at [rgb]; [onChange] hears every change. Greys keep their hue, and
- * a grey opens at [greyHue] (180 degrees, as measured; some pickers open at 0).
+ * a grey opens at [greyHue] (180 degrees, as measured; some pickers open at 0). One picker can edit
+ * several colours in turn ([edit]).
  */
-class HeldColor(rgb: Int, greyHue: Float = 0.5f, private val onChange: (Int) -> Unit) : ColorPick {
+class HeldColor(rgb: Int, greyHue: Float = 0.5f, private var onChange: (Int) -> Unit) : ColorPick {
     override var hue by mutableFloatStateOf(greyHue)
         private set
     override var saturation by mutableFloatStateOf(0f)
@@ -197,14 +199,22 @@ class HeldColor(rgb: Int, greyHue: Float = 0.5f, private val onChange: (Int) -> 
     }
 
     private fun take(rgb: Int) {
-        val hsv = FloatArray(3)
-        android.graphics.Color.RGBToHSV((rgb shr 16) and 0xFF, (rgb shr 8) and 0xFF, rgb and 0xFF, hsv)
-        if (hsv[1] > 0f) hue = hsv[0] / 360f
+        val hsv = rgbToHsv(rgb)
+        if (hsv[1] > 0f) hue = hsv[0]
         saturation = hsv[1]
         brightness = hsv[2]
     }
 
-    override fun rgb() = CanvasViewModel.hsvToRgb(hue, saturation, brightness)
+    /**
+     * From now on the picker edits [rgb], and [onChange] hears its changes: the same picker for
+     * another colour (a grey keeps the hue shown).
+     */
+    fun edit(rgb: Int, onChange: (Int) -> Unit) {
+        this.onChange = onChange
+        take(rgb)
+    }
+
+    override fun rgb() = hsvToRgb(hue, saturation, brightness)
 
     override fun setHsv(h: Float, s: Float, v: Float) {
         hue = h.coerceIn(0f, 1f)
@@ -255,16 +265,20 @@ fun ColorPanel(vm: CanvasViewModel, arrowX: Dp, screenHeight: Dp, modifier: Modi
     } else {
         remember(vm) { BrushColor(vm) }
     }
+    // the colour as the panel opened, for a plugin's swatch of the colour before
+    val opened = remember { c.rgb() }
     // the disc, Classic and Value work in the colour model chosen (the background's colour with a place of its own)
     val place = if (background) remember { ColourPlace() } else vm.colourPlace
     val m = remember(c, vm.colourModel, place) { ModelColor(c, vm.colourModel, place) }
     // a swatch dragged out and let go over the panel itself fills nothing
     if (!background) androidx.compose.runtime.DisposableEffect(Unit) { onDispose { vm.dropAvoid = null } }
+    // (on the canvas: in the window, less what the interface keeps clear of)
+    val corner = LocalClearance.current.corner
     // dragged out by its grabber, it is not seen (nor its blur) until let go, the window floating
     val undocking = !background && vm.colorsUndocking
     val look = LocalPanelLook.current
     ProvidePanelLook(if (undocking) PanelLook(0f, look.scale, look.pivot) else look) {
-    Popover(PanelWidth, arrowX, (if (background) modifier else modifier.onGloballyPositioned { vm.dropAvoid = it.boundsInRoot() }).heightIn(max = screenHeight - Pc.BarHeight - 25.dp).alpha(if (undocking) 0f else 1f)) {
+    Popover(PanelWidth, arrowX, (if (background) modifier else modifier.onGloballyPositioned { vm.dropAvoid = it.boundsInRoot().translate(-corner) }).heightIn(max = screenHeight - Pc.BarHeight - 25.dp).alpha(if (undocking) 0f else 1f)) {
         Box {
             if (background) {
                 PanelHeader("Background", start = 20.dp, end = 12.dp, height = headerHeight, chevron = false) {
@@ -286,7 +300,15 @@ fun ColorPanel(vm: CanvasViewModel, arrowX: Dp, screenHeight: Dp, modifier: Modi
                     }
                     Row(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
                         val swatch = Modifier.size(43.dp, 25.dp).clip(RoundedCornerShape(6.dp))
-                        Box(swatch.background(rgbColor(vm.colorRgb())).border(1.dp, Pc.SwatchEdge, RoundedCornerShape(6.dp)))
+                        if (Pc.colourBefore) {
+                            // a plugin's: the colour before (a tap goes back to it) beside the colour now
+                            Row(swatch.border(1.dp, Pc.SwatchEdge, RoundedCornerShape(6.dp))) {
+                                Box(Modifier.weight(1f).fillMaxHeight().background(rgbColor(opened)).clickable { c.setRgb(opened) })
+                                Box(Modifier.weight(1f).fillMaxHeight().background(rgbColor(vm.colorRgb())))
+                            }
+                        } else {
+                            Box(swatch.background(rgbColor(vm.colorRgb())).border(1.dp, Pc.SwatchEdge, RoundedCornerShape(6.dp)))
+                        }
                         Box(swatch.background(rgbColor(vm.secondaryRgb)).clickable { vm.swapColors() })
                     }
                 }
@@ -335,13 +357,19 @@ private val FloatingField = Color.White.copy(alpha = 0.06f)
 private fun UndockHandle(vm: CanvasViewModel, modifier: Modifier) {
     var origin by remember { mutableStateOf(Offset.Zero) }
     val density = LocalDensity.current
+    // where it is in the interface: in the window, less what the interface keeps clear of
+    val corner = LocalClearance.current.corner
     Box(
-        modifier.size(150.dp, 30.dp).onGloballyPositioned { origin = it.positionInRoot() }.pointerInput(vm) {
+        modifier.size(150.dp, 30.dp).onGloballyPositioned { origin = it.positionInRoot() - corner }.pointerInput(vm) {
             var total = Offset.Zero
-            val grab = with(density) { Offset(FloatingGrab.x.toPx(), FloatingGrab.y.toPx()) }
+            // (the window's grabber under the finger, at the size the window shows: this panel's
+            // density undone, the floating windows' taken)
+            val k = Pc.partScale(io.github.artcraftandroid.procraft.core.InterfacePart.FLOATING) / Pc.partScale(io.github.artcraftandroid.procraft.core.InterfacePart.PANELS)
+            val grab = with(density) { Offset(FloatingGrab.x.toPx(), FloatingGrab.y.toPx()) * k }
             fun letGo() {
                 if (vm.colorsUndocking) {
                     vm.colorsUndocking = false
+                    vm.letGoColours()
                     vm.closePanels()
                 }
             }
@@ -354,7 +382,7 @@ private fun UndockHandle(vm: CanvasViewModel, modifier: Modifier) {
                 total += delta
                 if (vm.colorsUndocking || total.getDistance() > UndockDrag.toPx()) {
                     vm.colorsUndocking = true
-                    vm.floatingColorsAt = origin + change.position - grab
+                    vm.undockColours(origin + change.position, grab)
                 }
             }
         },
@@ -364,23 +392,50 @@ private fun UndockHandle(vm: CanvasViewModel, modifier: Modifier) {
 /**
  * The colour panel floating: a window of its own, 260 wide, moved by its grabber and closed by its
  * Close (the colour button then opens the panel again). The same colour and mode as the panel; no
- * swatches, history or palette under the pickers, the modes as icons under them.
+ * swatches, history or palette under the pickers, the modes as icons under them. A plugin may show
+ * it smaller than the rest of the interface ([Pc.floatingScale]), or as Classic's picker alone
+ * ([Pc.floatingPickerOnly]).
  */
 @Composable
 fun FloatingColors(vm: CanvasViewModel, maxWidth: Dp, maxHeight: Dp) {
-    val at = vm.floatingColorsAt ?: return
+    val kept = vm.floatingColorsAt ?: return
+    // hidden from its menu: unseen until its button or Show Hidden brings it back
+    if (vm.layoutLook.on && vm.hiddenPieces().contains(io.github.artcraftandroid.procraft.core.LayoutPiece.COLOURS)) return
     val c: ColorPick = remember(vm) { BrushColor(vm) }
     // the disc and Classic in the panel's colour model (Value stays HSB or RGB, as its switch picks)
     val m = remember(c, vm.colourModel) { ModelColor(c, vm.colourModel, vm.colourPlace) }
-    val density = LocalDensity.current
-    val height = if (vm.colorMode == ColorMode.DISC) 351.dp else 390.dp
-    // kept on the screen
-    val x = with(density) { at.x.toDp() }.coerceIn(0.dp, (maxWidth - FloatingWidth).coerceAtLeast(0.dp))
-    val y = with(density) { at.y.toDp() }.coerceIn(0.dp, (maxHeight - height).coerceAtLeast(0.dp))
+    val k = Pc.partScale(io.github.artcraftandroid.procraft.core.InterfacePart.FLOATING)
+    val ringed = vm.colourModel == ColourModel.HSB && Pc.picker?.huePoint?.invoke(c.hue) != null
+    val height = when {
+        Pc.floatingPickerOnly -> FloatingPickerTop + 248.dp + (if (ringed) 0.dp else 40.dp) + 6.dp
+        vm.colorMode == ColorMode.DISC -> 351.dp
+        else -> 390.dp
+    }
+    // while a plugin lays the panels out, where the layout has it (folded, its tab)
+    val at = if (vm.layoutLook.on) {
+        vm.panelLayout.setColoursSize(FloatingWidth.value, height.value)
+        val shown = vm.shownPiece(io.github.artcraftandroid.procraft.core.LayoutPiece.COLOURS)
+        if (shown?.folded == true) {
+            FloatingTab(vm, io.github.artcraftandroid.procraft.core.LayoutPiece.COLOURS, shown, if (vm.colorMode == ColorMode.PALETTES) "Palettes" else "Colors")
+            return
+        }
+        val density = LocalDensity.current.density
+        shown?.let { Offset(it.x * density, it.y * density) } ?: kept
+    } else {
+        kept
+    }
+    if (Pc.floatingPickerOnly) {
+        FloatingPicker(vm, c, m, maxWidth, maxHeight, at, height)
+        return
+    }
+    // kept on the screen, and clear of the side bar as the panels are
+    val (x, y) = floatingPlace(vm, at, FloatingWidth * k, height * k, maxWidth, maxHeight)
+    // all of it drawn at the floating windows' size, placed in the window's pixels
+    PartScaled(io.github.artcraftandroid.procraft.core.InterfacePart.FLOATING) {
     Popover(
         FloatingWidth,
         0.dp,
-        Modifier.offset(x, y).height(height).pointerInput(Unit) {
+        Modifier.offset { androidx.compose.ui.unit.IntOffset(x, y) }.height(height).pointerInput(Unit) {
             // the canvas under it takes no touch (a move stays unconsumed: the grabber's drag gives up
             // on one consumed before it has gone far enough)
             awaitEachGesture { awaitFirstDown().consume() }
@@ -391,9 +446,18 @@ fun FloatingColors(vm: CanvasViewModel, maxWidth: Dp, maxHeight: Dp) {
             Box(Modifier.align(Alignment.TopCenter).padding(top = 5.5.dp).size(40.dp, 4.dp).clip(CircleShape).background(Pc.Grabber))
             Box(
                 Modifier.align(Alignment.TopCenter).size(150.dp, 30.dp).pointerInput(vm) {
-                    detectDragGestures { change, delta ->
+                    var total = Offset.Zero
+                    detectDragGestures(
+                        onDragStart = {
+                            total = Offset.Zero
+                            vm.holdColours()
+                        },
+                        onDragEnd = { vm.letGoColours() },
+                        onDragCancel = { vm.letGoColours() },
+                    ) { change, delta ->
                         change.consume()
-                        vm.floatingColorsAt = (vm.floatingColorsAt ?: Offset.Zero) + delta
+                        total += delta
+                        vm.moveColours(total, delta)
                     }
                 },
             )
@@ -401,7 +465,15 @@ fun FloatingColors(vm: CanvasViewModel, maxWidth: Dp, maxHeight: Dp) {
             Box(Modifier.padding(start = 18.dp, top = 4.dp).height(40.dp), contentAlignment = Alignment.CenterStart) {
                 Text(title, color = Pc.PanelTitle, fontSize = 24.sp, fontWeight = FontWeight.Bold)
             }
-            FloatingClose(Modifier.align(Alignment.TopEnd).padding(top = 4.dp, end = 4.dp)) { vm.floatingColorsAt = null }
+            FloatingClose(Modifier.align(Alignment.TopEnd).padding(top = 4.dp, end = 4.dp)) { vm.closeColours() }
+            if (vm.layoutLook.on && vm.layoutLook.fold) {
+                FloatingFold(Modifier.align(Alignment.TopEnd).padding(top = 4.dp, end = 44.dp)) {
+                    vm.foldPiece(io.github.artcraftandroid.procraft.core.LayoutPiece.COLOURS, true)
+                }
+            }
+            if (vm.layoutLook.on) {
+                FloatingMenuButton(Modifier.align(Alignment.TopEnd).padding(top = 4.dp, end = 84.dp), windowMenu(vm, io.github.artcraftandroid.procraft.core.LayoutPiece.COLOURS))
+            }
             Column(Modifier.padding(top = 44.dp)) {
                 when (vm.colorMode) {
                     ColorMode.DISC -> {
@@ -426,11 +498,82 @@ fun FloatingColors(vm: CanvasViewModel, maxWidth: Dp, maxHeight: Dp) {
         }
         CompactTabs(vm.colorMode) { vm.colorMode = it }
     }
+    }
+}
+
+/**
+ * Where the floating window [width] × [height] (as shown) sits, in the window's pixels, for [at]: kept on the screen,
+ * and clear of the side bar as the panels are.
+ */
+@Composable
+private fun floatingPlace(vm: CanvasViewModel, at: Offset, width: Dp, height: Dp, maxWidth: Dp, maxHeight: Dp): Pair<Int, Int> {
+    val density = LocalDensity.current
+    val clear = if (vm.showSideBar) Pc.sideBarShown + Pc.PopoverGap else 0.dp
+    val least = if (vm.rightHanded) 0.dp else clear
+    val most = (maxWidth - width - if (vm.rightHanded) clear else 0.dp).coerceAtLeast(least)
+    val x = with(density) { at.x.toDp() }.coerceIn(least, most)
+    val y = with(density) { at.y.toDp() }.coerceIn(0.dp, (maxHeight - height).coerceAtLeast(0.dp))
+    return with(density) { x.roundToPx() to y.roundToPx() }
+}
+
+/** The floating window's top as Classic's picker alone has it: its grabber, and the picker under it. */
+private val FloatingPickerTop = 30.dp
+
+/**
+ * The floating window as Classic's picker alone, as a plugin asks: its grabber and Close over the picker (the hue
+ * slider under it, unless the picker has the hue on a ring of its own), nothing else; at the plugin's scale.
+ */
+@Composable
+private fun FloatingPicker(vm: CanvasViewModel, c: ColorPick, m: ModelColor, maxWidth: Dp, maxHeight: Dp, at: Offset, height: Dp) {
+    val k = Pc.partScale(io.github.artcraftandroid.procraft.core.InterfacePart.FLOATING)
+    val ringed = vm.colourModel == ColourModel.HSB && Pc.picker?.huePoint?.invoke(c.hue) != null
+    val (x, y) = floatingPlace(vm, at, FloatingWidth * k, height * k, maxWidth, maxHeight)
+    PartScaled(io.github.artcraftandroid.procraft.core.InterfacePart.FLOATING) {
+        Popover(
+            FloatingWidth,
+            0.dp,
+            Modifier.offset { androidx.compose.ui.unit.IntOffset(x, y) }.height(height).pointerInput(Unit) {
+                awaitEachGesture { awaitFirstDown().consume() }
+            },
+            side = ArrowSide.NONE,
+        ) {
+            Box(Modifier.fillMaxWidth().height(height)) {
+                Box(Modifier.align(Alignment.TopCenter).padding(top = 5.5.dp).size(40.dp, 4.dp).clip(CircleShape).background(Pc.Grabber))
+                Box(
+                    Modifier.align(Alignment.TopCenter).size(150.dp, FloatingPickerTop).pointerInput(vm) {
+                        var total = Offset.Zero
+                        detectDragGestures(
+                            onDragStart = {
+                                total = Offset.Zero
+                                vm.holdColours()
+                            },
+                            onDragEnd = { vm.letGoColours() },
+                            onDragCancel = { vm.letGoColours() },
+                        ) { change, delta ->
+                            change.consume()
+                            total += delta
+                            vm.moveColours(total, delta)
+                        }
+                    },
+                )
+                Column(Modifier.padding(top = FloatingPickerTop)) { Classic(c, compact = true, m = m) }
+                FloatingClose(Modifier.align(Alignment.TopEnd).padding(top = 0.dp, end = 0.dp)) { vm.closeColours() }
+                if (vm.layoutLook.on && vm.layoutLook.fold) {
+                    FloatingFold(Modifier.align(Alignment.TopEnd).padding(top = 0.dp, end = 40.dp)) {
+                        vm.foldPiece(io.github.artcraftandroid.procraft.core.LayoutPiece.COLOURS, true)
+                    }
+                }
+                if (vm.layoutLook.on) {
+                    FloatingMenuButton(Modifier.align(Alignment.TopEnd).padding(top = 0.dp, end = 80.dp), windowMenu(vm, io.github.artcraftandroid.procraft.core.LayoutPiece.COLOURS))
+                }
+            }
+        }
+    }
 }
 
 /** Close: a disc with a cross cut out of it. */
 @Composable
-private fun FloatingClose(modifier: Modifier, onClose: () -> Unit) {
+internal fun FloatingClose(modifier: Modifier, onClose: () -> Unit) {
     Box(
         modifier.size(40.dp).clickable(onClick = onClose).drawBehind {
             val r = 8.5.dp.toPx()
@@ -579,19 +722,93 @@ private fun Classic(c: ColorPick, compact: Boolean = false, square: Dp = 344.dp,
         ModelClassic(m, compact, square)
         return
     }
-    SaturationBrightness(c, compact, square)
+    Box {
+        SaturationBrightness(c, compact, square)
+        // plugins' menus, from a button in the square's lower left corner (the panel's, not a compact picker's)
+        if (!compact) Pc.classicMenu?.let { ClassicMenuButton(it, Modifier.align(Alignment.BottomStart).padding(start = 16.dp)) }
+    }
+    // a picker plugin's with the hue on a ring of its own takes the hue slider's place
+    val ringed = Pc.picker?.huePoint?.invoke(c.hue) != null
     if (compact) {
         // the hue only, 240 wide under the 248 square
-        Box(Modifier.padding(start = 10.dp, end = 10.dp).height(40.dp)) {
-            SliderRow(huePosition(HueControl.SLIDER, c.hue), SliderHues.map { hsvColor(it / 360f, 1f, 1f) }) { c.setHsv(hueAt(HueControl.SLIDER, it), c.saturation, c.brightness) }
+        if (!ringed) Box(Modifier.padding(start = 10.dp, end = 10.dp).height(40.dp)) {
+            SliderRow(huePosition(HueControl.SLIDER, c.hue), SliderHues.map { hsvColor(it / 360f, 1f, 1f) }, 1f / 360f) { c.setHsv(hueAt(HueControl.SLIDER, it), c.saturation, c.brightness) }
         }
         return
     }
     Column(Modifier.padding(horizontal = 20.dp)) {
         val pure = hsvColor(c.hue, 1f, 1f)
-        SliderRow(huePosition(HueControl.SLIDER, c.hue), SliderHues.map { hsvColor(it / 360f, 1f, 1f) }) { c.setHsv(hueAt(HueControl.SLIDER, it), c.saturation, c.brightness) }
+        if (!ringed) SliderRow(huePosition(HueControl.SLIDER, c.hue), SliderHues.map { hsvColor(it / 360f, 1f, 1f) }, 1f / 360f) { c.setHsv(hueAt(HueControl.SLIDER, it), c.saturation, c.brightness) }
         SliderRow(c.saturation, listOf(Pc.SaturationGrey, pure)) { c.setHsv(c.hue, it, c.brightness) }
         SliderRow(c.brightness, BrightnessTrack) { c.setHsv(c.hue, c.saturation, it) }
+    }
+}
+
+/** The button for plugins' menus at Classic's corner: three dots on a dark disc, its touch 36 across. */
+private val ClassicMenuDisc = Color.Black.copy(alpha = 0.45f)
+
+/**
+ * Plugins' menus at Classic's corner: three dots on a dark disc in the square's lower left corner, opening a small
+ * menu above it of their choices' icons, the ones that stand now lit; picking one closes it.
+ */
+@Composable
+private fun ClassicMenuButton(menu: ClassicMenu, modifier: Modifier) {
+    var open by remember { mutableStateOf(false) }
+    Box(modifier.size(36.dp).clickable { open = true }, contentAlignment = Alignment.Center) {
+        Box(
+            Modifier.size(26.dp).clip(CircleShape).background(ClassicMenuDisc).drawBehind {
+                val r = 1.6.dp.toPx()
+                for (i in -1..1) drawCircle(Color.White, r, center + Offset(i * 5.5.dp.toPx(), 0f))
+            },
+        )
+        MenuPresence(open, androidx.compose.ui.graphics.TransformOrigin(0f, 1f)) { look ->
+            val gap = with(LocalDensity.current) { 6.dp.roundToPx() }
+            PcPopup(Above(gap), properties = PopupProperties(focusable = true), onDismissRequest = { open = false }) {
+                Row(
+                    look.clip(RoundedCornerShape(17.dp)).background(Pc.GlassMenuOverPanel)
+                        .border(1.dp, Pc.GlassMenuEdge, RoundedCornerShape(17.dp)).padding(6.dp),
+                ) {
+                    for (choice in menu.choices) {
+                        val icon = remember(choice.icon) { choiceIcon(choice.icon) }
+                        Box(
+                            Modifier.size(48.dp, 44.dp).clip(RoundedCornerShape(11.dp))
+                                .background(if (choice.chosen) Pc.Accent.copy(alpha = 0.18f) else Color.Transparent)
+                                .clickable {
+                                    open = false
+                                    menu.choose(choice.key)
+                                },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Icon(icon, contentDescription = choice.label, tint = if (choice.chosen) Pc.Accent else Pc.MenuInk, modifier = Modifier.size(26.dp))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** A plugin's menu choice's icon: its path data on the icons' 24-unit grid, filled even-odd, tinted where it shows. */
+private fun choiceIcon(d: String): ImageVector =
+    ImageVector.Builder(name = "plugin choice", defaultWidth = 24.dp, defaultHeight = 24.dp, viewportWidth = 24f, viewportHeight = 24f)
+        .addPath(
+            pathData = androidx.compose.ui.graphics.vector.addPathNodes(d),
+            pathFillType = androidx.compose.ui.graphics.PathFillType.EvenOdd,
+            fill = androidx.compose.ui.graphics.SolidColor(Color.White),
+        )
+        .build()
+
+/** Puts a popup above the anchor, [gap] over it, its left edge at the anchor's, inside the window. */
+private class Above(private val gap: Int) : androidx.compose.ui.window.PopupPositionProvider {
+    override fun calculatePosition(
+        anchorBounds: androidx.compose.ui.unit.IntRect,
+        windowSize: IntSize,
+        layoutDirection: androidx.compose.ui.unit.LayoutDirection,
+        popupContentSize: IntSize,
+    ): IntOffset {
+        val x = anchorBounds.left.coerceIn(0, (windowSize.width - popupContentSize.width).coerceAtLeast(0))
+        val y = (anchorBounds.top - gap - popupContentSize.height).coerceAtLeast(0)
+        return IntOffset(x, y)
     }
 }
 
@@ -721,6 +938,9 @@ private fun Disc(c: ColorPick, compact: Boolean = false, short: Boolean = false,
     val hue by rememberUpdatedState(c.hue)
     val sat by rememberUpdatedState(c.saturation)
     val bri by rememberUpdatedState(c.brightness)
+    // the colour a touch sets: the one passed now (another may come in mid-way, as the onion
+    // skins' second colour does)
+    val pick by rememberUpdatedState(c)
     val density = LocalDensity.current
     // compact, the whole picker is 240 across instead of 364
     val k = if (compact) 240f / 364f else 1f
@@ -753,14 +973,14 @@ private fun Disc(c: ColorPick, compact: Boolean = false, short: Boolean = false,
                         val d = p - centre
                         if (onRing) {
                             val turn = (atan2(-d.y, d.x) / (2f * PI.toFloat()) + 1f) % 1f
-                            c.setHsv(hueAt(HueControl.RING, turn), sat, bri)
+                            pick.setHsv(hueAt(HueControl.RING, turn), sat, bri)
                         } else {
                             val r = discRadius.toPx()
                             var uv = Offset(d.x / r, d.y / r)
                             val len = uv.getDistance()
                             if (len > 1f) uv = Offset(uv.x / len, uv.y / len)
                             val sq = discToSquare(uv.x, uv.y)
-                            c.setHsv(hue, (sq.x + 1f) / 2f, (1f - sq.y) / 2f)
+                            pick.setHsv(hue, (sq.x + 1f) / 2f, (1f - sq.y) / 2f)
                         }
                     }
                     send(down.position)
@@ -920,6 +1140,7 @@ private fun SaturationBrightness(c: ColorPick, compact: Boolean, height: Dp = 34
         return
     }
     val hue by rememberUpdatedState(c.hue)
+    val pick by rememberUpdatedState(c)
     val pure = hsvColor(c.hue, 1f, 1f)
     val current = rgbColor(c.rgb())
     Box(
@@ -931,7 +1152,7 @@ private fun SaturationBrightness(c: ColorPick, compact: Boolean, height: Dp = 34
     ) {
         Box(
             Modifier.fillMaxSize().clip(RoundedCornerShape(10.dp))
-                .pointerInput(Unit) { track { x, y -> c.setHsv(hue, x, 1f - y) } }
+                .pointerInput(Unit) { track { x, y -> pick.setHsv(hue, x, 1f - y) } }
                 .drawBehind {
                     drawRect(Brush.horizontalGradient(oneSpace(listOf(Color.White, pure))))
                     drawRect(Brush.verticalGradient(listOf(Color.Transparent, Color.Black)))
@@ -943,17 +1164,22 @@ private fun SaturationBrightness(c: ColorPick, compact: Boolean, height: Dp = 34
 /**
  * A plugin's picker in Classic's square, as big as fits: a picker plugin's picture, touches and knob, or else a
  * triangle (saturation and brightness between the pure hue at the right, white at the top left and black at the
- * bottom left) drawn by the core.
+ * bottom left) drawn by the core. A picker plugin's may pick the hue too, on a ring of its own: a touch that starts
+ * where it says a hue moves the hue, and the hue's knob sits where it says.
  */
 @Composable
 private fun ColourTriangle(c: ColorPick, compact: Boolean, height: Dp) {
     val hue by rememberUpdatedState(c.hue)
+    val saturation by rememberUpdatedState(c.saturation)
+    val brightness by rememberUpdatedState(c.brightness)
+    val pick by rememberUpdatedState(c)
     val picker by rememberUpdatedState(Pc.picker)
     val current = rgbColor(c.rgb())
     val box = if (compact) 248.dp else 344.dp
     val side = if (compact) 248.dp else minOf(344.dp, height)
     val px = with(LocalDensity.current) { side.roundToPx() }
-    val picture = rememberPickerPicture(c.hue to (picker != null), px, false) { n ->
+    // (a new picker is its controls changed: its picture drawn again)
+    val picture = rememberPickerPicture(c.hue to picker, px, false) { n ->
         val drawn = picker?.let { it.picture(hue, n) ?: ByteArray(n * n * 4) }
         drawn ?: io.github.artcraftandroid.procraft.core.trianglePicture(hue, n.toUInt())
     }
@@ -961,15 +1187,37 @@ private fun ColourTriangle(c: ColorPick, compact: Boolean, height: Dp) {
         Box(
             Modifier.size(side)
                 .pointerInput(Unit) {
-                    track { x, y ->
-                        val sv = picker?.pick?.invoke(x, y) ?: io.github.artcraftandroid.procraft.core.triangleSv(x, y)
-                        c.setHsv(hue, sv[0], sv[1])
+                    awaitEachGesture {
+                        val down = awaitFirstDown()
+                        down.consume()
+                        fun share(p: Offset) = Offset(p.x / size.width, p.y / size.height)
+                        // on the picker's ring, the hue for the whole drag; else saturation and brightness
+                        val onRing = share(down.position).let { picker?.hue?.invoke(it.x, it.y) } != null
+                        fun send(p: Offset) {
+                            val at = share(p)
+                            if (onRing) {
+                                picker?.hue?.invoke(at.x, at.y)?.let { pick.setHsv(it, saturation, brightness) }
+                                return
+                            }
+                            val (x, y) = at.x.coerceIn(0f, 1f) to at.y.coerceIn(0f, 1f)
+                            val sv = picker?.pick?.invoke(x, y) ?: io.github.artcraftandroid.procraft.core.triangleSv(x, y)
+                            pick.setHsv(hue, sv[0], sv[1])
+                        }
+                        send(down.position)
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val ch = event.changes.firstOrNull { it.id == down.id } ?: break
+                            if (!ch.pressed) break
+                            send(ch.position)
+                            ch.consume()
+                        }
                     }
                 }
                 .drawWithContent {
                     // read, so a new picture draws
                     picture.version
                     drawImage(picture.image, dstSize = androidx.compose.ui.unit.IntSize(size.width.roundToInt(), size.height.roundToInt()))
+                    picker?.huePoint?.invoke(c.hue)?.let { knob(Offset(it[0] * size.width, it[1] * size.height), 10.75.dp.toPx(), hsvColor(c.hue, 1f, 1f)) }
                     val at = picker?.point?.invoke(c.saturation, c.brightness)
                         ?: io.github.artcraftandroid.procraft.core.trianglePoint(c.saturation, c.brightness)
                     knob(Offset(at[0] * size.width, at[1] * size.height), 10.75.dp.toPx(), current)
@@ -986,11 +1234,16 @@ private val BrightnessTrack = listOf(Color.Black, Color.White)
  * Touching anywhere on the row moves the pill there.
  */
 @Composable
-private fun SliderRow(value: Float, colours: List<Color>, onChange: (Float) -> Unit) {
+private fun SliderRow(value: Float, colours: List<Color>, unit: Float = 0.01f, onChange: (Float) -> Unit) {
     val change by rememberUpdatedState(onChange)
+    val now by rememberUpdatedState(value)
+    val steps = Pc.colourSteps
     Box(
         Modifier.fillMaxWidth().height(36.dp)
-            .pointerInput(Unit) { track { x, _ -> change(x) } }
+            .pointerInput(steps, unit) {
+                // a plugin's: a tap at either end steps one unit
+                if (steps) trackStepping(StepEnd.toPx(), unit, { now }) { change(it) } else track { x, _ -> change(x) }
+            }
             .drawBehind {
                 val trackH = 4.dp.toPx()
                 val y = size.height / 2f
@@ -1101,9 +1354,10 @@ private fun Harmony(vm: CanvasViewModel, c: ColorPick, compact: Boolean = false,
     val worked = remember(rgb) { rgbToP3Hsv(rgb) }
     val hsv = held?.takeIf { it.first == rgb }?.second ?: worked
     val state by rememberUpdatedState(hsv)
+    val pick by rememberUpdatedState(c)
     fun set(h: Float, s: Float, v: Float) {
-        c.setRgb(p3HsvToRgb(h, s, v))
-        held = c.rgb() to floatArrayOf(h, s, v)
+        pick.setRgb(p3HsvToRgb(h, s, v))
+        held = pick.rgb() to floatArrayOf(h, s, v)
     }
     val density = LocalDensity.current
     // compact, the wheel is 200 across instead of 298; short, 296
@@ -1377,9 +1631,9 @@ private fun Value(c: ColorPick, compact: Boolean = false, short: Boolean = false
     Column(Modifier.padding(horizontal = 8.dp)) {
         ValueGroup(short = short) { ModelRows(c, m) }
         ValueGroup(Modifier.padding(top = 6.dp), short) {
-            ValueRow("R", r / 255f, listOf(Color(0, g, b), Color(255, g, b)), "$r") { c.setRgb(((it * 255f).roundToInt() shl 16) or (g shl 8) or b) }
-            ValueRow("G", g / 255f, listOf(Color(r, 0, b), Color(r, 255, b)), "$g") { c.setRgb((r shl 16) or ((it * 255f).roundToInt() shl 8) or b) }
-            ValueRow("B", b / 255f, listOf(Color(r, g, 0), Color(r, g, 255)), "$b") { c.setRgb((r shl 16) or (g shl 8) or (it * 255f).roundToInt()) }
+            ValueRow("R", r / 255f, listOf(Color(0, g, b), Color(255, g, b)), "$r", 1f / 255f) { c.setRgb(((it * 255f).roundToInt() shl 16) or (g shl 8) or b) }
+            ValueRow("G", g / 255f, listOf(Color(r, 0, b), Color(r, 255, b)), "$g", 1f / 255f) { c.setRgb((r shl 16) or ((it * 255f).roundToInt() shl 8) or b) }
+            ValueRow("B", b / 255f, listOf(Color(r, g, 0), Color(r, g, 255)), "$b", 1f / 255f) { c.setRgb((r shl 16) or (g shl 8) or (it * 255f).roundToInt()) }
         }
         HexRow(rgb) { c.setRgb(it) }
         if (short) Spacer(Modifier.height(2.dp))
@@ -1393,7 +1647,7 @@ private fun Value(c: ColorPick, compact: Boolean = false, short: Boolean = false
 @Composable
 private fun ModelRows(c: ColorPick, m: ModelColor?) {
     if (m == null || m.model == ColourModel.HSB) {
-        ValueRow("H", huePosition(HueControl.SLIDER, c.hue), SliderHues.map { hsvColor(it / 360f, 1f, 1f) }, "${(c.hue * 360f).roundToInt()}°") {
+        ValueRow("H", huePosition(HueControl.SLIDER, c.hue), SliderHues.map { hsvColor(it / 360f, 1f, 1f) }, "${(c.hue * 360f).roundToInt()}°", 1f / 360f) {
             c.setHsv(hueAt(HueControl.SLIDER, it), c.saturation, c.brightness)
         }
         ValueRow("S", c.saturation, listOf(Pc.SaturationGrey, hsvColor(c.hue, 1f, 1f)), "${(c.saturation * 100f).roundToInt()}%") {
@@ -1423,7 +1677,7 @@ private fun ModelRows(c: ColorPick, m: ModelColor?) {
     val letters = colourModelLetters(m.model)
     for (i in 0..2) {
         val track = tracks.getOrNull(i) ?: continue
-        ValueRow(letters.getOrElse(i) { "" }, track.place, track.paints(), if (i == 0) degreesShown(coords[0]) else percentShown(coords[i])) {
+        ValueRow(letters.getOrElse(i) { "" }, track.place, track.paints(), if (i == 0) degreesShown(coords[0]) else percentShown(coords[i]), if (i == 0) 1f / 360f else 0.01f) {
             m.set(colourModelSlid(m.model, coords[0], coords[1], coords[2], i.toUInt(), it).toFloatArray())
         }
     }
@@ -1506,7 +1760,7 @@ private fun CompactValue(c: ColorPick, group: Color = CompactGroup, field: Color
 private fun CompactValueRow(letter: String, value: Float, colours: List<Color>, shown: String, onChange: (Float) -> Unit) {
     Row(Modifier.fillMaxWidth().height(44.dp), verticalAlignment = Alignment.CenterVertically) {
         Text(letter, color = Pc.PanelTitle, fontSize = 15.sp, modifier = Modifier.width(20.dp))
-        Box(Modifier.weight(1f)) { SliderRow(value, colours, onChange) }
+        Box(Modifier.weight(1f)) { SliderRow(value, colours, onChange = onChange) }
         Text(shown, color = Pc.PanelTitle, fontSize = 15.sp, maxLines = 1, textAlign = TextAlign.End, modifier = Modifier.width(48.dp))
     }
 }
@@ -1528,11 +1782,11 @@ private fun ValueGroup(modifier: Modifier = Modifier, height: Dp, gap: Dp, top: 
 
 /** One number slider: its letter, a track from 32 to 296 dp, and the value centred at 326.5. */
 @Composable
-private fun ValueRow(letter: String, value: Float, colours: List<Color>, shown: String, onChange: (Float) -> Unit) {
+private fun ValueRow(letter: String, value: Float, colours: List<Color>, shown: String, unit: Float = 0.01f, onChange: (Float) -> Unit) {
     Box(Modifier.fillMaxWidth().height(44.dp)) {
         Text(letter, color = Pc.PanelTitle, fontSize = 15.sp, modifier = Modifier.align(Alignment.CenterStart).padding(start = 13.dp))
         Box(Modifier.padding(start = 32.dp).width(264.dp).align(Alignment.CenterStart)) {
-            SliderRow(value, colours, onChange)
+            SliderRow(value, colours, unit, onChange)
         }
         Box(Modifier.align(Alignment.CenterStart).padding(start = 304.dp).width(45.dp), contentAlignment = Alignment.Center) {
             Text(shown, color = Pc.PanelTitle, fontSize = 15.sp, maxLines = 1)
@@ -1800,6 +2054,39 @@ private fun ModeTab(icon: ImageVector, label: String, selected: Boolean, modifie
             maxLines = 1,
             modifier = Modifier.align(Alignment.TopCenter).padding(top = 41.dp),
         )
+    }
+}
+
+/** How far in from either end of a slider a tap steps it, while a plugin has them step. */
+private val StepEnd = 18.dp
+
+/**
+ * As [track] across, for a slider a plugin has step: a tap within [end] pixels of either end moves
+ * its [value] one [unit] down or up (0..1); a drag from anywhere, or a touch between, goes where it is.
+ */
+private suspend fun PointerInputScope.trackStepping(end: Float, unit: Float, value: () -> Float, onMove: (Float) -> Unit) {
+    awaitEachGesture {
+        val down = awaitFirstDown()
+        down.consume()
+        fun at(p: Offset) = (p.x / size.width).coerceIn(0f, 1f)
+        val side = when {
+            down.position.x < end -> -1f
+            down.position.x > size.width - end -> 1f
+            else -> 0f
+        }
+        var dragging = side == 0f
+        if (dragging) onMove(at(down.position))
+        while (true) {
+            val event = awaitPointerEvent()
+            val c = event.changes.firstOrNull { it.id == down.id } ?: break
+            if (!c.pressed) {
+                if (!dragging) onMove((value() + side * unit).coerceIn(0f, 1f))
+                break
+            }
+            if (!dragging && (c.position - down.position).getDistance() > viewConfiguration.touchSlop) dragging = true
+            if (dragging) onMove(at(c.position))
+            c.consume()
+        }
     }
 }
 

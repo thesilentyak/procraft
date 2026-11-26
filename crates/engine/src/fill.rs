@@ -24,6 +24,11 @@ pub(crate) fn flood_here_most(pixels: usize) -> usize {
 /// lists may take outweighs the speed, and each fill is a flood.
 pub(crate) const REACH_MOST: u64 = 8192 * 4096;
 
+/// The reach is worked out only for a fill over at least one in so many of the picture's pixels:
+/// a fill over less is quicker flooded again than read off the reach, which goes over every pixel
+/// (and working it out takes a core a while).
+pub(crate) const REACH_LEAST: usize = 8;
+
 /// Whether working out the reach of `pixels` pixels, `bytes` each at most while it runs (its
 /// lists included), is worth its memory here: within [`REACH_MOST`], and within an eighth of the
 /// device's layer budget (half its memory), so a tablet with little doesn't run short for it.
@@ -100,18 +105,32 @@ impl Flood {
     /// through pixels within reach, fully where the distance is within the threshold, fading out
     /// over [`FADE`] past it.
     pub fn mask(&self, threshold: f32) -> Mask {
+        self.mask_bounded(threshold).0
+    }
+
+    /// [`Flood::mask`], with a rectangle (x, y, width, height) holding all it takes where that is
+    /// known without going over every pixel (a fill flooded on this thread): the rest of the mask
+    /// is none. A small fill on a large canvas is then worked on where it is.
+    pub fn mask_bounded(&self, threshold: f32) -> (Mask, Option<[u32; 4]>) {
         // The reach may be from an earlier seed of this colour: a fill from there that gets to
         // this seed is the area joined to both, the same from either, so it holds for that.
         let seed = self.seed.1 as usize * self.width as usize + self.seed.0 as usize;
         let cut = farthest(threshold);
         match self.reach.get().filter(|reach| reach.get(seed).is_some_and(|&r| r <= cut)) {
-            Some(reach) => self.by_reach(reach, threshold),
+            Some(reach) => (self.by_reach(reach, threshold), None),
             None => {
-                if self.asked.swap(true, Ordering::Relaxed) && !self.reaching.swap(true, Ordering::Relaxed) {
+                let again = self.asked.swap(true, Ordering::Relaxed);
+                let count = self.distance.len();
+                let (mask, bounds, filled) = match self.by_scanlines(threshold, flood_here_most(count)) {
+                    Some((mask, bounds, filled)) => (mask, Some(bounds), filled),
+                    None => (self.by_runs(threshold), None, count),
+                };
+                // a second fill over much of the picture: the next are read off the reach
+                if again && filled.saturating_mul(REACH_LEAST) >= count && !self.reaching.swap(true, Ordering::Relaxed)
+                {
                     self.work_out_reach();
                 }
-                self.by_scanlines(threshold, flood_here_most(self.distance.len()))
-                    .unwrap_or_else(|| self.by_runs(threshold))
+                (mask, bounds)
             }
         }
     }
@@ -130,9 +149,10 @@ impl Flood {
     }
 
     /// [`Flood::mask`] by a flood on this thread: scanlines from the seed, each span filled whole,
-    /// then the runs above and below it seeded; none once it has filled more than `most` pixels
-    /// (a large fill is quicker on every core, [`Flood::by_runs`]).
-    fn by_scanlines(&self, threshold: f32, most: usize) -> Option<Mask> {
+    /// then the runs above and below it seeded; with the rectangle holding what it filled (x, y,
+    /// width, height) and how many pixels that was. None once it has filled more than `most`
+    /// pixels (a large fill is quicker on every core, [`Flood::by_runs`]).
+    fn by_scanlines(&self, threshold: f32, most: usize) -> Option<(Mask, [u32; 4], usize)> {
         let weights = weights(threshold);
         // the farthest distance the fill reaches (the weights only fall with distance)
         let cut = weights.iter().rposition(|&v| v > 0).unwrap_or(0) as u8;
@@ -150,6 +170,8 @@ impl Flood {
         // looked along as a slice
         let mut stack = vec![(self.seed.0 as usize, self.seed.1 as usize)];
         let mut filled = 0;
+        // what it filled: least and most across and down
+        let (mut x0, mut x1, mut y0, mut y1) = (usize::MAX, 0, usize::MAX, 0);
         while let Some((x, y)) = stack.pop() {
             let (Some(line), Some(far)) = (m.data.get_mut(y * w..(y + 1) * w), self.distance.get(y * w..(y + 1) * w))
             else {
@@ -164,6 +186,7 @@ impl Flood {
             if filled > most {
                 return None;
             }
+            (x0, x1, y0, y1) = (x0.min(l), x1.max(r), y0.min(y), y1.max(y));
             for (v, &d) in line.get_mut(l..=r).unwrap_or_default().iter_mut().zip(far.get(l..=r).unwrap_or_default()) {
                 *v = weights.get(usize::from(d)).copied().unwrap_or(0);
             }
@@ -181,7 +204,9 @@ impl Flood {
                 }
             }
         }
-        Some(m)
+        let n = |v: usize| u32::try_from(v).unwrap_or(u32::MAX);
+        let bounds = if filled == 0 { [0, 0, 0, 0] } else { [n(x0), n(y0), n(x1 + 1 - x0), n(y1 + 1 - y0)] };
+        Some((m, bounds, filled))
     }
 
     /// [`Flood::mask`] by a flood, worked out on every core ([`joined`]).
@@ -398,7 +423,7 @@ pub(crate) fn joined<T: Copy + PartialOrd + Sync>(
     std::thread::scope(|scope| {
         for ((y0, y1), part) in bands.iter().copied().zip(out.chunks_mut(band * w)) {
             let (runs, inside, value, row) = (&runs, &inside, &value, &row);
-            scope.spawn(move || {
+            crate::par::beside(scope, move || {
                 for y in y0..y1 {
                     for i in row(y) {
                         let (Some(&[x0, x1]), Some(true)) = (runs.get(i), inside.get(i).copied()) else { continue };
@@ -476,15 +501,23 @@ fn distance(a: &[u8; 4], b: &[u8; 4]) -> u8 {
 }
 
 /// How far past a flood's bounds a soft edge is followed, pixels.
-const EDGE_MOST: usize = 32;
+pub const EDGE_MOST: usize = 32;
 
 /// `mask`, a flood out of see-through `pixels` (premultiplied RGBA8), taken on up the soft edges it
 /// stopped at, each pixel as much as the one below it on the way up: the colour goes behind them
 /// as far as their solid middle, leaving no pale rim between a fill and its line. Only ever up, so
 /// it stops at a line's middle, and a flat half-covered area (none of it above the next) stays out.
 pub fn under_edges(mask: &mut Mask, pixels: &[u8]) {
+    if let Some(bounds) = mask.bounds() {
+        under_edges_within(mask, pixels, bounds);
+    }
+}
+
+/// [`under_edges`] of a mask that takes nothing outside `bounds` (x, y, width, height): what it
+/// takes after is within [`EDGE_MOST`] of them.
+pub fn under_edges_within(mask: &mut Mask, pixels: &[u8], bounds: [u32; 4]) {
     let (w, h) = (mask.width as usize, mask.height as usize);
-    let Some([x, y, bw, bh]) = mask.bounds() else { return };
+    let [x, y, bw, bh] = bounds;
     let alpha = |i: usize| pixels.get(i * 4 + 3).copied().unwrap_or(0);
     // what was taken reaches the edge it stopped at from either side, so a pass each way
     let (left, right) = ((x as usize).saturating_sub(EDGE_MOST), (x as usize + bw as usize + EDGE_MOST).min(w));
@@ -700,8 +733,10 @@ mod tests {
                 let plain = flooded(&flood, threshold);
                 assert_eq!(flood.by_reach(&reach, threshold).data, plain, "seed {seed} threshold {threshold}");
                 assert_eq!(flood.by_runs(threshold).data, plain, "seed {seed} threshold {threshold}");
-                let here = flood.by_scanlines(threshold, usize::MAX).map(|m| m.data);
-                assert_eq!(here, Some(plain.clone()), "seed {seed} threshold {threshold}");
+                let (here, bounds, _) = flood.by_scanlines(threshold, usize::MAX).unwrap();
+                let mask = Mask { width: w, height: h, data: plain.clone() };
+                assert_eq!(Some(bounds), mask.bounds(), "seed {seed} threshold {threshold}");
+                assert_eq!(here.data, plain, "seed {seed} threshold {threshold}");
             }
             // moved on to other pixels of the seed's colour, the reach kept from the first
             let _ = flood.reach.set(reach);
@@ -736,9 +771,11 @@ mod tests {
 
     #[test]
     fn a_flood_works_its_reach_out_only_once_a_second_fill_is_asked_for() {
-        let px: Vec<u8> = (0..64u32 * 64).flat_map(|i| [(i % 7 * 30) as u8, 0, 0, 255]).collect();
+        // shades a step apart, which a fill at 0.1 goes over: it takes the whole picture
+        let px: Vec<u8> = (0..64u32 * 64).flat_map(|i| [(i % 7 * 6) as u8, 0, 0, 255]).collect();
         let flood = Flood::new(64, 64, &px, (3, 3)).unwrap();
         let first = flood.mask(0.1);
+        assert!(first.data.iter().all(|&v| v > 0));
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(flood.reach.get().is_none(), "one fill, no reach");
         assert_eq!(flood.mask(0.1).data, first.data);
@@ -748,6 +785,21 @@ mod tests {
         }
         assert!(flood.reach.get().is_some(), "a second fill starts the reach");
         assert_eq!(flood.mask(0.1).data, first.data);
+    }
+
+    #[test]
+    fn a_small_fill_never_works_its_reach_out() {
+        // stripes too far apart for a fill at 0.1 to cross: it takes a thin band of the picture,
+        // known by the rectangle round it
+        let px: Vec<u8> = (0..64u32 * 64).flat_map(|i| [(i % 7 * 30) as u8, 0, 0, 255]).collect();
+        let flood = Flood::new(64, 64, &px, (3, 3)).unwrap();
+        for _ in 0..3 {
+            let (mask, bounds) = flood.mask_bounded(0.1);
+            assert_eq!(bounds, mask.bounds());
+            assert!(mask.data.iter().filter(|&&v| v > 0).count() < 64 * 64 / REACH_LEAST);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(flood.reach.get().is_none() && !flood.reaching.load(Ordering::Relaxed));
     }
 
     #[test]

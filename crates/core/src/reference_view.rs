@@ -66,6 +66,51 @@ pub fn reference_view_pinched(
     ReferenceView { zoom, x: (mx - cx).clamp(-half_w, half_w), y: (my - cy).clamp(-half_h, half_h) }
 }
 
+/// The side the canvas is read at for a window showing it before the window's size is known.
+pub const REFERENCE_CANVAS_FIRST: u32 = 700;
+
+/// The most pixels the canvas is read at on its longer side for a window (as a picture imported
+/// into one is kept at most): a read of 2048 square is 16 MB.
+const CANVAS_MOST: u32 = 2048;
+
+/// The steps the side the canvas is read at goes up and down in: a pinch reads it again now and
+/// then, not at every move of the fingers.
+const CANVAS_STEP: u32 = 128;
+
+/// The longer side to read a `canvas_width` x `canvas_height` canvas at for a Reference window
+/// whose picture area is `window_width` x `window_height` pixels of the screen, zoomed `zoom` past
+/// fitting whole: a pixel of the picture for each pixel of the screen it covers, so it shows as
+/// sharp as the screen can show it, up to the canvas's own pixels (read whole, it shows crisp
+/// past them as the canvas does), and no more than [`CANVAS_MOST`]; in steps of [`CANVAS_STEP`].
+/// [`REFERENCE_CANVAS_FIRST`] (or the canvas's side, if less) while the window's size isn't known.
+#[uniffi::export]
+pub fn reference_canvas_side(
+    window_width: f32,
+    window_height: f32,
+    zoom: f32,
+    canvas_width: u32,
+    canvas_height: u32,
+) -> u32 {
+    let long = canvas_width.max(canvas_height).max(1);
+    let most = long.min(CANVAS_MOST);
+    let sizes = ReferenceSizes {
+        window_width,
+        window_height,
+        picture_width: canvas_width.max(1) as f32,
+        picture_height: canvas_height.max(1) as f32,
+    };
+    let zoom = if zoom.is_finite() { zoom.clamp(1.0, MOST_ZOOM) } else { 1.0 };
+    // screen pixels a canvas pixel covers
+    let scale = sizes.scale(zoom);
+    if !(scale.is_finite() && scale > 0.0) {
+        return REFERENCE_CANVAS_FIRST.min(most);
+    }
+    let wanted = (long as f32 * scale.min(1.0)).ceil();
+    let steps = (wanted / CANVAS_STEP as f32).ceil().max(1.0);
+    let side = if steps * (CANVAS_STEP as f32) >= most as f32 { most } else { steps as u32 * CANVAS_STEP };
+    side.clamp(1, most)
+}
+
 /// Where the picture is drawn in the window: left, top, width and height (window pixels).
 #[uniffi::export]
 pub fn reference_picture_rect(view: ReferenceView, sizes: ReferenceSizes) -> Vec<f32> {
@@ -140,5 +185,76 @@ mod tests {
         assert_eq!((view.x, view.y), (-200.0, 100.0));
         // its right edge, and its top, at the window's middle
         assert_eq!(reference_picture_rect(view, SIZES), vec![-200.0, 200.0, 400.0, 200.0]);
+    }
+
+    /// The screen pixels each pixel of a `canvas` read at `side` spreads over in a `window` zoomed
+    /// `zoom`: 1 or less shows as sharp as the screen can; more is blown up, soft.
+    fn spread(window: (f32, f32), zoom: f32, canvas: (u32, u32), side: u32) -> f32 {
+        let sizes = ReferenceSizes {
+            window_width: window.0,
+            window_height: window.1,
+            picture_width: canvas.0 as f32,
+            picture_height: canvas.1 as f32,
+        };
+        sizes.scale(zoom) * canvas.0.max(canvas.1) as f32 / side.min(canvas.0.max(canvas.1)) as f32
+    }
+
+    #[test]
+    fn the_canvas_is_read_as_sharp_as_the_window_shows_it() {
+        // a phone's window, 910 x 720 pixels, over a 1080 x 2520 canvas (as reported), and a
+        // tablet's, 1300 x 1100, over a 4000 x 3000 one and a 1500 x 1000 one
+        let cases =
+            [((910.0, 720.0), (1080, 2520)), ((1300.0, 1100.0), (4000, 3000)), ((1300.0, 1100.0), (1500, 1000))];
+        for (window, canvas) in cases {
+            for zoom in [1.0, 1.5, 2.5, 4.0, 8.0, 20.0] {
+                let side = reference_canvas_side(window.0, window.1, zoom, canvas.0, canvas.1);
+                let (before, now) = (spread(window, zoom, canvas, 700), spread(window, zoom, canvas, side));
+                println!(
+                    "{window:?} over {canvas:?} zoomed {zoom}: read at {side}, a pixel over {now:.2} (700: {before:.2})"
+                );
+                let long = canvas.0.max(canvas.1);
+                // never past the canvas's own pixels or 2048 a side, and within a step of what it shows
+                assert!(side <= long.min(CANVAS_MOST), "{side}");
+                if side < long.min(CANVAS_MOST) {
+                    assert!(now <= 1.0, "{now}");
+                    assert!(spread(window, zoom, canvas, side - CANVAS_STEP) > 1.0, "a step less would do: {side}");
+                }
+            }
+        }
+        // the reported window zoomed 2.5 times: a pixel over 2.57 of the screen's before, 1 now
+        let side = reference_canvas_side(910.0, 720.0, 2.5, 1080, 2520);
+        assert_eq!(side, 1920);
+        assert!(spread((910.0, 720.0), 2.5, (1080, 2520), 700) > 2.5);
+        assert!(spread((910.0, 720.0), 2.5, (1080, 2520), side) <= 1.0);
+    }
+
+    #[test]
+    fn a_canvas_shown_past_its_own_pixels_is_read_whole_and_never_past_2048() {
+        // shown three times its size: read whole (and shown crisp past its pixels)
+        assert_eq!(reference_canvas_side(900.0, 700.0, 3.0, 1000, 800), 1000);
+        assert_eq!(reference_canvas_side(900.0, 700.0, 20.0, 4096, 4096), 2048);
+        // a window not laid out yet: as before
+        assert_eq!(reference_canvas_side(0.0, 0.0, 1.0, 2048, 2048), REFERENCE_CANVAS_FIRST);
+        assert_eq!(reference_canvas_side(f32::NAN, f32::NAN, 1.0, 2048, 2048), REFERENCE_CANVAS_FIRST);
+        // (one side known: by that side)
+        assert_eq!(reference_canvas_side(f32::NAN, 500.0, 1.0, 2048, 2048), 512);
+        assert_eq!(reference_canvas_side(0.0, 0.0, 1.0, 400, 300), 400);
+        assert_eq!(reference_canvas_side(500.0, 500.0, f32::NAN, 0, 0), 1);
+    }
+
+    #[test]
+    fn a_pinch_reads_the_canvas_again_only_now_and_then() {
+        // zoomed from fitting whole to the most, a hundredth at a time: 300 moves of the fingers
+        let mut sides = Vec::new();
+        let mut zoom = 1.0f32;
+        while zoom <= MOST_ZOOM {
+            let side = reference_canvas_side(910.0, 720.0, zoom, 1080, 2520);
+            if sides.last() != Some(&side) {
+                sides.push(side);
+            }
+            zoom *= 1.01;
+        }
+        println!("{} reads: {sides:?}", sides.len());
+        assert!(sides.len() <= 12, "{sides:?}");
     }
 }

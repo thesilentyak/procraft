@@ -279,8 +279,53 @@ pub struct BadgeLine {
 }
 
 impl PluginBadge {
+    /// A filter layer's badge (interface 17): a circle, half of it filled with lines, as a picture
+    /// half changed.
+    pub fn filter() -> PluginBadge {
+        // a circle of four quarter curves about the middle, radius 0.3, and lines across its left half
+        let (c, r, k) = (0.5_f32, 0.3_f32, 0.3_f32 * 0.5523);
+        let circle = vec![
+            c,
+            c - r,
+            c + k,
+            c - r,
+            c + r,
+            c - k,
+            c + r,
+            c,
+            c + r,
+            c + k,
+            c + k,
+            c + r,
+            c,
+            c + r,
+            c - k,
+            c + r,
+            c - r,
+            c + k,
+            c - r,
+            c,
+            c - r,
+            c - k,
+            c - k,
+            c - r,
+            c,
+            c - r,
+        ];
+        let across = |y: f32| {
+            let half = (r * r - (y - c) * (y - c)).max(0.0).sqrt();
+            BadgeLine { points: vec![c - half, y, c, y], curved: false }
+        };
+        let mut lines = vec![
+            BadgeLine { points: circle, curved: true },
+            BadgeLine { points: vec![c, c - r, c, c + r], curved: false },
+        ];
+        lines.extend([0.32, 0.44, 0.56, 0.68].map(across));
+        PluginBadge { lines, dots: Vec::new() }
+    }
+
     /// The badge of a layer whose kind draws none, or whose plugin is gone: a plug.
-    pub(crate) fn plug() -> PluginBadge {
+    pub fn plug() -> PluginBadge {
         let line = |points: &[f32]| BadgeLine { points: points.to_vec(), curved: false };
         PluginBadge {
             lines: vec![
@@ -291,6 +336,20 @@ impl PluginBadge {
             dots: Vec::new(),
         }
     }
+}
+
+/// What a kind of layer is known by beside its name in the Layers panel's +, as on its layers'
+/// thumbnails: the badge its manifest draws, or a plug.
+#[uniffi::export]
+pub fn plugin_kind_badge(kind: PluginKind) -> PluginBadge {
+    kind.badge.unwrap_or_else(PluginBadge::plug)
+}
+
+/// What a filter layer is known by (interface 17): on its thumbnail, and beside Filter Layer in the
+/// Layers panel's +.
+#[uniffi::export]
+pub fn filter_layer_badge() -> PluginBadge {
+    PluginBadge::filter()
 }
 
 /// A plugin's artwork open: the copy of its code that keeps it, and its size.

@@ -146,13 +146,21 @@ pub(crate) fn content_shape(pixels: &[u8], width: u32) -> Option<([f32; 4], Vec<
     if row_len == 0 {
         return None;
     }
+    shape_of_rows(pixels.chunks_exact(row_len).map(|row| {
+        let (px, _) = row.as_chunks::<4>();
+        let first = px.iter().position(|&[.., a]| a != 0)?;
+        Some((first, px.iter().rposition(|&[.., a]| a != 0).unwrap_or(first) + 1))
+    }))
+}
+
+/// [`content_shape`] of rows given by where each has any alpha: its first such pixel and the one
+/// past its last (none for a row with none), rows top to bottom.
+fn shape_of_rows(rows: impl Iterator<Item = Option<(usize, usize)>>) -> Option<([f32; 4], Vec<Vec2>)> {
     let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0, 0);
     // each row's outermost pixels are all the hull can need
     let mut ends: Vec<Vec2> = Vec::new();
-    for (y, row) in pixels.chunks_exact(row_len).enumerate() {
-        let (px, _) = row.as_chunks::<4>();
-        let Some(first) = px.iter().position(|&[.., a]| a != 0) else { continue };
-        let last = px.iter().rposition(|&[.., a]| a != 0).unwrap_or(first) + 1;
+    for (y, ends_of) in rows.enumerate() {
+        let Some((first, last)) = ends_of else { continue };
         x0 = x0.min(first);
         x1 = x1.max(last);
         y0 = y0.min(y);
@@ -161,6 +169,99 @@ pub(crate) fn content_shape(pixels: &[u8], width: u32) -> Option<([f32; 4], Vec<
         ends.extend([(first, yt), (first, yb), (last, yt), (last, yb)].map(|(x, y)| Vec2::new(x as f32, y)));
     }
     (x0 < x1).then(|| ([x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32], convex_hull(&ends)))
+}
+
+/// Where `targets` hold what a transform takes: the box around what they hold (the whole canvas,
+/// `size`, where the GPU can't tell), within the box around what `selection` takes.
+pub(crate) fn transform_area(
+    canvas: &procraft_gpu::Canvas,
+    gpu: &procraft_gpu::Gpu,
+    targets: &[LayerId],
+    selection: Option<&procraft_engine::selection::Mask>,
+    (width, height): (u32, u32),
+) -> IRect {
+    // only where they are painted (and the selection takes) is read; all of them where the GPU
+    // can't tell
+    let boxes = canvas.painted_boxes(gpu, targets);
+    let full = IRect::from_size(width, height);
+    let area = boxes
+        .iter()
+        .copied()
+        .collect::<Option<Vec<_>>>()
+        .map_or(full, |b| b.into_iter().reduce(IRect::union).unwrap_or(IRect::EMPTY));
+    match selection.and_then(crate::layer_ops::mask_rect) {
+        Some(taken) => area.intersect(taken),
+        None => area,
+    }
+}
+
+/// The shape of what `targets` hold together within `area` (on the canvas, holding all of it), as
+/// far as `selection` takes it (see [`content_shape`]), measured from `area`'s corner: found on the
+/// GPU, each row's ends sent back, not the pixels, where it can; else read back.
+fn targets_shape(
+    canvas: &procraft_gpu::Canvas,
+    gpu: &procraft_gpu::Gpu,
+    targets: &[LayerId],
+    area: IRect,
+    selection: Option<&procraft_engine::selection::Mask>,
+) -> Option<([f32; 4], Vec<Vec2>)> {
+    match shape_on_gpu(canvas, gpu, targets, area, selection) {
+        Some(found) => found,
+        None => shape_read_back(canvas, gpu, targets, area, selection),
+    }
+}
+
+/// [`targets_shape`] found on the GPU (see [`procraft_gpu::Canvas::row_ends`]): none if it can't
+/// be (a layer parked, or the GPU didn't say), else the shape if there is one.
+pub(crate) fn shape_on_gpu(
+    canvas: &procraft_gpu::Canvas,
+    gpu: &procraft_gpu::Gpu,
+    targets: &[LayerId],
+    area: IRect,
+    selection: Option<&procraft_engine::selection::Mask>,
+) -> Option<Option<([f32; 4], Vec<Vec2>)>> {
+    // (the GPU's selection is the one painting keeps to: the state's own, unless they differ)
+    if selection.is_some() != canvas.has_selection() {
+        return None;
+    }
+    let ends = canvas.row_ends(gpu, targets, selection.is_some())?;
+    let (left, top) = (area.x0.max(0).cast_unsigned(), area.y0.max(0).cast_unsigned());
+    let rows = area.y1.max(0).cast_unsigned().saturating_sub(top) as usize;
+    let at = |x: u32| x.saturating_sub(left) as usize;
+    Some(shape_of_rows(ends.into_iter().skip(top as usize).take(rows).map(|r| r.map(|(a, b)| (at(a), at(b))))))
+}
+
+/// [`targets_shape`] found from the pixels, read back.
+pub(crate) fn shape_read_back(
+    canvas: &procraft_gpu::Canvas,
+    gpu: &procraft_gpu::Gpu,
+    targets: &[LayerId],
+    area: IRect,
+    selection: Option<&procraft_engine::selection::Mask>,
+) -> Option<([f32; 4], Vec<Vec2>)> {
+    let (left, top) = (area.x0.max(0).cast_unsigned(), area.y0.max(0).cast_unsigned());
+    // what all of them hold together there
+    let mut pixels: Vec<u8> = Vec::new();
+    for id in targets {
+        let layer = canvas.read_layer_part(gpu, *id, area).ok()?;
+        if pixels.is_empty() {
+            pixels = layer;
+        } else {
+            for (p, q) in pixels.as_chunks_mut::<4>().0.iter_mut().zip(layer.as_chunks::<4>().0) {
+                p[3] = p[3].max(q[3]);
+            }
+        }
+    }
+    // with a selection, only what it takes moves
+    let across = area.width().max(1) as usize;
+    if let Some(mask) = selection {
+        for (i, px) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let at = (top as usize + i / across) * mask.width as usize + left as usize + i % across;
+            let m = mask.data.get(at).copied().unwrap_or(0);
+            px[3] = ((u16::from(px[3]) * u16::from(m) + 127) / 255) as u8;
+        }
+    }
+    content_shape(&pixels, area.width())
 }
 
 /// Whether `l` shows: it and every group it is in visible.
@@ -270,13 +371,14 @@ impl State {
         canvas.changed_box(gpu).map(|b| b.unwrap_or(IRect::new(0, 0, 1, 1)))
     }
 
-    /// Redraws the layer with the content where the transform has it now.
+    /// Redraws the layer with the content where the transform has it now, from the pixels it
+    /// began with (however many changes it has had, each pixel is filtered once).
     fn show_transform(&mut self) {
         let (Some(t), Some(canvas)) = (self.transform.as_ref(), self.canvas.as_mut()) else { return };
         if let Some(mesh) = t.warp() {
             canvas.set_transform_mesh(&warp::triangles(&mesh, t.source(), MESH_STEPS), self.interpolation.into());
-        } else if let Some(to_source) = Homography::quad_to_quad(t.content(), t.source()) {
-            // each layer pixel looks up where it came from
+        } else if let Some(to_source) = Homography::quad_to_quad(t.placed(), t.source()) {
+            // each layer pixel looks up where it came from: a move lands on whole pixels
             canvas.set_transform(to_source.to_f32(), self.interpolation.into());
         }
     }
@@ -386,8 +488,8 @@ impl CanvasSession {
         st.finish_stroke();
         st.settle();
         let current = st.doc.current();
-        let movable = |l: &Layer| !st.doc.is_locked(l.id) && l.visible && !l.drawn_from_data();
-        // with layers picked, every paint layer chosen (those in a chosen group too) moves
+        // with layers picked or a group current, every paint layer chosen (those in a chosen
+        // group too) moves
         let chosen = st.doc.chosen();
         // a plugin's layer alone moves its items as items: those the selection takes
         st.transform_items = None;
@@ -399,18 +501,7 @@ impl CanvasSession {
             }
             st.transform_items = Some((current, ids, false));
         }
-        let movable = |l: &Layer| movable(l) || st.transform_items.as_ref().is_some_and(|(id, ..)| *id == l.id);
-        let targets: Vec<LayerId> = if chosen.len() > 1 {
-            st.doc
-                .layers()
-                .iter()
-                .filter(|l| l.kind == LayerKind::Paint && movable(l))
-                .filter(|l| chosen.iter().any(|c| *c == l.id || st.doc.is_inside(l.id, *c)))
-                .map(|l| l.id)
-                .collect()
-        } else {
-            st.doc.layer(current).filter(|l| movable(l)).map(|_| current).into_iter().collect()
-        };
+        let targets = st.edited_layers_but(|id| st.transform_items.as_ref().is_some_and(|(items, ..)| *items == id));
         if targets.is_empty() {
             st.transform_items = None;
             return None;
@@ -424,43 +515,11 @@ impl CanvasSession {
         }
         let (width, height) = (st.doc.width(), st.doc.height());
         let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else { return None };
-        // only where they are painted (and the selection takes) is read back; all of them where
-        // the GPU can't tell
-        let boxes = canvas.painted_boxes(gpu, &targets);
-        let full = IRect::from_size(width, height);
-        let mut area = boxes
-            .iter()
-            .copied()
-            .collect::<Option<Vec<_>>>()
-            .map_or(full, |b| b.into_iter().reduce(IRect::union).unwrap_or(IRect::EMPTY));
-        if let Some(taken) = st.selection.as_ref().and_then(crate::layer_ops::mask_rect) {
-            area = area.intersect(taken);
-        }
+        let area = transform_area(canvas, gpu, &targets, st.selection.as_ref(), (width, height));
         if area.is_empty() {
             return None;
         }
-        // what all of them hold together there
-        let mut pixels: Vec<u8> = Vec::new();
-        for id in &targets {
-            let layer = canvas.read_layer_part(gpu, *id, area).ok()?;
-            if pixels.is_empty() {
-                pixels = layer;
-            } else {
-                for (p, q) in pixels.as_chunks_mut::<4>().0.iter_mut().zip(layer.as_chunks::<4>().0) {
-                    p[3] = p[3].max(q[3]);
-                }
-            }
-        }
-        // with a selection, only what it takes moves
-        let (left, top, across) = (area.x0.max(0) as usize, area.y0.max(0) as usize, area.width().max(1) as usize);
-        if let Some(mask) = st.selection.as_ref() {
-            for (i, px) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                let at = (top + i / across) * mask.width as usize + left + i % across;
-                let m = mask.data.get(at).copied().unwrap_or(0);
-                px[3] = ((u16::from(px[3]) * u16::from(m) + 127) / 255) as u8;
-            }
-        }
-        let ([x, y, w, h], hull) = content_shape(&pixels, area.width())?;
+        let ([x, y, w, h], hull) = targets_shape(canvas, gpu, &targets, area, st.selection.as_ref())?;
         let corner = Vec2::new(area.x0 as f32, area.y0 as f32);
         let (x, y, hull) = (x + corner.x, y + corner.y, hull.into_iter().map(|p| p + corner).collect());
         // the other layers shown are snapped onto by their bounds: found now with snapping on,
@@ -491,6 +550,8 @@ impl CanvasSession {
             "Rasterize the layer to transform it"
         } else if st.selection.is_some() {
             "Nothing is selected on this layer"
+        } else if current.is_some_and(|l| l.kind == LayerKind::Group) {
+            "This group is empty"
         } else {
             "This layer is empty"
         }
@@ -637,23 +698,20 @@ impl CanvasSession {
     }
 
     /// Ends the transform: `commit` keeps it as one undo step, otherwise the layer is put back.
+    /// Kept, it ends the selection too, in the same step (undoing it brings the selection back).
     pub fn transform_end(&self, commit: bool) {
         let mut guard = self.shared.lock();
         let st = &mut *guard;
-        if let Some(t) = st.transform.as_ref() {
-            // a selection moves with what it took
-            let moved = match (commit, st.selection.as_ref()) {
-                (true, Some(mask)) => match t.warp() {
-                    Some(mesh) => Some(mask.warped(&warp::triangles(&mesh, t.source(), MESH_STEPS))),
-                    None => Homography::quad_to_quad(t.content(), t.source()).map(|h| mask.moved(|p| h.apply(p))),
-                },
-                _ => None,
-            };
+        if st.transform.is_some() {
+            st.flush();
+            let steps = |st: &State| st.canvas.as_deref().map_or(0, procraft_gpu::Canvas::steps_made);
+            let before = steps(st);
             st.end_transform(commit);
             st.flush();
-            if let Some(moved) = moved {
-                let before = st.selection.replace(moved);
-                st.record_selection(before, "move");
+            if commit && st.selection.is_some() {
+                let made =
+                    st.canvas.as_deref().and_then(procraft_gpu::Canvas::undo_step).filter(|_| steps(st) > before);
+                st.drop_selection_with_step(made);
             }
             st.revision += 1;
             st.scene_back_from_tool();
@@ -669,15 +727,15 @@ impl CanvasSession {
         vec![m.a, m.b, m.c, m.d, m.e, m.f]
     }
 
-    /// The view the canvas opens with in a window of `width` × `height` pixels (as it was left,
-    /// else fitted), as [`CanvasSession::view_matrix`] gives it; once shown, the view it has.
+    /// The view the canvas opens with in a window of `width` × `height` pixels (fitted, turned as
+    /// the gallery shows it), as [`CanvasSession::view_matrix`] gives it; once shown, the view it
+    /// has.
     pub fn opening_view_matrix(&self, width: u32, height: u32) -> Vec<f32> {
         let st = self.shared.lock();
         let window = (width.max(1), height.max(1));
         let view = st.view.unwrap_or_else(|| {
-            st.saved_view.and_then(|v| v.view(window)).unwrap_or_else(|| {
-                procraft_engine::view::View::fit_inside((st.doc.width(), st.doc.height()), window, st.fit_insets)
-            })
+            let canvas = (st.doc.width(), st.doc.height());
+            procraft_engine::view::View::fit_turned(canvas, window, st.kept_clear(), i32::from(st.turns))
         });
         let m = view.to_screen();
         vec![m.a, m.b, m.c, m.d, m.e, m.f]
@@ -793,6 +851,12 @@ pub fn mesh_handle_at(mesh: Vec<f32>, view: Vec<f32>, x: f32, y: f32, density: f
 #[cfg(test)]
 mod handles {
     use super::*;
+
+    #[test]
+    fn transforms_filter_bilinear_until_another_is_chosen() {
+        let s = CanvasSession::new(32, 32);
+        assert_eq!(s.shared.lock().interpolation, Interpolation::Bilinear);
+    }
 
     #[test]
     fn a_transform_that_cannot_begin_says_why() {

@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 use egui::{Align2, Color32, Pos2, Rect, Sense, TextureHandle, TextureOptions, Ui, pos2, vec2};
-use procraft_core::{CanvasSession, Pick, QuickShapeAnchor, QuickShapeInfo, QuickShapeKind};
+use procraft_core::{CanvasSession, LOUPE_LIFT, Pick, QuickShapeAnchor, QuickShapeInfo, QuickShapeKind};
 
 use crate::icons;
 use crate::look::{Look, Themed, Weight, argb, pc, text};
@@ -20,11 +20,16 @@ const MESSAGE_BAR: Themed = Themed(0xFF606060, 0xFFD0D0D0);
 const MESSAGE_TEXT: Themed = Themed(0xFFB5B5B5, 0xFF3B3B3B);
 const LOUPE_OUTER: f32 = 69.0;
 const LOUPE_INNER: f32 = 53.5;
-const LOUPE_LIFT: f32 = 41.0;
 const LOUPE_EDGE: u32 = 0xFF808080;
 const MODE_BAR: Themed = Themed(0xD63B3B3B, 0xD6EEEEEE);
 const MODE_TEXT: u32 = 0xFFC5C5C5;
 const MODES_FILL: Themed = Themed(0xFF7B7B7B, 0xFFFFFFFF);
+/// The hover fill's stamp is made at most this many pixels across (larger, it is drawn bigger).
+const CURSOR_FILL_MOST: usize = 256;
+/// A hover fill whose stamp is nowhere stronger than this (of 255) is too faint to see.
+const CURSOR_FILL_FAINTEST: u8 = 8;
+/// A hover fill drawn at least this strong (the brush's opacity) shows by itself.
+const CURSOR_FILL_SEEN: f32 = 0.1;
 
 /// A passing message under the top bar; a warning stays longer.
 struct Notice {
@@ -40,10 +45,16 @@ pub struct Picking {
     pub rgb: Option<u32>,
     /// On the reference window's picture, not the canvas.
     from_reference: bool,
+    /// How far above `at` the loupe is centred (points): none on a pen's tip.
+    lift: f32,
 }
 
 pub struct Overlays {
     notice: Option<Notice>,
+    /// Whether the notices of something done go by unseen, as the plugins said at their generation
+    /// (asked again when it changes).
+    hide_done: bool,
+    notices_for: Option<u64>,
     /// Where the notice band shows this frame, to frost the canvas under it (as measured).
     pub frost: Option<Rect>,
     pub picking: Option<Picking>,
@@ -60,16 +71,24 @@ pub struct Overlays {
     /// circle).
     cursor_shape: Vec<Vec<f32>>,
     /// How much more the shape is turned on the screen than its own rotation, radians clockwise,
-    /// as the stamps are: with the canvas, and as a pen that the brush follows leans.
+    /// as the stamps it stands for are (the core's): painting, as the newest stamp; hovering, as one
+    /// laid there, going the way the pointer goes and held as the pen is.
     cursor_turn: f32,
     /// How the cursor is drawn (Advanced cursor settings).
     pub cursor_style: CursorStyle,
+    /// The brush's stamp the cursor fills while the pointer hovers (its Hover fill), its side in
+    /// pixels and how strongly the brush paints; none painting, or when the brush has no fill.
+    cursor_fill: Option<(Vec<u8>, usize, f32, f32)>,
+    /// The stamp's picture, by what it was made from.
+    cursor_fill_picture: Option<(u64, TextureHandle)>,
 }
 
 impl Default for Overlays {
     fn default() -> Overlays {
         Overlays {
             notice: None,
+            hide_done: false,
+            notices_for: None,
             frost: None,
             picking: None,
             spent: None,
@@ -79,25 +98,60 @@ impl Default for Overlays {
             cursor_shape: Vec::new(),
             cursor_turn: 0.0,
             cursor_style: CursorStyle::Brush,
+            cursor_fill: None,
+            cursor_fill_picture: None,
         }
     }
 }
 
 impl Overlays {
-    /// Shows `text` in the band under the top bar, in place of any message there.
+    /// Shows `text` in the band under the top bar, in place of any message there: a notice of
+    /// something gone wrong, which always shows.
     pub fn notice(&mut self, text: impl Into<String>, warning: bool) {
         self.notice = Some(Notice { text: text.into(), since: Instant::now(), warning });
     }
 
-    /// The brush's outline goes to (x, y), window pixels (sized and styled as the stroke begins),
-    /// or away.
+    /// Shows `text`, the notice of something done (copied, cleared, applied, switched on), unless
+    /// a plugin hides those.
+    pub fn done(&mut self, text: impl Into<String>, warning: bool) {
+        if !self.hide_done {
+            self.notice(text, warning);
+        }
+    }
+
+    /// Shows `text`, a notice of `kind`: [`Overlays::notice`] or [`Overlays::done`].
+    pub fn notice_of(&mut self, text: impl Into<String>, warning: bool, kind: procraft_core::NoticeKind) {
+        match kind {
+            procraft_core::NoticeKind::Problem => self.notice(text, warning),
+            procraft_core::NoticeKind::Step | procraft_core::NoticeKind::Done => self.done(text, warning),
+        }
+    }
+
+    /// Which notices show, as `plugins` say now (asked again only when they change).
+    pub fn follow_plugins(&mut self, plugins: &procraft_core::Plugins) {
+        let now = plugins.generation();
+        if self.notices_for != Some(now) {
+            self.notices_for = Some(now);
+            self.hide_done = !plugins.shows_notice(procraft_core::NoticeKind::Done);
+        }
+    }
+
+    /// The brush's outline goes to (x, y), window pixels (styled as the stroke begins, sized as its
+    /// newest stamp once it has one), or away.
     pub fn cursor(&mut self, ctx: &egui::Context, session: &CanvasSession, at: Option<(f32, f32)>) {
         let ppp = ctx.pixels_per_point();
         if self.cursor.is_none() && at.is_some() {
             self.cursor_shape = session.brush_outline();
         }
-        // turned as the pen turns, through the stroke
-        self.cursor_turn = cursor_turn(session);
+        // turned as the newest stamp, through the stroke (as it hovered before it has one)
+        self.cursor_turn = session.cursor_turn();
+        // filled only while it hovers
+        self.cursor_fill = None;
+        // where a stroke's sample there lands, as a plugin may move it: the cursor stands where the stroke goes
+        let at = at.map(|(x, y)| match session.cursor_point(x, y)[..] {
+            [to_x, to_y] => (to_x, to_y),
+            _ => (x, y),
+        });
         self.cursor = at.map(|(x, y)| {
             let (r, outline) = self.cursor.map(|(_, r, o)| (r, o)).unwrap_or_else(|| {
                 let info = session.info();
@@ -106,6 +160,8 @@ impl Overlays {
                     session.current_brush_setting("cursor_outline".into()).round() as i32,
                 )
             });
+            // as big as the newest stamp is laid, once the stroke has one
+            let r = session.cursor_radius().map_or(r, |r| r / ppp);
             (pos2(x, y) / ppp, r, outline)
         });
     }
@@ -113,27 +169,51 @@ impl Overlays {
     /// The brush's outline goes to `at` (points), where the pointer hovers, sized for the brush
     /// as it is now (`info`); or away.
     pub fn hover(&mut self, session: &CanvasSession, info: &procraft_core::CanvasInfo, ppp: f32, at: Option<Pos2>) {
-        if at.is_some() {
-            // the core keeps the brush's outline: asked again, it is handed back as it was
-            self.cursor_shape = session.brush_outline();
-            self.cursor_turn = cursor_turn(session);
+        // where a stroke's sample there lands, as a plugin may move it: the cursor stands where the stroke goes
+        let at = at.map(|at| match session.cursor_point(at.x * ppp, at.y * ppp)[..] {
+            [x, y] => pos2(x / ppp, y / ppp),
+            _ => at,
+        });
+        match at {
+            Some(at) => {
+                // the core keeps the brush's outline: asked again, it is handed back as it was
+                self.cursor_shape = session.brush_outline();
+                // turned as a stamp laid there: going the way the pointer goes, as the pen is held
+                let pen = crate::pen::azimuth()
+                    .map(|azimuth| procraft_core::CursorPen { azimuth, roll: crate::pen::barrel().unwrap_or(0.0) });
+                self.cursor_turn = session.cursor_hovers(at.x * ppp, at.y * ppp, pen);
+            }
+            // (hovering again, it goes on from where it comes back)
+            None if self.cursor.is_some() => session.cursor_hover_gone(),
+            None => {}
         }
         self.cursor = at.map(|at| {
             let outline = session.current_brush_setting("cursor_outline".into()).round() as i32;
             (at, info.brush_diameter * info.zoom / 2.0 / ppp, outline)
         });
+        // the stamp it paints, filling it, if the brush's Hover fill says so: as it would paint at
+        // its estimated pressure, as big and as strong
+        self.cursor_fill = at
+            .and_then(|_| session.hover_fill())
+            .map(|look| {
+                let side = ((info.brush_diameter * info.zoom).ceil() as usize).clamp(2, CURSOR_FILL_MOST);
+                let strength = info.opacity.clamp(0.0, 1.0) * look.opacity.clamp(0.0, 1.0);
+                (session.brush_stamp(side as u32), side, strength, look.size.clamp(0.0, 1.0))
+            })
+            // (one too faint to see is none: the outline shows instead)
+            .filter(|(stamp, ..)| stamp.iter().any(|&a| a >= CURSOR_FILL_FAINTEST));
     }
 
     /// The brush's outline as it shows this frame: where, its radius, and how it is drawn (1
     /// contrasting rings, 2 the colour); none without one, or with one too small to see.
     fn outline(&self) -> Option<(Pos2, f32, i32)> {
         let (at, r, outline) = self.cursor.filter(|(_, r, _)| *r >= 2.0)?;
-        // the style chosen, or as the brush says: none, contrasting rings, or the colour
-        let outline = match self.cursor_style {
-            CursorStyle::Contrast => 1,
-            CursorStyle::Colour => 2,
-            CursorStyle::Brush => outline,
-        };
+        // its stamp filling it as it shows (a fill at the faintest opacities is as good as none)
+        let filled = self
+            .cursor_fill
+            .as_ref()
+            .is_some_and(|(_, _, strength, size)| *strength >= CURSOR_FILL_SEEN && r * size >= 1.0);
+        let outline = cursor_lines(self.cursor_style, outline, filled);
         (outline != 0).then_some((at, r, outline))
     }
 
@@ -160,11 +240,14 @@ impl Overlays {
         };
         let rgb = seen.and_then(|p| p.rgb);
         let ppp = ctx.pixels_per_point();
+        // on a pen's tip, or clear above a mouse, as the touches say it was opened
+        let lift = kept.as_ref().map_or_else(|| session.pick_loupe_lift(), |k| k.lift);
         self.picking = Some(Picking {
             at: pos2(x, y) / ppp,
             image,
             rgb: rgb.or_else(|| kept.and_then(|k| k.rgb)),
             from_reference: false,
+            lift,
         });
     }
 
@@ -172,7 +255,7 @@ impl Overlays {
     /// `rgb`, the `side` x `side` pixels (RGBA) around it shown.
     pub fn pick_reference(&mut self, ctx: &egui::Context, at: Pos2, side: usize, rgba: &[u8], rgb: u32) {
         let image = Some(loupe_texture(ctx, self.picking.as_ref(), side, rgba));
-        self.picking = Some(Picking { at, image, rgb: Some(rgb), from_reference: true });
+        self.picking = Some(Picking { at, image, rgb: Some(rgb), from_reference: true, lift: LOUPE_LIFT });
     }
 
     /// Draws them; `bar_shown` when the interface shows (the bands hang under the top bar).
@@ -180,7 +263,7 @@ impl Overlays {
     pub fn show(&mut self, ui: &Ui, look: &mut Look, current: Color32, bar_shown: bool) -> Option<QuickShapeKind> {
         let ctx = ui.ctx().clone();
         let window = ctx.content_rect();
-        let under_bar = window.top() + if bar_shown { pc::BAR_HEIGHT } else { 0.0 };
+        let under_bar = window.top() + if bar_shown { crate::panel::bar_shown(&ctx) } else { 0.0 };
         let mut chosen = None;
         self.spent = None;
         self.frost = None;
@@ -210,6 +293,36 @@ impl Overlays {
                     }
                 }
                 self.notice_band(ui, under_bar, window);
+                // hovering, the brush's stamp in the colour, as strongly as it paints, under its
+                // outline
+                if let (Some((at, r, _)), Some((stamp, side, strength, size))) = (self.cursor, &self.cursor_fill)
+                    && r >= 2.0
+                    && r * size >= 1.0
+                    && stamp.len() >= side * side
+                {
+                    let key = crate::chrome::stamp_key(stamp, *side);
+                    let picture = match self.cursor_fill_picture.take() {
+                        Some((k, t)) if k == key => t,
+                        _ => {
+                            let pixels = stamp.iter().map(|&a| Color32::from_white_alpha(a)).collect();
+                            let image = egui::ColorImage { size: [*side, *side], pixels, ..Default::default() };
+                            ui.ctx().load_texture("cursor fill", image, TextureOptions::LINEAR)
+                        }
+                    };
+                    let (sin, cos) = self.cursor_turn.sin_cos();
+                    let corner = |x: f32, y: f32| at + vec2(x * cos - y * sin, x * sin + y * cos) * r * *size;
+                    let colour = current.gamma_multiply(*strength);
+                    let mut mesh = egui::Mesh::with_texture(picture.id());
+                    for (x, y, u, v) in
+                        [(-1.0, -1.0, 0.0, 0.0), (1.0, -1.0, 1.0, 0.0), (1.0, 1.0, 1.0, 1.0), (-1.0, 1.0, 0.0, 1.0)]
+                    {
+                        mesh.vertices.push(egui::epaint::Vertex { pos: corner(x, y), uv: pos2(u, v), color: colour });
+                    }
+                    mesh.add_triangle(0, 1, 2);
+                    mesh.add_triangle(0, 2, 3);
+                    ui.painter().add(egui::Shape::mesh(mesh));
+                    self.cursor_fill_picture = Some((key, picture));
+                }
                 // the brush's outline where the pen paints: a thin dark ring with a light edge, or
                 // the colour, as the brush says
                 if let Some((at, r, outline)) = self.outline() {
@@ -391,8 +504,6 @@ fn strip_area(name: &'static str, rect: Rect, ctx: &egui::Context, show: impl Fn
         });
 }
 
-/// The eyedropper's loupe, centred `LOUPE_LIFT` above the pointer: a ring whose top half is the
-/// colour under it and bottom half the current colour, round what is shown there at twice the size.
 /// What the loupe shows, the `side` x `side` pixels (RGBA) `rgba`: in the texture it showed
 /// before, if there was one (a new texture each move frees the one still being drawn).
 fn loupe_texture(ctx: &egui::Context, before: Option<&Picking>, side: usize, rgba: &[u8]) -> TextureHandle {
@@ -409,8 +520,11 @@ fn loupe_texture(ctx: &egui::Context, before: Option<&Picking>, side: usize, rgb
     }
 }
 
+/// The eyedropper's loupe, centred its lift above the pointer (on a pen's tip, `LOUPE_LIFT` above a
+/// mouse): a ring whose top half is the colour under it and bottom half the current colour, round
+/// what is shown there at twice the size.
 fn loupe(ui: &Ui, p: &Picking, current: Color32) {
-    let c = p.at - vec2(0.0, LOUPE_LIFT);
+    let c = p.at - vec2(0.0, p.lift);
     let painter = ui.painter();
     let shadow = egui::epaint::Shadow { offset: [0, 2], blur: 6, spread: 0, color: Color32::from_black_alpha(0x40) };
     painter.add(shadow.as_shape(Rect::from_center_size(c, vec2(LOUPE_OUTER * 2.0, LOUPE_OUTER * 2.0)), LOUPE_OUTER));
@@ -568,29 +682,19 @@ fn icon(kind: QuickShapeKind) -> &'static icons::Icon {
     }
 }
 
-/// How much more the brush's stamps turn on the screen than its own rotation (radians clockwise),
-/// as the strokes turn them: with the canvas, unless the brush is oriented to the screen; and, for a
-/// brush that follows the pen, as the pen near the window leans (its azimuth). The barrel's roll
-/// turns the stamps from where it was as a stroke begins, so a stroke's first stamp is as the
-/// outline shows it however the barrel is turned.
-fn cursor_turn(session: &CanvasSession) -> f32 {
-    let setting = |key: &str| session.current_brush_setting(key.into());
-    let mut turn = 0.0;
-    if setting("orient_to_screen") < 0.5 {
-        let v = session.view_matrix();
-        turn += v.get(1).copied().unwrap_or(0.0).atan2(v.first().copied().unwrap_or(1.0));
+/// How the brush cursor's outline is drawn in `style` for a brush whose own outline is `own` (0
+/// none, 1 contrasting rings, 2 the colour), its hover fill showing under it if `filled`: 0 not at
+/// all, 1 contrasting rings, 2 the colour. Per brush, one whose own is none shows its fill alone
+/// where it has one (hovering); painting, or with no fill, it still shows contrasting rings, so a
+/// brush cursor turned on never goes missing.
+fn cursor_lines(style: CursorStyle, own: i32, filled: bool) -> i32 {
+    match style {
+        CursorStyle::Contrast => 1,
+        CursorStyle::Colour => 2,
+        CursorStyle::Brush if own == 2 => 2,
+        CursorStyle::Brush if own == 0 && filled => 0,
+        CursorStyle::Brush => 1,
     }
-    if let Some(azimuth) = crate::pen::azimuth().filter(|_| setting("input_style") >= 0.5) {
-        turn += azimuth;
-    }
-    // turned by the barrel from its zero, as the stamps will be (relative to the stroke, the first
-    // stamp isn't)
-    if let Some(barrel) =
-        crate::pen::barrel().filter(|_| setting("input_style") >= 1.5 && setting("relative_to_stroke") < 0.5)
-    {
-        turn += barrel;
-    }
-    turn
 }
 
 #[cfg(test)]
@@ -659,6 +763,32 @@ mod tests {
         /// Whether a press at `at` is the interface's, as the window's events go by.
         fn interface_at(&self, at: Pos2) -> bool {
             self.ctx.layer_id_at(at).is_some_and(|l| l.order != egui::Order::Background)
+        }
+    }
+
+    /// Per brush, a brush whose own outline is none still shows contrasting rings while it paints
+    /// (no fill then), and hovering with no fill to show; its fill alone where it shows one.
+    #[test]
+    fn a_brush_with_no_outline_of_its_own_still_shows_its_cursor_while_painting() {
+        let at = pos2(300.0, 300.0);
+        let mut o = Overlays { cursor: Some((at, 20.0, 0)), cursor_style: CursorStyle::Brush, ..Overlays::default() };
+        // painting: rings, standing in for the system's pointer
+        assert_eq!(o.outline(), Some((at, 20.0, 1)));
+        assert!(o.outline_shown());
+        // hovering with its stamp filling it: the fill alone; one too faint to see, the rings
+        o.cursor_fill = Some((vec![255; 4], 2, 0.8, 1.0));
+        assert_eq!(o.outline(), None);
+        o.cursor_fill = Some((vec![255; 4], 2, 0.05, 1.0));
+        assert_eq!(o.outline(), Some((at, 20.0, 1)));
+        // its own outline whatever the fill, and the style chosen for all over the brush's
+        o.cursor = Some((at, 20.0, 2));
+        assert_eq!(o.outline(), Some((at, 20.0, 2)));
+        for (style, lines) in [(CursorStyle::Contrast, 1), (CursorStyle::Colour, 2)] {
+            for own in 0..=2 {
+                for filled in [false, true] {
+                    assert_eq!(cursor_lines(style, own, filled), lines);
+                }
+            }
         }
     }
 

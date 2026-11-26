@@ -171,6 +171,9 @@ pub fn read(bytes: &[u8]) -> Result<Imported, ReadError> {
     }
     document.profile = profile;
     document.icc = icc.map(|icc| CanvasIcc(Arc::new(icc)));
+    // made with the screen on its side: shown upright here, its brushes' shapes and moving grains
+    // lie as the screen held upright had them
+    document.made_turns = u8::try_from(turns % 4).unwrap_or(0);
     if let Some(mut a) = root.object("animation").and_then(|a| animation(&a, holds)) {
         // the layers are listed top first: the first item is the last frame, the last the first
         a.foreground = root.bool("isFirstItemAnimationForeground").unwrap_or(false);
@@ -465,6 +468,17 @@ impl Canvas<'_> {
     }
 }
 
+/// The `orientation` a canvas shown `turns` quarter turns clockwise is kept with (as
+/// [`shown_turns`] reads it).
+fn orientation_for(turns: u32) -> i64 {
+    match turns % 4 {
+        1 => 4,
+        2 => 2,
+        3 => 3,
+        _ => 1,
+    }
+}
+
 /// The quarter turns clockwise a canvas made with the screen at `orientation` is shown at: 1
 /// upright, 2 upside down, 3 and 4 on its side one way and the other (as measured on files made
 /// each way: a mark at the top left of a canvas made at 3 is stored at the top right).
@@ -565,7 +579,7 @@ fn text_look(canvas: &Canvas<'_>, attrs: &Object<'_>) -> LayerText {
 
 /// `src` (`w` × `h`, `bpp` bytes a pixel, top row first) turned `turns` quarter turns clockwise,
 /// then mirrored.
-fn orient(src: Vec<u8>, w: usize, h: usize, bpp: usize, turns: u32, flip_x: bool, flip_y: bool) -> Vec<u8> {
+pub fn orient(src: Vec<u8>, w: usize, h: usize, bpp: usize, turns: u32, flip_x: bool, flip_y: bool) -> Vec<u8> {
     if turns == 0 && !flip_x && !flip_y {
         return src;
     }
@@ -638,6 +652,8 @@ fn add_item(
                 assisted: false,
                 control: None,
                 plugin: None,
+                filter: None,
+                marks: Default::default(),
             });
         }
         _ => {
@@ -671,6 +687,8 @@ fn add_item(
                 assisted: item.bool("perspectiveAssisted").unwrap_or(false),
                 control: None,
                 plugin: None,
+                filter: None,
+                marks: Default::default(),
             });
             if !uuid.is_empty() {
                 pixels.push((lid, canvas.pixels(&uuid, 4, 0)?));
@@ -696,6 +714,8 @@ fn add_item(
                     assisted: false,
                     control: None,
                     plugin: None,
+                    filter: None,
+                    marks: Default::default(),
                 });
                 if let Some(m) = mask.string("UUID") {
                     // a mask stores only the tiles painted on: the rest shows the layer
@@ -756,12 +776,26 @@ pub(crate) fn older_blends(id: i64) -> (i64, i64) {
     }
 }
 
+/// Where an export's layers' pixels come from: each layer's asked for once, as it is written, so
+/// they needn't all be in memory at once.
+pub trait LayerPixels {
+    /// Layer `id`'s pixels (premultiplied RGBA8, the canvas's size; a mask's too), none if it has
+    /// none; an error if they can't be read (the package isn't made).
+    fn pixels(&self, id: LayerId) -> std::io::Result<Option<std::borrow::Cow<'_, [u8]>>>;
+}
+
+impl LayerPixels for std::collections::HashMap<LayerId, Vec<u8>> {
+    fn pixels(&self, id: LayerId) -> std::io::Result<Option<std::borrow::Cow<'_, [u8]>>> {
+        Ok(self.get(&id).map(|p| std::borrow::Cow::Borrowed(p.as_slice())))
+    }
+}
+
 /// What an export writes besides the document: each paint layer's pixels (premultiplied RGBA)
 /// and each mask's (its brightness as grey), the flattened picture (premultiplied, background
 /// included) and the preview PNG.
 pub struct Export<'a> {
     pub document: &'a Document,
-    pub pixels: &'a std::collections::HashMap<LayerId, Vec<u8>>,
+    pub pixels: &'a dyn LayerPixels,
     pub composite: &'a [u8],
     pub thumbnail_png: &'a [u8],
     pub name: &'a str,
@@ -776,6 +810,9 @@ pub struct Export<'a> {
     /// (a PNG, upright).
     pub reference: Option<&'a ReferenceWindow>,
     pub reference_picture: Option<&'a [u8]>,
+    /// How the canvas shows: turned this many quarter turns clockwise (its pixels kept as they
+    /// are; the preview should be turned so).
+    pub turns: u32,
 }
 
 /// The Reference window as a package keeps it. The format keeps the window's kind under
@@ -819,9 +856,22 @@ fn reference_fields(b: &mut Builder, w: &ReferenceWindow) -> Vec<(&'static str, 
 
 /// Writes a package.
 pub fn write(e: &Export<'_>) -> Vec<u8> {
+    let mut zip = ZipWriter::new();
+    write_into(e, &mut zip);
+    zip.finish()
+}
+
+/// Writes a package into `out` as it is made, a layer at a time (each layer's pixels asked for
+/// as it is written, and let go after): `out` back, or why the package couldn't be made whole.
+pub fn write_to<W: std::io::Write>(e: &Export<'_>, out: W) -> std::io::Result<W> {
+    let mut zip = ZipWriter::to(out);
+    write_into(e, &mut zip);
+    zip.finish_to()
+}
+
+fn write_into<W: std::io::Write>(e: &Export<'_>, zip: &mut ZipWriter<W>) {
     let doc = e.document;
     let (w, h) = (doc.width(), doc.height());
-    let mut zip = ZipWriter::new();
     let mut b = Builder::new();
     let mut uuids = Uuids(e.seed ^ 0x9E37_79B9_7F4A_7C15);
     let doc_ref = b.reserve();
@@ -831,12 +881,12 @@ pub fn write(e: &Export<'_>) -> Vec<u8> {
     let (mut selected, mut sampled) = (Builder::null(), Builder::null());
     let mut items = Vec::new();
     for id in tops {
-        items.push(write_item(&mut b, &mut zip, &mut uuids, e, &doc_ref, id, [&mut selected, &mut sampled]));
+        items.push(write_item(&mut b, zip, &mut uuids, e, &doc_ref, id, [&mut selected, &mut sampled]));
     }
     let layers = b.array(items.clone(), true);
     let unwrapped = b.array(items, false);
     let composite_uuid = uuids.next();
-    write_tiles(&mut zip, &composite_uuid, e.composite, w, h, 4, 0);
+    write_tiles(zip, &composite_uuid, e.composite, w, h, 4, 0);
     let composite = layer_record(&mut b, &doc_ref, &composite_uuid, None, LayerRecord::plain(1), w, h);
     let mask_uuid = uuids.next();
     let mask = layer_record(&mut b, &doc_ref, &mask_uuid, None, LayerRecord::plain(2), w, h);
@@ -879,7 +929,7 @@ pub fn write(e: &Export<'_>) -> Vec<u8> {
     let author = if e.author.is_empty() { Builder::null() } else { b.string(e.author) };
     let strokes = b.add(Value::Int(i64::try_from(e.strokes).unwrap_or(i64::MAX)));
     let reference = reference_fields(&mut b, e.reference.unwrap_or(&ReferenceWindow::default()));
-    let video = write_time_lapse(&mut b, &mut zip, e.time_lapse);
+    let video = write_time_lapse(&mut b, zip, e.time_lapse);
     // the last text's look, as a run of a space
     let text_style = match &doc.text_style {
         Some(t) => attributed_string(&mut b, " ", t, doc.profile),
@@ -910,7 +960,7 @@ pub fn write(e: &Export<'_>) -> Vec<u8> {
         ("legacyBehaviour", Value::Int(1)),
         ("mask", mask),
         ("name", name),
-        ("orientation", Value::Int(1)),
+        ("orientation", Value::Int(orientation_for(e.turns))),
         ("primaryItem", selected.clone()),
         ("selectedLayer", selected),
         ("selectedSamplerLayer", sampled),
@@ -931,11 +981,14 @@ pub fn write(e: &Export<'_>) -> Vec<u8> {
     if let Some(png) = e.reference_picture {
         zip.add(REFERENCE_PICTURE, png);
     }
-    zip.finish()
 }
 
 /// The document's time-lapse fields, its segments added to `zip` (stored: video doesn't deflate).
-fn write_time_lapse(b: &mut Builder, zip: &mut ZipWriter, t: Option<&TimeLapse>) -> Vec<(&'static str, Value)> {
+fn write_time_lapse<W: std::io::Write>(
+    b: &mut Builder,
+    zip: &mut ZipWriter<W>,
+    t: Option<&TimeLapse>,
+) -> Vec<(&'static str, Value)> {
     let Some(t) = t else { return vec![("videoEnabled", Value::Bool(false))] };
     let quality = QUALITY_NAMES.get(usize::from(t.quality)).unwrap_or(&"pro50.vqLossless");
     let resolution = RESOLUTION_NAMES.get(usize::from(t.resolution)).unwrap_or(&"pro50.vr4K");
@@ -1057,9 +1110,9 @@ fn top_first(doc: &Document, group: Option<LayerId>) -> Vec<LayerId> {
 }
 
 /// Writes a layer (with its mask and tiles) or a group (with what it holds); gives its record.
-fn write_item(
+fn write_item<W: std::io::Write>(
     b: &mut Builder,
-    zip: &mut ZipWriter,
+    zip: &mut ZipWriter<W>,
     uuids: &mut Uuids,
     e: &Export<'_>,
     doc_ref: &Value,
@@ -1093,15 +1146,23 @@ fn write_item(
         );
     }
     let uuid = uuids.next();
-    let px = e.pixels.get(&id);
-    if let Some(px) = px {
+    // (one that can't be read leaves the package unfinished)
+    let px = e.pixels.pixels(id).unwrap_or_else(|err| {
+        zip.fail(err);
+        None
+    });
+    if let Some(px) = &px {
         write_tiles(zip, &uuid, px, w, h, 4, 0);
     }
     let mask = doc.mask_of(id).and_then(|m| {
         let ml = doc.layer(m)?;
         let mask_uuid = uuids.next();
+        let mask_px = e.pixels.pixels(m).unwrap_or_else(|err| {
+            zip.fail(err);
+            None
+        });
         let grey: Option<Vec<u8>> =
-            e.pixels.get(&m).map(|px| px.as_chunks::<4>().0.iter().map(|&p| crate::document::mask_grey(p)).collect());
+            mask_px.map(|px| px.as_chunks::<4>().0.iter().map(|&p| crate::document::mask_grey(p)).collect());
         if let Some(grey) = &grey {
             write_tiles(zip, &mask_uuid, grey, w, h, 1, 255);
         }
@@ -1125,7 +1186,7 @@ fn write_item(
     let rec = LayerRecord {
         kind: 0,
         name: Some(&l.name),
-        bounds: Some(px.map_or([0.0; 4], |px| bounds(px, w, h, 4, 0))),
+        bounds: Some(px.as_deref().map_or([0.0; 4], |px| bounds(px, w, h, 4, 0))),
         opacity: l.opacity,
         blend: blend_to(l.blend),
         hidden: !l.visible,
@@ -1357,7 +1418,15 @@ fn bounds(px: &[u8], w: u32, h: u32, bpp: usize, blank: u8) -> [f64; 4] {
 
 /// Writes `px` (`w` × `h`, `bpp` bytes a pixel, top row first) as tiles under `uuid/`, leaving out
 /// those whose every byte is `blank` (clear paint, white mask).
-fn write_tiles(zip: &mut ZipWriter, uuid: &str, px: &[u8], w: u32, h: u32, bpp: usize, blank: u8) {
+fn write_tiles<W: std::io::Write>(
+    zip: &mut ZipWriter<W>,
+    uuid: &str,
+    px: &[u8],
+    w: u32,
+    h: u32,
+    bpp: usize,
+    blank: u8,
+) {
     let (w, h, t) = (w as usize, h as usize, TILE as usize);
     let tiles: Vec<(usize, usize)> =
         (0..h.div_ceil(t)).flat_map(|ty| (0..w.div_ceil(t)).map(move |tx| (tx, ty))).collect();
@@ -1459,6 +1528,7 @@ mod tests {
             time_lapse: None,
             reference,
             reference_picture: picture,
+            turns: 0,
         })
     }
 
@@ -1572,6 +1642,7 @@ mod tests {
             time_lapse: None,
             reference: None,
             reference_picture: None,
+            turns: 0,
         });
 
         let back = read(&bytes).unwrap();
@@ -1612,6 +1683,7 @@ mod tests {
                 time_lapse: None,
                 reference: None,
                 reference_picture: None,
+                turns: 0,
             }))
             .unwrap()
             .document
@@ -1677,6 +1749,7 @@ mod tests {
             time_lapse: None,
             reference: None,
             reference_picture: None,
+            turns: 0,
         });
         // the picture's 6 tiles, the mask's one, none for the clear layer
         let zip = ZipReader::new(&bytes).unwrap();
@@ -1722,6 +1795,7 @@ mod tests {
             time_lapse: None,
             reference: None,
             reference_picture: None,
+            turns: 0,
         });
         let zip = ZipReader::new(&bytes).unwrap();
         let mut older = ZipWriter::new();
@@ -1778,6 +1852,7 @@ mod tests {
             time_lapse: None,
             reference: None,
             reference_picture: None,
+            turns: 0,
         });
         let back = read(&bytes).unwrap();
         let d = &back.document;
@@ -1819,6 +1894,7 @@ mod tests {
             time_lapse: None,
             reference: None,
             reference_picture: None,
+            turns: 0,
         });
         let back = read(&bytes).unwrap();
         let kinds = |d: &Document| d.layers().iter().map(|l| l.kind).collect::<Vec<_>>();
@@ -1854,6 +1930,7 @@ mod tests {
             time_lapse: None,
             reference: None,
             reference_picture: None,
+            turns: 0,
         });
         let zip = ZipReader::new(&bytes).unwrap();
         let archive = Archive::read(&zip.read("Document.archive").unwrap()).unwrap();
@@ -1889,6 +1966,7 @@ mod tests {
                 time_lapse: None,
                 reference: None,
                 reference_picture: None,
+                turns: 0,
             })
         };
         if let Some(a) = doc.animation.as_mut() {
@@ -2009,6 +2087,7 @@ mod tests {
             time_lapse: None,
             reference: None,
             reference_picture: None,
+            turns: 0,
         };
         let back = read(&write(&export)).unwrap();
         let layer = back.document.layers().iter().find(|l| l.text.is_some()).unwrap();
@@ -2044,6 +2123,7 @@ mod tests {
                 time_lapse: None,
                 reference: None,
                 reference_picture: None,
+                turns: 0,
             }))
             .unwrap()
             .document
@@ -2095,6 +2175,36 @@ mod tests {
         assert_eq!(parse_size("1488x2266"), None);
     }
 
+    /// A file made with the screen on its side opens shown upright, and keeps how far the screen
+    /// was turned, for its brushes (see `Document::made_turns`).
+    #[test]
+    fn a_canvas_made_on_its_side_keeps_how_it_was_made() {
+        let doc = Document::new(4, 2);
+        let id = doc.layers().first().map(|l| l.id).unwrap();
+        let pixels = HashMap::from([(id, vec![0u8; 4 * 2 * 4])]);
+        for turns in 0..4u32 {
+            let bytes = write(&Export {
+                document: &doc,
+                pixels: &pixels,
+                composite: &[0; 4 * 2 * 4],
+                thumbnail_png: &[],
+                name: "",
+                author: "",
+                strokes: 0,
+                tracked_seconds: 0.0,
+                seed: 1,
+                time_lapse: None,
+                reference: None,
+                reference_picture: None,
+                turns,
+            });
+            let read = read(&bytes).unwrap();
+            assert_eq!(u32::from(read.document.made_turns), turns);
+            let size = (read.document.width(), read.document.height());
+            assert_eq!(size, if turns % 2 == 1 { (2, 4) } else { (4, 2) });
+        }
+    }
+
     #[test]
     fn the_time_lapse_round_trips() {
         let doc = Document::new(16, 16);
@@ -2114,6 +2224,7 @@ mod tests {
                 time_lapse: t,
                 reference: None,
                 reference_picture: None,
+                turns: 0,
             })
         };
         let t = TimeLapse {
@@ -2208,7 +2319,7 @@ mod tests {
                 }
             }
             let preview = ZipReader::new(&bytes).unwrap().read("QuickLook/Thumbnail.png").unwrap();
-            let pixels = back.pixels.iter().cloned().collect();
+            let pixels: HashMap<LayerId, Vec<u8>> = back.pixels.iter().cloned().collect();
             let package = write(&Export {
                 document: doc,
                 pixels: &pixels,
@@ -2222,6 +2333,7 @@ mod tests {
                 time_lapse: None,
                 reference: None,
                 reference_picture: None,
+                turns: 0,
             });
             std::fs::write(out, package).unwrap();
         }

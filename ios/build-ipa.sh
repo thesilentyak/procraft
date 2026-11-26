@@ -6,6 +6,9 @@
 #
 # Usage: ios/build-ipa.sh
 #
+# With PROCRAFT_WIDGET=YES the app comes with its Recent artwork widget (ios/widget.yml), which
+# needs signing of its own to install (see there); without it, as before.
+#
 # VERSION and BUILD as packaging/macos/package.sh has them (default: android/gradle.properties).
 # Needs Xcode, XcodeGen (brew install xcodegen) and Rust with the aarch64-apple-ios target. No
 # Apple account: nothing is signed (CODE_SIGNING_ALLOWED=NO).

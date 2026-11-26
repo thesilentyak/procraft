@@ -5,7 +5,7 @@ name: Build APK
 # open the run on GitHub (on the phone too), scroll to Artifacts, download, unzip, install.
 on:
   push:
-    branches: [main-diffusion]
+    branches: [main-diffusion, "update/**"]
     # documents alone don't change the app
     paths-ignore: ["docs/**", "**/*.md"]
   workflow_dispatch:

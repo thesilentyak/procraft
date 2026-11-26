@@ -40,7 +40,13 @@ impl CanvasSession {
         if st.holding_frames {
             return None;
         }
+        // the pen input that came while the canvas was held goes in this frame
+        self.shared.take_queued_input(&mut st);
         st.draw_frame(view, format, size, screen, started);
+        self.shared.lands_on.note(&st);
+        crate::activity::Counts::add(&self.shared.counts.frames);
+        // what the frame laid (a stroke committed) may be new to save
+        self.shared.nudge.nudge();
         if st.needs_frame {
             return Some(Duration::ZERO);
         }
@@ -49,7 +55,7 @@ impl CanvasSession {
 
     /// Something changed since the last frame was drawn.
     pub fn wants_frame(&self) -> bool {
-        self.shared.lock().needs_frame
+        self.shared.input_waiting() || self.shared.lock().needs_frame
     }
 
     /// Draws the whole canvas fitted and centred on black into `view` (a second display's

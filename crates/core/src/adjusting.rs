@@ -44,9 +44,12 @@ fn glitch_defaults() -> [Vec<f32>; 4] {
     [vec![1.0, 0.09, 1.0], vec![0.2, 0.3, 1.0], vec![0.8, 0.19, 1.0], vec![0.98, -0.5, 0.85, 0.5]]
 }
 
-fn straight() -> Vec<(f32, f32)> {
+pub(crate) fn straight() -> Vec<(f32, f32)> {
     vec![(0.0, 0.0), (1.0, 1.0)]
 }
+
+/// How many curves are kept: all, red, green, blue, and alpha (a filter layer's alone).
+pub(crate) const CURVES: usize = 5;
 
 /// What an open adjustment shows: its values as its bar and panels show them.
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
@@ -67,6 +70,10 @@ pub struct AdjustShown {
     /// x, y pairs (0..1).
     pub curve_channel: u32,
     pub curves: Vec<Vec<f32>>,
+    /// How many of the curves its panel offers: 4 (all, red, green, blue), or 5 with alpha last,
+    /// for a filter layer's curves (interface 18).
+    #[uniffi(default = 4)]
+    pub curve_channels: u32,
     /// The gradient mapped by (its place in the library).
     pub gradient: u32,
     pub noise_kind: NoiseKind,
@@ -110,7 +117,8 @@ pub(crate) struct Adjusting {
     balance_tone: usize,
     balance: [f32; 9],
     curve_channel: usize,
-    curves: [Vec<(f32, f32)>; 4],
+    curves: [Vec<(f32, f32)>; CURVES],
+    curve_channels: usize,
     gradient: usize,
     gradients: Option<Arc<Gradients>>,
     noise_kind: NoiseKind,
@@ -173,7 +181,8 @@ impl Default for Adjusting {
             balance_tone: 1,
             balance: [0.5; 9],
             curve_channel: 0,
-            curves: [straight(), straight(), straight(), straight()],
+            curves: std::array::from_fn(|_| straight()),
+            curve_channels: 4,
             gradient: 0,
             gradients: None,
             noise_kind: NoiseKind::Clouds,
@@ -216,6 +225,22 @@ impl Adjusting {
     #[cfg(test)]
     pub(crate) fn opened(adjustment: Adjustment) -> Adjusting {
         Adjusting { open: Some(adjustment), ..Adjusting::default() }
+    }
+
+    /// Liquify's Adjust amount as an undo or redo left it, and whether it holds anything liquified.
+    pub(crate) fn liquify_follows(&mut self, amount: f32, liquified: bool) {
+        self.liquify_amount = amount;
+        self.liquified = liquified;
+    }
+
+    /// Liquify opened again by an undo or a redo, as it was: its brush as it is set.
+    pub(crate) fn liquify_open_again(&mut self) {
+        self.open = Some(Adjustment::Liquify);
+        self.pencil = false;
+        self.preview = false;
+        self.touched = true;
+        self.puck = None;
+        self.puck_offset = None;
     }
 
     /// The liquify brush as it is set.
@@ -265,6 +290,33 @@ impl Adjusting {
         self.open == Some(Adjustment::ChromaticAberration) && self.chroma_kind == ChromaticKind::Displace
     }
 
+    /// Curves open on a filter layer (interface 18): its five curves as it keeps them, alpha too.
+    pub(crate) fn open_layer_curves(&mut self, curves: [Vec<(f32, f32)>; CURVES]) {
+        self.open = Some(Adjustment::Curves);
+        self.curves = curves;
+        self.curve_channel = 0;
+        self.curve_channels = CURVES;
+        self.amount = 0.0;
+        self.pencil = false;
+        self.preview = false;
+        self.touched = false;
+    }
+
+    /// Gradient Map open on a filter layer (interface 18), library gradient `gradient` chosen.
+    pub(crate) fn open_layer_gradient(&mut self, gradient: usize) {
+        self.open = Some(Adjustment::GradientMap);
+        self.gradient = gradient;
+        self.amount = 1.0;
+        self.pencil = false;
+        self.preview = false;
+        self.touched = false;
+    }
+
+    /// The gradients of the library, if it is given.
+    pub(crate) fn gradient_list(&self) -> Vec<crate::gradients::GradientInfo> {
+        self.gradients.as_ref().map(|g| g.list()).unwrap_or_default()
+    }
+
     /// A plugin's filter is open, as if just begun.
     pub(crate) fn open_plugin(&mut self) {
         self.open = Some(Adjustment::Plugin);
@@ -311,6 +363,7 @@ impl Adjusting {
             balance: self.balance.to_vec(),
             curve_channel: self.curve_channel as u32,
             curves: self.curves.iter().map(|c| c.iter().flat_map(|&(x, y)| [x, y]).collect()).collect(),
+            curve_channels: self.curve_channels as u32,
             gradient: self.gradient as u32,
             noise_kind: self.noise_kind,
             noise: self.noise.to_vec(),
@@ -355,7 +408,7 @@ enum Redraw {
     Swipe(SwipeAdjustment, f32),
     Hsb([f32; 3]),
     Balance([f32; 9]),
-    Curves([Vec<f32>; 4]),
+    Curves([Vec<f32>; CURVES]),
     Gradient(Vec<f32>, f32),
     Noise(NoiseKind, f32, [f32; 3], bool, bool),
     Bloom(f32, [f32; 3]),
@@ -472,6 +525,15 @@ impl CanvasSession {
     }
 
     fn redraw_adjustment(&self, redraw: Redraw) {
+        // a filter layer's editor sets the layer, not pixels
+        let set = match &redraw {
+            Redraw::Curves(curves) => self.set_layer_curves(curves),
+            Redraw::Gradient(stops, _) => self.set_layer_gradient(stops),
+            _ => false,
+        };
+        if set {
+            return;
+        }
         match redraw {
             Redraw::None => {}
             Redraw::Swipe(kind, amount) => self.adjust_swipe(kind, amount),
@@ -481,7 +543,7 @@ impl CanvasSession {
                 let tone = |k: usize| v.get(k * 3..k * 3 + 3).map(<[f32]>::to_vec).unwrap_or_default();
                 self.adjust_color_balance(tone(0), tone(1), tone(2));
             }
-            Redraw::Curves([all, red, green, blue]) => self.adjust_curves(all, red, green, blue),
+            Redraw::Curves([all, red, green, blue, _]) => self.adjust_curves(all, red, green, blue),
             Redraw::Gradient(stops, amount) => self.adjust_gradient_map(stops, amount),
             Redraw::Noise(kind, amount, [scale, octaves, turbulence], multi, added) => {
                 self.adjust_noise(kind, amount, scale, octaves, turbulence, multi, added);
@@ -522,11 +584,16 @@ impl CanvasSession {
     /// can't be adjusted. The amount starts at none (a gradient map's at all of it), HSB, colour
     /// balance and curves as they were; the other adjustments keep their settings.
     pub fn adjustment_start(&self, adjustment: Adjustment) -> bool {
-        // Liquify leaves an alpha locked layer alone
-        if self.why_not_adjusted(adjustment) == Some(crate::layers::Blocked::AlphaLocked) {
+        // Liquify leaves an alpha locked layer alone; the others take one layer
+        use crate::layers::Blocked;
+        if matches!(self.why_not_adjusted(adjustment), Some(Blocked::AlphaLocked | Blocked::Group | Blocked::Several)) {
             return false;
         }
         self.adjustment_end(true);
+        // a filter layer's editor, again as it began (Reset, Undo, Apply)
+        if matches!(adjustment, Adjustment::Curves | Adjustment::GradientMap) && self.filter_layer_editor_again() {
+            return true;
+        }
         let begun = match adjustment {
             Adjustment::Liquify => self.liquify_begin(),
             Adjustment::Clone => self.clone_begin(),
@@ -550,7 +617,8 @@ impl CanvasSession {
             a.preview = false;
             a.hsb = [0.5; 3];
             a.balance = [0.5; 9];
-            a.curves = [straight(), straight(), straight(), straight()];
+            a.curves = std::array::from_fn(|_| straight());
+            a.curve_channels = 4;
             a.chroma_offset = (0.0, 0.0);
             a.liquified = false;
             a.touched = false;
@@ -633,9 +701,9 @@ impl CanvasSession {
         });
     }
 
-    /// Curves' channel shown: 0 all, 1 red, 2 green, 3 blue.
+    /// Curves' channel shown: 0 all, 1 red, 2 green, 3 blue (4 alpha, on a filter layer).
     pub fn adjustment_curve_channel(&self, channel: u32) {
-        self.adjusting(|a, _| a.curve_channel = (channel as usize).min(3));
+        self.adjusting(|a, _| a.curve_channel = (channel as usize).min(a.curve_channels.max(1) - 1));
     }
 
     /// Adds a point to the channel shown; returns its index.
@@ -765,6 +833,10 @@ impl CanvasSession {
 
     /// The layer shown as it was before the adjustment, or as adjusted.
     pub fn adjustment_preview(&self, original: bool) {
+        // (a filter layer's editor shows its layer as set)
+        if self.shared.lock().filters.layer.is_some() {
+            return;
+        }
         if self.adjusting(|a, _| a.open.map(|_| a.preview = original)).is_some() {
             self.adjust_preview(original);
         }
@@ -790,9 +862,12 @@ impl CanvasSession {
         }
     }
 
-    /// Takes back the adjustment's changes (perspective blur's puck a drag at a time), or with
-    /// none, the last one kept.
+    /// Takes back the adjustment's changes (perspective blur's puck a drag at a time; Liquify's a
+    /// step at a time), or with none, the last one kept.
     pub fn adjustment_undo(&self) {
+        if self.step_liquify(true).is_some() {
+            return;
+        }
         let Some((open, changed)) = self.adjusting(|a, _| a.open.map(|o| (o, a.changed()))) else { return };
         if self.perspective_step(true) {
             return;
@@ -878,6 +953,11 @@ impl CanvasSession {
         self.liquify_amount(amount);
     }
 
+    /// The finger let go of Adjust's slider: that drag is an undo step of its own.
+    pub fn adjustment_liquify_amount_end(&self) {
+        self.shared.lock().liquify_adjust_ends();
+    }
+
     /// Everything liquify did undone.
     pub fn adjustment_liquify_reset(&self) {
         self.liquify_reset();
@@ -903,6 +983,18 @@ impl CanvasSession {
     pub fn adjustment_liquify_held(&self, x: f32, y: f32, from: f32, to: f32) -> bool {
         let brush = self.adjusting(|a, _| a.liquify_brush());
         self.liquify_held(x, y, from, to, brush)
+    }
+
+    /// The pen's barrel rolled `turn` radians with the liquify brush at window point (`x`, `y`):
+    /// a twirl turns with it.
+    pub fn adjustment_liquify_rolled(&self, x: f32, y: f32, turn: f32) {
+        let brush = self.adjusting(|a, _| a.liquify_brush());
+        if self.liquify_rolled(x, y, turn, brush) {
+            self.adjusting(|a, _| {
+                a.liquified = true;
+                a.touched = true;
+            });
+        }
     }
 
     /// The liquify brush lifts: true if it, or what it threw off, goes on.

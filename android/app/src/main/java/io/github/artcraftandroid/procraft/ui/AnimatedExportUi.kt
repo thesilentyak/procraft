@@ -122,8 +122,9 @@ fun AnimatedExport(vm: CanvasViewModel, format: CanvasViewModel.Animated) {
                 frames = loaded
                 shown = 0
             }
-            LaunchedEffect(frames) {
-                while (frames.size > 1) {
+            // (still while the app is away)
+            LaunchedEffect(frames, vm.inFront) {
+                while (vm.inFront && frames.size > 1) {
                     delay(1000L / CanvasViewModel.ANIMATION_FPS)
                     shown = (shown + 1) % frames.size
                 }
@@ -259,8 +260,9 @@ fun ModelAnimatedExport(vm: CanvasViewModel, format: CanvasViewModel.Animated) {
                 frames = vm.turntablePreview(side / 2, PREVIEW_FPS)
                 shown = 0
             }
-            LaunchedEffect(frames) {
-                while (frames.size > 1) {
+            // (still while the app is away)
+            LaunchedEffect(frames, vm.inFront) {
+                while (vm.inFront && frames.size > 1) {
                     delay(1000L / PREVIEW_FPS)
                     shown = (shown + 1) % frames.size
                 }

@@ -217,7 +217,7 @@ impl Gradients {
         f(&mut list);
         let Some(file) = &self.file else { return };
         let tmp = file.with_extension("tmp");
-        if let Err(e) = std::fs::write(&tmp, write(&list)).and_then(|()| std::fs::rename(&tmp, file)) {
+        if let Err(e) = crate::storage::write(&tmp, write(&list)).and_then(|()| std::fs::rename(&tmp, file)) {
             log::warn!("keeping the gradients: {e}");
         }
     }

@@ -1,12 +1,53 @@
-//! Zip archives: reading entries (stored or deflated) and writing deflated ones. No Zip64,
-//! encryption or multi-part archives.
+//! Zip archives: reading entries (stored or deflated) and writing deflated ones. Archives are read
+//! from memory or, a big one, from its file an entry at a time (Zip64's larger sizes and counts
+//! too). No encryption or multi-part archives.
 
-/// An archive read into memory: its entries by name.
+use std::borrow::Cow;
+use std::io::{Read, Seek, SeekFrom};
+
+/// An archive: its entries by name, read from memory or from its file.
 pub struct ZipReader<'a> {
-    bytes: &'a [u8],
+    source: Source<'a>,
     entries: Vec<Entry>,
     /// Where each name's (first) entry is.
     by_name: std::collections::HashMap<String, usize>,
+}
+
+/// Where an archive's bytes are: in memory, or in a file read a piece at a time (one reader at a
+/// time, so an archive can be read from several threads).
+enum Source<'a> {
+    Memory(&'a [u8]),
+    File { file: std::sync::Mutex<std::fs::File>, len: u64 },
+}
+
+impl Source<'_> {
+    fn len(&self) -> u64 {
+        match self {
+            Source::Memory(bytes) => bytes.len() as u64,
+            Source::File { len, .. } => *len,
+        }
+    }
+
+    /// The `len` bytes at `at`; none if they aren't all there or can't be read.
+    fn get(&self, at: u64, len: usize) -> Option<Cow<'_, [u8]>> {
+        match self {
+            Source::Memory(bytes) => {
+                let at = usize::try_from(at).ok()?;
+                bytes.get(at..at.checked_add(len)?).map(Cow::Borrowed)
+            }
+            Source::File { file, len: whole } => {
+                // (never more than the file holds, whatever an entry claims)
+                if at.checked_add(len as u64)? > *whole {
+                    return None;
+                }
+                let mut file = file.lock().ok()?;
+                file.seek(SeekFrom::Start(at)).ok()?;
+                let mut out = vec![0; len];
+                file.read_exact(&mut out).ok()?;
+                Some(Cow::Owned(out))
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -14,10 +55,10 @@ struct Entry {
     name: String,
     method: u16,
     flags: u16,
-    compressed: usize,
-    size: usize,
+    compressed: u64,
+    size: u64,
     crc: u32,
-    local: usize,
+    local: u64,
     attributes: u32,
 }
 
@@ -34,19 +75,22 @@ pub struct EntryFacts<'a> {
 /// The largest entry read: anything claiming more is refused.
 const MAX_ENTRY: usize = 1 << 30;
 
+/// The largest central directory read (64 bytes an entry for a million entries).
+const MAX_DIRECTORY: u64 = 64 << 20;
+
 impl<'a> ZipReader<'a> {
     /// The archive in `bytes`, if it is one.
     pub fn new(bytes: &'a [u8]) -> Option<ZipReader<'a>> {
-        let from = bytes.len().saturating_sub(TAIL);
-        let end = end_record(bytes.get(from..)?)? + from;
-        let count = usize::from(u16le(bytes, end + 10)?);
-        let at = usize::try_from(u32le(bytes, end + 16)?).ok()?;
-        let entries = central_entries(bytes, at, count)?;
+        ZipReader::of(Source::Memory(bytes))
+    }
+
+    fn of(source: Source<'a>) -> Option<ZipReader<'a>> {
+        let entries = directory(&source)?;
         let mut by_name = std::collections::HashMap::with_capacity(entries.len());
         for (i, e) in entries.iter().enumerate() {
             by_name.entry(e.name.clone()).or_insert(i);
         }
-        Some(ZipReader { bytes, entries, by_name })
+        Some(ZipReader { source, entries, by_name })
     }
 
     fn entry(&self, name: &str) -> Option<&Entry> {
@@ -64,7 +108,9 @@ impl<'a> ZipReader<'a> {
             // the kind of file in a Unix mode, and a DOS folder's bit
             let kind = (e.attributes >> 16) & 0o170_000;
             let plain = (kind == 0 || kind == 0o100_000) && e.attributes & 0x10 == 0 && !e.name.ends_with('/');
-            EntryFacts { name: &e.name, size: e.size, compressed: e.compressed, encrypted: e.flags & 1 != 0, plain }
+            let size = usize::try_from(e.size).unwrap_or(usize::MAX);
+            let compressed = usize::try_from(e.compressed).unwrap_or(usize::MAX);
+            EntryFacts { name: &e.name, size, compressed, encrypted: e.flags & 1 != 0, plain }
         })
     }
 
@@ -73,35 +119,48 @@ impl<'a> ZipReader<'a> {
     pub fn names_agree(&self) -> bool {
         self.entries.iter().all(|e| {
             let named = || {
-                let len = usize::from(u16le(self.bytes, e.local + 26)?);
-                (u32le(self.bytes, e.local)? == 0x0403_4B50).then_some(())?;
-                self.bytes.get(e.local + 30..e.local + 30 + len)
+                let header = self.source.get(e.local, 30)?;
+                (u32le(&header, 0)? == 0x0403_4B50).then_some(())?;
+                let len = usize::from(u16le(&header, 26)?);
+                self.source.get(e.local.checked_add(30)?, len)
             };
-            named().is_some_and(|n| String::from_utf8_lossy(n) == e.name)
+            named().is_some_and(|n| String::from_utf8_lossy(&n) == e.name)
         })
     }
 
     /// The size entry `name` says it has once read (`read` gives no more).
     pub fn size(&self, name: &str) -> Option<usize> {
-        self.entry(name).map(|e| e.size)
+        self.entry(name).and_then(|e| usize::try_from(e.size).ok())
     }
 
     /// The contents of entry `name`; `None` if it is missing, damaged or of a kind not read.
     pub fn read(&self, name: &str) -> Option<Vec<u8>> {
         let e = self.entry(name)?;
-        if e.size > MAX_ENTRY || e.compressed > MAX_ENTRY || u32le(self.bytes, e.local)? != 0x0403_4B50 {
+        let size = usize::try_from(e.size).ok().filter(|&s| s <= MAX_ENTRY)?;
+        let compressed = usize::try_from(e.compressed).ok().filter(|&c| c <= MAX_ENTRY)?;
+        let header = self.source.get(e.local, 30)?;
+        if u32le(&header, 0)? != 0x0403_4B50 {
             return None;
         }
-        let name_len = usize::from(u16le(self.bytes, e.local + 26)?);
-        let extra = usize::from(u16le(self.bytes, e.local + 28)?);
-        let start = e.local + 30 + name_len + extra;
-        let raw = self.bytes.get(start..start.checked_add(e.compressed)?)?;
+        let name_len = u64::from(u16le(&header, 26)?);
+        let extra = u64::from(u16le(&header, 28)?);
+        let raw = self.source.get(e.local.checked_add(30 + name_len + extra)?, compressed)?;
         let data = match e.method {
-            0 => raw.to_vec(),
-            8 => miniz_oxide::inflate::decompress_to_vec_with_limit(raw, e.size).ok()?,
+            0 => raw.into_owned(),
+            8 => miniz_oxide::inflate::decompress_to_vec_with_limit(&raw, size).ok()?,
             _ => return None,
         };
-        (data.len() == e.size && crc32(&data) == e.crc).then_some(data)
+        (data.len() == size && crc32(&data) == e.crc).then_some(data)
+    }
+}
+
+impl ZipReader<'static> {
+    /// The archive in the file at `path`, if it is one: its directory read from its end, its
+    /// entries each when they are read (a big archive is never held whole).
+    pub fn open(path: &std::path::Path) -> Option<ZipReader<'static>> {
+        let file = std::fs::File::open(path).ok()?;
+        let len = file.metadata().ok()?.len();
+        ZipReader::of(Source::File { file: std::sync::Mutex::new(file), len })
     }
 }
 
@@ -113,7 +172,39 @@ fn end_record(tail: &[u8]) -> Option<usize> {
     (0..tail.len().checked_sub(21)?).rev().find(|&i| tail.get(i..i + 4) == Some(&[0x50, 0x4B, 0x05, 0x06]))
 }
 
-/// The `count` entries the central directory at `at` in `bytes` lists.
+/// The entries the central directory of the archive in `source` lists.
+fn directory(source: &Source<'_>) -> Option<Vec<Entry>> {
+    let len = source.len();
+    let tail_from = len.saturating_sub(TAIL as u64);
+    let tail = source.get(tail_from, usize::try_from(len - tail_from).ok()?)?;
+    let end = end_record(&tail)?;
+    let mut end_at = tail_from + end as u64;
+    let mut count = u64::from(u16le(&tail, end + 10)?);
+    let mut at = u64::from(u32le(&tail, end + 16)?);
+    // one too big for these fields has Zip64's
+    if (count == 0xFFFF || at == 0xFFFF_FFFF)
+        && let Some((wide_count, wide_at, record_at)) = zip64_end(source, end_at)
+    {
+        (count, at, end_at) = (wide_count, wide_at, record_at);
+    }
+    // the directory runs from where it starts to the end record
+    let size = end_at.checked_sub(at).filter(|&s| s <= MAX_DIRECTORY)?;
+    let bytes = source.get(at, usize::try_from(size).ok()?)?;
+    central_entries(&bytes, 0, usize::try_from(count).ok()?)
+}
+
+/// Zip64's end record, from its locator just before the end record at `end_at`: how many entries
+/// there are, where the directory starts and where the record is; none if there is none.
+fn zip64_end(source: &Source<'_>, end_at: u64) -> Option<(u64, u64, u64)> {
+    let locator = source.get(end_at.checked_sub(20)?, 20)?;
+    (u32le(&locator, 0)? == 0x0706_4B50).then_some(())?;
+    let record_at = u64le(&locator, 8)?;
+    let record = source.get(record_at, 56)?;
+    (u32le(&record, 0)? == 0x0606_4B50).then_some(())?;
+    Some((u64le(&record, 32)?, u64le(&record, 48)?, record_at))
+}
+
+/// The `count` entries of the central directory at `at` in `bytes`.
 fn central_entries(bytes: &[u8], mut at: usize, count: usize) -> Option<Vec<Entry>> {
     let mut entries = Vec::with_capacity(count.min(65_536));
     for _ in 0..count {
@@ -123,41 +214,48 @@ fn central_entries(bytes: &[u8], mut at: usize, count: usize) -> Option<Vec<Entr
         let flags = u16le(bytes, at + 8)?;
         let method = u16le(bytes, at + 10)?;
         let crc = u32le(bytes, at + 16)?;
-        let compressed = usize::try_from(u32le(bytes, at + 20)?).ok()?;
-        let size = usize::try_from(u32le(bytes, at + 24)?).ok()?;
+        let mut compressed = u64::from(u32le(bytes, at + 20)?);
+        let mut size = u64::from(u32le(bytes, at + 24)?);
         let name_len = usize::from(u16le(bytes, at + 28)?);
         let extra = usize::from(u16le(bytes, at + 30)?);
         let comment = usize::from(u16le(bytes, at + 32)?);
         let attributes = u32le(bytes, at + 38)?;
-        let local = usize::try_from(u32le(bytes, at + 42)?).ok()?;
+        let mut local = u64::from(u32le(bytes, at + 42)?);
         let name = String::from_utf8_lossy(bytes.get(at + 46..at + 46 + name_len)?).into_owned();
+        // sizes and places too big for their fields are in a Zip64 extra field, in this order
+        let full = [size, compressed, local].map(|v| v == 0xFFFF_FFFF);
+        if full.contains(&true) {
+            let wide = zip64_field(bytes.get(at + 46 + name_len..at + 46 + name_len + extra)?)?;
+            let mut values = wide.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c));
+            for (is_full, value) in full.iter().zip([&mut size, &mut compressed, &mut local]) {
+                if *is_full {
+                    *value = values.next()?;
+                }
+            }
+        }
         entries.push(Entry { name, method, flags, compressed, size, crc, local, attributes });
         at += 46 + name_len + extra + comment;
     }
     Some(entries)
 }
 
+/// The data of the Zip64 field among an entry's `extra` fields.
+fn zip64_field(mut extra: &[u8]) -> Option<&[u8]> {
+    while extra.len() >= 4 {
+        let (id, len) = (u16le(extra, 0)?, usize::from(u16le(extra, 2)?));
+        let data = extra.get(4..4 + len)?;
+        if id == 0x0001 {
+            return Some(data);
+        }
+        extra = extra.get(4 + len..)?;
+    }
+    None
+}
+
 /// The names in the archive at `path`, read from its end (the central directory) alone: a big
 /// archive is told by what it holds without reading all of it.
 pub fn names_in_file(path: &std::path::Path) -> Option<Vec<String>> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    let tail_len = len.min(TAIL as u64);
-    file.seek(SeekFrom::Start(len - tail_len)).ok()?;
-    let mut tail = vec![0; usize::try_from(tail_len).ok()?];
-    file.read_exact(&mut tail).ok()?;
-    let end = end_record(&tail)?;
-    let count = usize::from(u16le(&tail, end + 10)?);
-    let size = usize::try_from(u32le(&tail, end + 12)?).ok()?;
-    let at = u64::from(u32le(&tail, end + 16)?);
-    if size > MAX_ENTRY {
-        return None;
-    }
-    let mut directory = vec![0; size];
-    file.seek(SeekFrom::Start(at)).ok()?;
-    file.read_exact(&mut directory).ok()?;
-    Some(central_entries(&directory, 0, count)?.into_iter().map(|e| e.name).collect())
+    Some(ZipReader::open(path)?.names().map(str::to_owned).collect())
 }
 
 fn u16le(b: &[u8], at: usize) -> Option<u16> {
@@ -168,12 +266,21 @@ fn u32le(b: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(b.get(at..at.checked_add(4)?)?.try_into().ok()?))
 }
 
-/// Writes an archive entry by entry.
+fn u64le(b: &[u8], at: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(b.get(at..at.checked_add(8)?)?.try_into().ok()?))
+}
+
+/// Writes an archive entry by entry: into memory ([`ZipWriter::new`]), or into a writer as it
+/// goes ([`ZipWriter::to`]), so that a big archive is never all in memory.
 #[derive(Default)]
-pub struct ZipWriter {
-    out: Vec<u8>,
+pub struct ZipWriter<W: std::io::Write = Vec<u8>> {
+    out: W,
+    /// How many bytes are written.
+    at: u64,
     central: Vec<u8>,
     count: u16,
+    /// The first write that failed, or what its caller said went wrong: the archive isn't whole.
+    failed: Option<std::io::Error>,
 }
 
 /// An entry made ready to add with [`ZipWriter::add_ready`] (on any thread, for adding in order):
@@ -205,6 +312,43 @@ impl ZipWriter {
         ZipWriter::default()
     }
 
+    /// The finished archive.
+    pub fn finish(mut self) -> Vec<u8> {
+        self.end();
+        self.out
+    }
+}
+
+impl<W: std::io::Write> ZipWriter<W> {
+    /// An archive written into `out` as its entries are added.
+    pub fn to(out: W) -> ZipWriter<W> {
+        ZipWriter { out, at: 0, central: Vec::new(), count: 0, failed: None }
+    }
+
+    /// The archive can't be made whole (`e`, what went wrong): [`ZipWriter::finish_to`] fails.
+    pub fn fail(&mut self, e: std::io::Error) {
+        self.failed.get_or_insert(e);
+    }
+
+    /// Ends an archive written into a writer: the writer, or why the archive isn't whole.
+    pub fn finish_to(mut self) -> std::io::Result<W> {
+        self.end();
+        match self.failed {
+            Some(e) => Err(e),
+            None => Ok(self.out),
+        }
+    }
+
+    /// `bytes` written next (nothing more once a write failed).
+    fn put(&mut self, bytes: &[u8]) {
+        if self.failed.is_none()
+            && let Err(e) = self.out.write_all(bytes)
+        {
+            self.failed = Some(e);
+        }
+        self.at += bytes.len() as u64;
+    }
+
     /// Adds `data` as entry `name`, deflated (or stored, if deflating doesn't make it smaller).
     pub fn add(&mut self, name: &str, data: &[u8]) {
         self.add_ready(name, Ready::of(data, true));
@@ -219,7 +363,7 @@ impl ZipWriter {
     /// the archive (as USDZ packages ask: the local header padded with an extra field).
     pub fn add_aligned(&mut self, name: &str, data: &[u8], align: usize) {
         let align = align.max(1);
-        let at = self.out.len() + 30 + name.len();
+        let at = self.at as usize + 30 + name.len();
         let mut pad = (align - at % align) % align;
         // an extra field needs four bytes for its id and size
         if pad > 0 && pad < 4 {
@@ -230,7 +374,7 @@ impl ZipWriter {
 
     /// An entry whose data (`size` bytes, checksum `crc`) is written as `body` by `method`.
     fn entry(&mut self, name: &str, crc: u32, size: usize, method: u16, body: &[u8], pad: usize) {
-        let local = self.out.len() as u32;
+        let local = self.at as u32;
         let name = name.as_bytes();
         let header = |sig: u32, central: bool| {
             let mut h = Vec::with_capacity(46 + name.len());
@@ -265,25 +409,28 @@ impl ZipWriter {
             }
             h
         };
-        self.out.extend_from_slice(&header(0x0403_4B50, false));
-        self.out.extend_from_slice(body);
+        let local_header = header(0x0403_4B50, false);
+        self.put(&local_header);
+        self.put(body);
         self.central.extend_from_slice(&header(0x0201_4B50, true));
         self.count = self.count.saturating_add(1);
     }
 
-    /// The finished archive.
-    pub fn finish(mut self) -> Vec<u8> {
-        let start = self.out.len() as u32;
-        let size = self.central.len() as u32;
-        self.out.append(&mut self.central);
-        self.out.extend_from_slice(&0x0605_4B50u32.to_le_bytes());
-        self.out.extend_from_slice(&[0; 4]);
-        self.out.extend_from_slice(&self.count.to_le_bytes());
-        self.out.extend_from_slice(&self.count.to_le_bytes());
-        self.out.extend_from_slice(&size.to_le_bytes());
-        self.out.extend_from_slice(&start.to_le_bytes());
-        self.out.extend_from_slice(&0u16.to_le_bytes());
-        self.out
+    /// The central directory and its end, after the entries.
+    fn end(&mut self) {
+        let start = self.at as u32;
+        let central = std::mem::take(&mut self.central);
+        let size = central.len() as u32;
+        self.put(&central);
+        let mut tail = Vec::with_capacity(22);
+        tail.extend_from_slice(&0x0605_4B50u32.to_le_bytes());
+        tail.extend_from_slice(&[0; 4]);
+        tail.extend_from_slice(&self.count.to_le_bytes());
+        tail.extend_from_slice(&self.count.to_le_bytes());
+        tail.extend_from_slice(&size.to_le_bytes());
+        tail.extend_from_slice(&start.to_le_bytes());
+        tail.extend_from_slice(&0u16.to_le_bytes());
+        self.put(&tail);
     }
 }
 
@@ -378,6 +525,91 @@ mod tests {
         // the local header's name changed, the directory's not
         bytes[30] = b'z';
         assert!(!ZipReader::new(&bytes).unwrap().names_agree());
+    }
+
+    #[test]
+    fn an_archive_in_a_file_reads_as_one_in_memory() {
+        let dir = std::env::temp_dir().join(format!("procraft-zip-file-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut w = ZipWriter::new();
+        let noise: Vec<u8> = (0..200_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+        w.add("brushset.plist", b"<plist/>");
+        w.add("one/Shape.png", &noise);
+        w.add_ready("one/Grain.png", Ready::of(&noise, false));
+        let bytes = w.finish();
+        let path = dir.join("set.brushset");
+        std::fs::write(&path, &bytes).unwrap();
+        let file = ZipReader::open(&path).unwrap();
+        let memory = ZipReader::new(&bytes).unwrap();
+        assert!(file.names().eq(memory.names()));
+        assert!(file.names_agree());
+        for name in ["brushset.plist", "one/Shape.png", "one/Grain.png", "missing"] {
+            assert_eq!(file.read(name), memory.read(name), "{name}");
+        }
+        assert_eq!(file.read("one/Grain.png").as_deref(), Some(noise.as_slice()));
+        assert!(ZipReader::open(&dir.join("missing")).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An archive of one stored entry `name` holding `data`, its sizes, place and count in Zip64's
+    /// fields and records alone.
+    fn zip64(name: &str, data: &[u8]) -> Vec<u8> {
+        let crc = crc32(data);
+        let mut out = Vec::new();
+        out.extend_from_slice(&0x0403_4B50u32.to_le_bytes());
+        out.extend_from_slice(&[45, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(data);
+        let directory = out.len() as u64;
+        out.extend_from_slice(&0x0201_4B50u32.to_le_bytes());
+        out.extend_from_slice(&[45, 0, 45, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&[0xFF; 8]);
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&28u16.to_le_bytes());
+        out.extend_from_slice(&[0; 6]);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&[0xFF; 4]);
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&24u16.to_le_bytes());
+        out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes());
+        let size = out.len() as u64 - directory;
+        let record = out.len() as u64;
+        out.extend_from_slice(&0x0606_4B50u32.to_le_bytes());
+        out.extend_from_slice(&44u64.to_le_bytes());
+        out.extend_from_slice(&[45, 0, 45, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        out.extend_from_slice(&1u64.to_le_bytes());
+        out.extend_from_slice(&1u64.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&directory.to_le_bytes());
+        out.extend_from_slice(&0x0706_4B50u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&record.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&0x0605_4B50u32.to_le_bytes());
+        out.extend_from_slice(&[0; 4]);
+        out.extend_from_slice(&[0xFF; 4]);
+        out.extend_from_slice(&[0xFF; 8]);
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn a_zip64_archive_s_entries_are_read_by_their_wide_fields() {
+        let bytes = zip64("Brush.archive", b"bplist00 a brush");
+        let r = ZipReader::new(&bytes).unwrap();
+        assert_eq!(r.names().collect::<Vec<_>>(), ["Brush.archive"]);
+        assert_eq!(r.size("Brush.archive"), Some(16));
+        assert_eq!(r.read("Brush.archive").as_deref(), Some(&b"bplist00 a brush"[..]));
+        assert!(r.names_agree());
     }
 
     #[test]

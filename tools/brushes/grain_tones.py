@@ -12,7 +12,9 @@ to match whatever size its tile is drawn; and each shape's texture's feature siz
 taken away, so that our stand-in has marks as coarse. Each is keyed by a hash of its file's name, so the tables hold
 measurements only: neither the images nor their names. And each grain's width and the strength of
 each octave of our stand-in noise that makes it vary as much as the image does at each size, so
-that a stand-in for a paper or a wash has its fibres, veins and blotches each as strong.
+that a stand-in for a paper or a wash has its fibres, veins and blotches each as strong. And each
+shape's side in pixels, so that our stand-in for it is drawn sharper for a big stamp only as far as
+the image itself goes.
 
 usage: python -I tools/brushes/grain_tones.py <that app's bundle folder>   (needs Pillow and numpy)
 """
@@ -268,6 +270,12 @@ def octaves(path):
     return [min(65535, width)] + [min(65535, round(float(np.sqrt(v)) * 10000)) for v in x]
 
 
+def side(path):
+    """The image's longer side in pixels."""
+    w, h = Image.open(path).size
+    return [min(65535, max(w, h))]
+
+
 def table(bundle, images, key, measure, unnamed):
     """One table: each image the brush files name under `key`, and those `unnamed` (file names),
     its hash and `measure` of it."""
@@ -296,14 +304,15 @@ def main():
     features = table(bundle, images, "bundledGrainPath", feature, other_grains)
     shape_features = table(bundle, images, "bundledShapePath", shape_feature, other_shapes)
     grain_octaves = table(bundle, images, "bundledGrainPath", octaves, other_grains)
+    shape_sides = table(bundle, images, "bundledShapePath", side, other_shapes)
     header = """//! Written by tools/brushes/grain_tones.py (don't edit by hand): the tones of the stock grains
 //! and shapes other apps' brush files name instead of carrying (see [`stock_grain_tones`] and
 //! [`stock_shape_tones`]), each the values at [`TONE_SHARES`] or [`SHAPE_TONE_SHARES`] of it, and
 //! each band of a shape's rows' and columns' mean value (see [`stock_shape_rows`] and
 //! [`stock_shape_cols`]), each grain's feature size (see [`stock_grain_feature`]), how
 //! coarse each shape's texture is (see [`stock_shape_feature`]) and each grain's width and the
-//! octaves our noise stands in for it by (see [`stock_grain_octaves`]), keyed by a hash of its
-//! file's name.
+//! octaves our noise stands in for it by (see [`stock_grain_octaves`]) and each shape's side (see
+//! [`stock_shape_side`]), keyed by a hash of its file's name.
 
 #![cfg_attr(rustfmt, rustfmt_skip)]
 
@@ -318,6 +327,7 @@ def main():
         f.write("\npub(crate) const STOCK_SHAPE_FEATURES: &[(u64, [u16; 1])] = &[\n"
                 + "\n".join(f"    (0x{h:016x}, [{', '.join(str(v) for v in t)}])," for h, t in shape_features) + "\n];\n")
         f.write(f"\npub(crate) const STOCK_GRAIN_OCTAVES: &[(u64, [u16; {OCTAVES + 1}])] = &[\n{body(grain_octaves)}\n];\n")
+        f.write(f"\npub(crate) const STOCK_SHAPE_SIDES: &[(u64, [u16; 1])] = &[\n{body(shape_sides)}\n];\n")
     print(f"{len(grains)} grains, {len(shapes)} shapes, {len(features)} grains' features and {len(shape_features)} shapes' measured")
 
 

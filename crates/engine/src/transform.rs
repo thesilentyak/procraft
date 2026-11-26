@@ -86,6 +86,10 @@ pub struct Guides {
 /// Smallest scale a handle can bring the box to.
 const MIN_SCALE: f32 = 0.01;
 
+/// How much one pinch can scale what the box holds, from where the fingers took it: down to
+/// 1/1024 and up to 1024 times.
+const PINCH_SCALE: (f32, f32) = (1.0 / 1024.0, 1024.0);
+
 /// The step magnetics keeps directions and turns to.
 const MAGNETIC_STEP: f32 = std::f32::consts::PI / 12.0;
 
@@ -125,6 +129,18 @@ impl Transform {
     /// Where the source rectangle's corners are now.
     pub fn content(&self) -> Quad {
         self.now.content
+    }
+
+    /// Where the source rectangle's corners go as the content's pixels are drawn: where the
+    /// content is, except that content only moved, turned by quarter turns or mirrored (its size
+    /// and shape as they were, no warp) goes the nearest whole number of pixels, halves away from
+    /// zero. Every pixel then lands on a pixel and is drawn as it was, whatever the filter, so
+    /// moving a drawing never softens it.
+    pub fn placed(&self) -> Quad {
+        match self.now.warp {
+            Some(_) => self.now.content,
+            None => whole_pixel_move(self.source, self.now.content).unwrap_or(self.now.content),
+        }
     }
 
     /// The box shown around the content.
@@ -184,14 +200,33 @@ impl Transform {
             return false;
         }
         let (middle_was, middle) = (from[0].lerp(from[1], 0.5), to[0].lerp(to[1], 0.5));
+        let spread = now.length() / was.length();
+        let scale = if spread.is_nan() { PINCH_SCALE.0 } else { spread.clamp(PINCH_SCALE.0, PINCH_SCALE.1) };
         let m = Affine::translate(Vec2::ZERO - middle_was)
-            .then(Affine::scale((now.length() / was.length()).max(MIN_SCALE)))
+            .then(Affine::scale(scale))
             .then(Affine::rotate(angle(now) - angle(was)))
             .then(Affine::translate(middle));
         let next = map_placement(&start, m);
+        // pinched again and again, the content could go past what can be drawn (to a point, or out
+        // past any number): it stays where the last step that could be drawn left it
+        if !self.drawable(&next) {
+            return false;
+        }
         let moved = next != self.now;
         self.now = next;
         moved
+    }
+
+    /// Whether content placed as in `p` can be drawn: every point a number, the box's sides too,
+    /// and its pixels found again from where they go (the map from the source to its place
+    /// undoes).
+    fn drawable(&self, p: &Placement) -> bool {
+        let finite = p.content.iter().chain(&p.frame).chain(p.warp.iter().flatten()).all(|v| v.is_finite());
+        let [a, b, _, d] = p.frame;
+        finite
+            && a.distance(b).is_finite()
+            && a.distance(d).is_finite()
+            && Homography::quad_to_quad(p.content, self.source).is_some()
     }
 
     /// The lines (x across, y down, canvas pixels) the box held in a move has snapped onto: shown
@@ -293,19 +328,26 @@ impl Transform {
         }
     }
 
-    /// Scales the box, upright and keeping its proportions, to fit a `width` × `height` canvas,
-    /// centred.
+    /// Scales the box and content alike, keeping their proportions, their turn and any flip, so
+    /// that the box as it is turned (the upright rectangle around it, a warp's mesh too) just fits
+    /// a `width` × `height` canvas, centred on it.
     pub fn fit(&mut self, width: f32, height: f32) {
-        let [a, b, _, d] = self.now.frame;
-        let (w, h) = (a.distance(b), a.distance(d));
-        if w <= 0.0 || h <= 0.0 {
+        let mesh = self.now.warp.map(|m| m.to_vec()).unwrap_or_default();
+        let (mut low, mut high) = (Vec2::new(f32::MAX, f32::MAX), Vec2::new(f32::MIN, f32::MIN));
+        for p in self.now.frame.iter().chain(&mesh) {
+            low = Vec2::new(low.x.min(p.x), low.y.min(p.y));
+            high = Vec2::new(high.x.max(p.x), high.y.max(p.y));
+        }
+        let (w, h) = (high.x - low.x, high.y - low.y);
+        if !(w > 0.0 && h > 0.0) {
             return;
         }
         let k = (width / w).min(height / h);
-        let (w, h) = (w * k, h * k);
-        let (x, y) = ((width - w) / 2.0, (height - h) / 2.0);
-        let to = [Vec2::new(x, y), Vec2::new(x + w, y), Vec2::new(x + w, y + h), Vec2::new(x, y + h)];
-        self.change(|p| carry_all(p, to));
+        let middle = Vec2::new((low.x + high.x) / 2.0, (low.y + high.y) / 2.0);
+        let m = Affine::translate(Vec2::ZERO - middle)
+            .then(Affine { a: k, d: k, ..Affine::IDENTITY })
+            .then(Affine::translate(Vec2::new(width / 2.0, height / 2.0)));
+        self.change(|p| Some(map_placement(p, m)));
     }
 
     /// Moves the content one canvas pixel towards `toward`, along whichever axis it is further
@@ -641,6 +683,38 @@ fn warped(mesh: Mesh, handle: Handle, from: Vec2, delta: Vec2) -> Placement {
     Placement { content: corners, frame: corners, warp: Some(next) }
 }
 
+/// How far (canvas pixels) each corner may be from an exact move, quarter turn or mirror and still
+/// count as one: more than the rounding of corners kept as `f32` on the biggest canvas, less than
+/// any change a hand or a typed number makes.
+const WHOLE_PIXEL_REACH: f32 = 0.01;
+
+/// `to` as the upright rectangle `from` moved the nearest whole number of pixels: when `to` is
+/// `from` moved, turned by quarter turns or mirrored, to within [`WHOLE_PIXEL_REACH`] at each
+/// corner; none otherwise.
+fn whole_pixel_move(from: Quad, to: Quad) -> Option<Quad> {
+    let [a, b, _, d] = from;
+    let (width, height) = (b.x - a.x, d.y - a.y);
+    if !(width > 0.0 && height > 0.0 && b.y == a.y && d.x == a.x) {
+        return None;
+    }
+    // where the rectangle's own axes went, each to the nearest of the four ways along the canvas's
+    let [p, q, _, s] = to;
+    let axis = |v: Vec2, length: f32| Vec2::new((v.x / length).round(), (v.y / length).round());
+    let (across, down) = (axis(q - p, width), axis(s - p, height));
+    let unit = |v: Vec2| v.x.abs() + v.y.abs() == 1.0;
+    if !(unit(across) && unit(down) && across.dot(down) == 0.0) {
+        return None;
+    }
+    let turned = |v: Vec2| across * v.x + down * v.y;
+    // the move: what the corners say on average, which each must say to within the reach
+    let offset = from.iter().zip(&to).fold(Vec2::ZERO, |sum, (f, t)| sum + (*t - turned(*f))) * 0.25;
+    if !offset.is_finite() || from.iter().zip(&to).any(|(f, t)| t.distance(turned(*f) + offset) > WHOLE_PIXEL_REACH) {
+        return None;
+    }
+    let whole = Vec2::new(offset.x.round(), offset.y.round());
+    Some(from.map(|f| turned(f) + whole))
+}
+
 /// The content carried along as the box goes from where it is to `frame`.
 fn carry(p: &Placement, frame: Quad) -> Option<Quad> {
     let h = Homography::quad_to_quad(p.frame, frame)?;
@@ -793,6 +867,52 @@ mod tests {
         assert!(quad_close(t.frame(), rect(100.0, 100.0, 100.0, 200.0)));
     }
 
+    /// The width of the box, and whether what it holds can be drawn where it is.
+    fn width_drawable(t: &Transform) -> (f32, bool) {
+        let content = t.content();
+        let drawable = content.iter().chain(&t.frame()).all(|p| p.is_finite())
+            && Homography::quad_to_quad(content, t.source()).is_some();
+        (t.size().0, drawable)
+    }
+
+    #[test]
+    fn one_pinch_scales_1024_times_at_most_and_pinches_again_and_again_leave_it_drawable() {
+        let mut t = box_100x200();
+        let (a, b) = (Vec2::new(150.0, 200.0), Vec2::new(250.0, 200.0));
+        // fingers 100 apart brought to a hair: a 1024th of the size, no less
+        t.grab(Handle::Move, a);
+        assert!(t.pinch([a, b], [Vec2::new(199.9994, 200.0), Vec2::new(200.0006, 200.0)]));
+        t.release();
+        assert!((t.size().0 - 100.0 / 1024.0).abs() < 1e-4, "{:?}", t.size());
+        // a hair apart spread wide: 1024 times, no more
+        let mut wide = box_100x200();
+        wide.grab(Handle::Move, a);
+        assert!(wide.pinch([Vec2::new(199.9994, 200.0), Vec2::new(200.0006, 200.0)], [a, b]));
+        assert!((wide.size().0 - 100.0 * 1024.0).abs() < 1.0, "{:?}", wide.size());
+        // pinched in quickly again and again, about wherever the fingers are: it gets as small as
+        // can still be drawn, and stays drawable
+        for k in 0..40 {
+            let (a, b) = (Vec2::new(100.0 + k as f32, 300.0), Vec2::new(300.0 + k as f32, 300.0));
+            t.grab(Handle::Move, a);
+            t.pinch([a, b], [Vec2::new(199.9994, 300.0), Vec2::new(200.0006, 300.0)]);
+            t.release();
+            let (width, drawable) = width_drawable(&t);
+            assert!(drawable && width > 0.0, "pinch {k}: {:?}", t.frame());
+        }
+        // and spread out again and again, it stays a number
+        for k in 0..40 {
+            let (a, b) = (Vec2::new(199.9994, 300.0), Vec2::new(200.0006, 300.0));
+            wide.grab(Handle::Move, a);
+            wide.pinch([a, b], [Vec2::new(100.0 - k as f32, 300.0), Vec2::new(300.0 + k as f32, 300.0)]);
+            wide.release();
+            let (width, drawable) = width_drawable(&wide);
+            assert!(drawable && width.is_finite(), "pinch {k}: {:?}", wide.frame());
+        }
+        // every step back undoes, to where it started
+        while t.undo() {}
+        assert!(quad_close(t.frame(), rect(100.0, 100.0, 100.0, 200.0)));
+    }
+
     #[test]
     fn turning_the_box_refits_it_and_leaves_the_content() {
         let hull = vec![Vec2::new(100.0, 100.0), Vec2::new(200.0, 100.0), Vec2::new(100.0, 300.0)];
@@ -823,8 +943,16 @@ mod tests {
         assert!(close(centre(t.frame()), Vec2::new(150.0, 200.0)));
         let [a, b, ..] = t.frame();
         assert!((angle(b - a) - std::f32::consts::FRAC_PI_4).abs() < 1e-4);
+        // fitted turned as it is: the turned box's upright bounds fill the canvas's side
         t.fit(1000.0, 1000.0);
-        assert!(quad_close(t.frame(), rect(250.0, 0.0, 500.0, 1000.0)));
+        let [a, b, ..] = t.frame();
+        assert!((angle(b - a) - std::f32::consts::FRAC_PI_4).abs() < 1e-4);
+        assert!(close(centre(t.frame()), Vec2::new(500.0, 500.0)));
+        let (w, h) = t.size();
+        let k = 1000.0 / (300.0 / std::f32::consts::SQRT_2);
+        assert!((w - 100.0 * k).abs() < 1e-2 && (h - 200.0 * k).abs() < 1e-2, "{w} {h}");
+        let xs = t.frame().map(|p| p.x);
+        assert!(xs.iter().any(|x| x.abs() < 1e-2) && xs.iter().any(|x| (x - 1000.0).abs() < 1e-2), "{xs:?}");
         t.reset();
         assert!(quad_close(t.content(), rect(100.0, 100.0, 100.0, 200.0)));
         // every action was a step
@@ -836,6 +964,45 @@ mod tests {
         // a reset with nothing changed is not a step
         t.reset();
         assert!(!t.can_undo());
+    }
+
+    #[test]
+    fn fit_to_canvas_keeps_flips_and_turns() {
+        // flipped across: fitted, the content's left edge is still on the box's right
+        let mut t = box_100x200();
+        t.flip_horizontal();
+        t.fit(1000.0, 1000.0);
+        assert!(quad_close(t.frame(), rect(250.0, 0.0, 500.0, 1000.0)));
+        let [a, b, c, d] = t.content();
+        assert!(close(a, Vec2::new(750.0, 0.0)) && close(b, Vec2::new(250.0, 0.0)), "{a:?} {b:?}");
+        assert!(close(c, Vec2::new(250.0, 1000.0)) && close(d, Vec2::new(750.0, 1000.0)), "{c:?} {d:?}");
+        // flipped up and down: its top is at the bottom
+        let mut t = box_100x200();
+        t.flip_vertical();
+        t.fit(1000.0, 1000.0);
+        let [a, b, ..] = t.content();
+        assert!(close(a, Vec2::new(250.0, 1000.0)) && close(b, Vec2::new(750.0, 1000.0)), "{a:?} {b:?}");
+        // a quarter turn: the turned box is 200 across and 100 down, so it fits the width
+        let mut t = box_100x200();
+        t.rotate(std::f32::consts::FRAC_PI_2);
+        t.fit(1000.0, 1000.0);
+        let [a, b, c, d] = t.frame();
+        assert!(close(a, Vec2::new(1000.0, 250.0)) && close(b, Vec2::new(1000.0, 750.0)), "{a:?} {b:?}");
+        assert!(close(c, Vec2::new(0.0, 750.0)) && close(d, Vec2::new(0.0, 250.0)), "{c:?} {d:?}");
+        assert!(quad_close(t.content(), t.frame()));
+        // turned and flipped: both kept
+        let mut t = box_100x200();
+        t.flip_horizontal();
+        t.rotate(std::f32::consts::FRAC_PI_2);
+        t.fit(1000.0, 1000.0);
+        let [fa, fb, fc, fd] = t.frame();
+        assert!(quad_close(t.content(), [fb, fa, fd, fc]));
+        assert!(close(fa, Vec2::new(1000.0, 250.0)));
+        // undone in one step, flipped as before
+        let before = t.content();
+        t.fit(500.0, 300.0);
+        assert!(t.undo());
+        assert!(quad_close(t.content(), before));
     }
 
     #[test]
@@ -969,5 +1136,80 @@ mod tests {
         t.set_size(f32::NAN, 10.0);
         assert!((t.size().0 - 100.0).abs() < 1e-2);
         assert!(t.undo() && t.undo() && t.undo() && !t.undo());
+    }
+
+    #[test]
+    fn content_moved_lands_on_whole_pixels_halves_away_from_zero() {
+        let mut t = box_100x200();
+        assert_eq!(t.placed(), t.source());
+        t.grab(Handle::Move, Vec2::new(150.0, 150.0));
+        t.drag(TransformMode::Uniform, Vec2::new(150.5, 149.5), &NONE);
+        // the box where it was dragged; the pixels half a pixel on, away from zero
+        assert!(quad_close(t.content(), rect(100.5, 99.5, 100.0, 200.0)));
+        assert_eq!(t.placed(), rect(101.0, 99.0, 100.0, 200.0));
+        t.drag(TransformMode::Uniform, Vec2::new(153.3, 147.8), &NONE);
+        assert_eq!(t.placed(), rect(103.0, 98.0, 100.0, 200.0));
+        t.drag(TransformMode::Uniform, Vec2::new(149.6, 150.4), &NONE);
+        assert_eq!(t.placed(), rect(100.0, 100.0, 100.0, 200.0));
+        // far out on a big canvas, where corners kept as f32 are rounded: still a move
+        let mut far = Transform::new(15000.0, 9000.0, 3.0, 2.0, Vec::new());
+        far.grab(Handle::Move, Vec2::new(15001.0, 9001.0));
+        far.drag(TransformMode::Uniform, Vec2::new(15001.3, 9000.6), &NONE);
+        assert_eq!(far.placed(), rect(15000.0, 9000.0, 3.0, 2.0));
+    }
+
+    #[test]
+    fn content_turned_by_quarters_or_mirrored_lands_on_whole_pixels() {
+        let mut t = box_100x200();
+        t.grab(Handle::Move, Vec2::new(150.0, 150.0));
+        t.drag(TransformMode::Uniform, Vec2::new(150.3, 150.6), &NONE);
+        t.release();
+        let whole = |q: Quad| q.iter().all(|p| p.x.fract() == 0.0 && p.y.fract() == 0.0);
+        // a quarter turn about the box's middle, (150.3, 200.6): the corners come within half a
+        // pixel of where it puts them, each on a whole pixel
+        t.rotate(std::f32::consts::FRAC_PI_2);
+        let (placed, content) = (t.placed(), t.content());
+        assert!(whole(placed), "{placed:?}");
+        assert!(placed.iter().zip(&content).all(|(p, c)| p.distance(*c) <= 0.71), "{placed:?} {content:?}");
+        // the source's top left corner went to the top right, its top edge down the right side
+        assert_eq!(placed[1] - placed[0], Vec2::new(0.0, 100.0));
+        assert_eq!(placed[3] - placed[0], Vec2::new(-200.0, 0.0));
+        // two eighths of a turn make a quarter as well
+        t.undo();
+        t.rotate(std::f32::consts::FRAC_PI_4);
+        t.rotate(std::f32::consts::FRAC_PI_4);
+        assert!(whole(t.placed()), "{:?}", t.placed());
+        t.flip_horizontal();
+        t.flip_vertical();
+        assert!(whole(t.placed()), "{:?}", t.placed());
+    }
+
+    #[test]
+    fn content_scaled_turned_distorted_or_warped_lands_where_it_is() {
+        let mut t = box_100x200();
+        t.rotate(std::f32::consts::FRAC_PI_4);
+        assert_eq!(t.placed(), t.content());
+        t.reset();
+        t.rotate(0.3);
+        assert_eq!(t.placed(), t.content());
+        // a turn too small to see goes on whole pixels
+        t.reset();
+        t.rotate(1e-6);
+        assert_eq!(t.placed(), t.source());
+        t.reset();
+        t.set_size(100.4, 200.0);
+        assert_eq!(t.placed(), t.content());
+        t.reset();
+        t.grab(Handle::Corner(2), Vec2::new(200.0, 300.0));
+        t.drag(TransformMode::Distort, Vec2::new(203.0, 301.0), &NONE);
+        t.release();
+        assert_eq!(t.placed(), t.content());
+        // a warp's mesh, moved as a whole by a fraction, is drawn through the mesh
+        t.reset();
+        t.start_warp();
+        t.grab(Handle::Move, Vec2::new(-50.0, -50.0));
+        t.drag(TransformMode::Warp, Vec2::new(-49.5, -50.0), &NONE);
+        assert!(quad_close(t.content(), rect(100.5, 100.0, 100.0, 200.0)), "{:?}", t.content());
+        assert_eq!(t.placed(), t.content());
     }
 }

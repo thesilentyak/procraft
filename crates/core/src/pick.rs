@@ -34,8 +34,9 @@ impl CanvasSession {
         let grid = st.surround_grid(Vec2::ZERO - corner);
         let surround = st.surround();
         let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else { return None };
+        crate::surround::put_on(canvas, gpu, st.surround_picture.as_deref());
         let format = wgpu::TextureFormat::Rgba8Unorm;
-        let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        let texture = gpu.texture(&wgpu::TextureDescriptor {
             label: Some("eyedropper"),
             size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: 1 },
             mip_level_count: 1,
@@ -62,7 +63,8 @@ impl CanvasSession {
                 convert: None,
                 lut: None,
                 crisp_from: st.display_scale,
-                grey: false,
+                look: None,
+                traced: false,
             }),
         );
         let pixels = read_texture(gpu, &texture, side, side).ok()?;

@@ -12,7 +12,7 @@
 
 use crate::brush::Brush;
 use crate::brushfile::{self, BrushFile, Pictures};
-use crate::zip::{ZipReader, ZipWriter};
+use crate::zip::{Ready, ZipReader, ZipWriter};
 
 /// The file extension of a brush library.
 pub const EXTENSION: &str = "brushlibrary";
@@ -29,18 +29,19 @@ fn meta_prefix() -> String {
 }
 
 /// A brush library as its file holds it: its sets in order, and each tool's brush (set, brush).
+/// Its brushes as they are read ([`read_with`] can make them something else as it goes).
 #[derive(Clone, Debug, PartialEq)]
-pub struct LibraryFile {
-    pub sets: Vec<LibrarySetFile>,
+pub struct LibraryFile<B = BrushFile> {
+    pub sets: Vec<LibrarySetFile<B>>,
     pub tools: [Option<(usize, usize)>; TOOLS],
 }
 
 /// A set in a library file: its name, the stock set whose icon it shows, and its brushes.
 #[derive(Clone, Debug, PartialEq)]
-pub struct LibrarySetFile {
+pub struct LibrarySetFile<B = BrushFile> {
     pub name: String,
     pub icon: Option<String>,
-    pub brushes: Vec<BrushFile>,
+    pub brushes: Vec<B>,
 }
 
 /// A list: its lines (name, order) in their order, and its properties (key, value).
@@ -130,7 +131,14 @@ pub fn is_library<'n>(names: impl Iterator<Item = &'n str>) -> bool {
 
 /// Reads a brush library file (its empty sets too); none if it isn't one or holds no brushes.
 pub fn read(bytes: &[u8]) -> Option<LibraryFile> {
-    let zip = ZipReader::new(bytes)?;
+    read_with(&ZipReader::new(bytes)?, Some)
+}
+
+/// Reads the brush library file that is the archive `zip` as [`read`] does, each brush made
+/// `make` of it as soon as it is read (a few side by side, a set's brush files read one at a time
+/// from the archive), so a big library is never held whole; a brush `make` makes nothing of is
+/// left out.
+pub fn read_with<B: Send>(zip: &ZipReader<'_>, make: impl Fn(BrushFile) -> Option<B> + Sync) -> Option<LibraryFile<B>> {
     let prefix = meta_prefix();
     let names: Vec<String> = zip.names().map(str::to_owned).collect();
     let meta_in = |folder: Option<&str>| {
@@ -141,6 +149,8 @@ pub fn read(bytes: &[u8]) -> Option<LibraryFile> {
         })?;
         Meta::read(&zip.read(name)?)
     };
+    // (a brush file read and made at once: no more of them held at a time than there are threads)
+    let made = |path: &String| zip.read(path).and_then(|b| brushfile::read(&b)).and_then(&make);
     // the sets' folders (an empty one kept by its empty file) and their brush files, as the zip
     // has them
     let mut folders: Vec<(String, Vec<String>)> = Vec::new();
@@ -165,12 +175,12 @@ pub fn read(bytes: &[u8]) -> Option<LibraryFile> {
     for s in top.order(&set_names) {
         let Some((folder, files)) = folders.get(s) else { continue };
         let meta = meta_in(Some(folder)).unwrap_or_default();
+        let ordered: Vec<&String> = meta.order(files).into_iter().filter_map(|f| files.get(f)).collect();
+        let paths: Vec<String> = ordered.iter().map(|file| format!("{folder}/{file}")).collect();
         let mut brushes = Vec::new();
         let mut kept = Vec::new();
-        for file in meta.order(files).into_iter().filter_map(|f| files.get(f)) {
-            let Some(brush) = zip.read(&format!("{folder}/{file}")).and_then(|b| brushfile::read(&b)) else {
-                continue;
-            };
+        for (file, brush) in ordered.iter().zip(crate::par::side_by_side(&paths, made)) {
+            let Some(brush) = brush.flatten() else { continue };
             brushes.push(brush);
             kept.push(file.trim_end_matches(".brush").to_owned());
         }
@@ -219,42 +229,131 @@ pub fn write(
     id: impl Fn(usize) -> String,
     time: u64,
 ) -> Vec<u8> {
-    let prefix = meta_prefix();
-    let mut zip = ZipWriter::new();
-    let mut folders: Vec<String> = Vec::new();
-    for set in sets {
-        let folder = file_name(set.name, &folders);
-        folders.push(folder);
-    }
-    for (s, (set, folder)) in sets.iter().zip(&folders).enumerate() {
-        zip.add(&format!("{folder}/{EMPTY}"), b"");
-        let mut files: Vec<String> = Vec::new();
+    let heads: Vec<(&str, Option<&str>)> = sets.iter().map(|s| (s.name, s.icon)).collect();
+    let mut library = LibraryWriter::begin(Vec::new(), &heads, tools, id, time);
+    for (s, set) in sets.iter().enumerate() {
         for (brush, author, pictures) in &set.brushes {
-            let stem = file_name(&brush.name, &files);
-            zip.add(&format!("{folder}/{stem}.brush"), &brushfile::write(brush, author, pictures));
-            files.push(stem);
+            library.add(s, brush, author, pictures);
         }
+    }
+    library.finish().unwrap_or_default()
+}
+
+/// A brush library file written into a writer a brush at a time: each set's folder, its brushes'
+/// files as they are added and its list once the next set begins, then the library's list, so
+/// that however big the library, only the brush being added is held.
+pub struct LibraryWriter<W: std::io::Write> {
+    zip: ZipWriter<W>,
+    /// Each set's folder and the stock set whose icon it shows.
+    folders: Vec<String>,
+    icons: Vec<Option<String>>,
+    tools: [Option<(usize, usize)>; TOOLS],
+    /// Each list's 32 hex digits (the top's, then the sets'), and when they are stamped.
+    ids: Vec<String>,
+    time: u64,
+    /// The sets begun so far, and the brushes' file names in the last of them.
+    begun: usize,
+    files: Vec<String>,
+}
+
+impl<W: std::io::Write> LibraryWriter<W> {
+    /// A library of the sets `heads` (each its name and icon) in order, each tool's brush (paint,
+    /// smudge, erase) at `tools`, written into `out`; `id` and `time` as [`write`] takes them.
+    pub fn begin(
+        out: W,
+        heads: &[(&str, Option<&str>)],
+        tools: [Option<(usize, usize)>; TOOLS],
+        id: impl Fn(usize) -> String,
+        time: u64,
+    ) -> LibraryWriter<W> {
+        let mut folders: Vec<String> = Vec::new();
+        for (name, _) in heads {
+            let folder = file_name(name, &folders);
+            folders.push(folder);
+        }
+        LibraryWriter {
+            zip: ZipWriter::to(out),
+            folders,
+            icons: heads.iter().map(|(_, icon)| icon.map(str::to_owned)).collect(),
+            tools,
+            ids: (0..=heads.len()).map(id).collect(),
+            time,
+            begun: 0,
+            files: Vec::new(),
+        }
+    }
+
+    /// Adds `brush` (by `author`, with `pictures`) to set `set`, after those added before. Sets go
+    /// in order: one before the last added to is left out.
+    pub fn add(&mut self, set: usize, brush: &Brush, author: &str, pictures: &Pictures<'_>) {
+        if set + 1 < self.begun || set >= self.folders.len() {
+            return;
+        }
+        while self.begun <= set {
+            self.begin_next();
+        }
+        let Some(folder) = self.folders.get(set) else { return };
+        let stem = file_name(&brush.name, &self.files);
+        // a brush file is an archive already: kept as it is, not deflated again
+        let file = brushfile::write(brush, author, pictures);
+        self.zip.add_ready(&format!("{folder}/{stem}.brush"), Ready::of(&file, false));
+        self.files.push(stem);
+    }
+
+    /// The library can't be made whole (`e`, what went wrong): [`LibraryWriter::finish`] fails.
+    pub fn fail(&mut self, e: std::io::Error) {
+        self.zip.fail(e);
+    }
+
+    /// The last set begun is ended (its list written) and the next begun.
+    fn begin_next(&mut self) {
+        self.end_set();
+        if let Some(folder) = self.folders.get(self.begun) {
+            self.zip.add(&format!("{folder}/{EMPTY}"), b"");
+        }
+        self.begun += 1;
+        self.files.clear();
+    }
+
+    /// The last set begun, if any, ended: its list of brushes and its properties.
+    fn end_set(&mut self) {
+        let Some(s) = self.begun.checked_sub(1) else { return };
+        let (Some(folder), Some(id)) = (self.folders.get(s), self.ids.get(s + 1)) else { return };
         let mut properties: Vec<(String, String)> = Vec::new();
-        if let Some(icon) = set.icon {
-            properties.push(("icon_preset".to_owned(), icon.to_owned()));
+        if let Some(icon) = self.icons.get(s).cloned().flatten() {
+            properties.push(("icon_preset".to_owned(), icon));
         }
-        for (tool, at) in tools.into_iter().enumerate() {
+        for (tool, at) in self.tools.into_iter().enumerate() {
             if let Some((_, b)) = at.filter(|&(ts, _)| ts == s)
-                && let Some(stem) = files.get(b)
+                && let Some(stem) = self.files.get(b)
             {
                 properties.push((format!("default_brush_{tool}"), stem.clone()));
             }
         }
-        let listed: Vec<String> = files.iter().map(|f| format!("{f}.brush")).collect();
-        zip.add(&format!("{folder}/{prefix}{}", id(s + 1)), &Meta::write(&listed, &properties, time));
+        let listed: Vec<String> = self.files.iter().map(|f| format!("{f}.brush")).collect();
+        let prefix = meta_prefix();
+        let meta = Meta::write(&listed, &properties, self.time);
+        self.zip.add(&format!("{folder}/{prefix}{id}"), &meta);
     }
-    let properties: Vec<(String, String)> = tools
-        .iter()
-        .enumerate()
-        .filter_map(|(tool, at)| Some((format!("default_set_{tool}"), folders.get(at.as_ref()?.0)?.clone())))
-        .collect();
-    zip.add(&format!("{prefix}{}", id(0)), &Meta::write(&folders, &properties, time));
-    zip.finish()
+
+    /// Ends the library (the sets not begun yet as empty ones, then its list): the writer, or why
+    /// the file isn't whole.
+    pub fn finish(mut self) -> std::io::Result<W> {
+        while self.begun < self.folders.len() {
+            self.begin_next();
+        }
+        self.end_set();
+        let properties: Vec<(String, String)> = self
+            .tools
+            .iter()
+            .enumerate()
+            .filter_map(|(tool, at)| Some((format!("default_set_{tool}"), self.folders.get(at.as_ref()?.0)?.clone())))
+            .collect();
+        let top = self.ids.first().cloned().unwrap_or_default();
+        let meta = Meta::write(&self.folders, &properties, self.time);
+        self.zip.add(&format!("{}{top}", meta_prefix()), &meta);
+        self.zip.finish_to()
+    }
 }
 
 #[cfg(test)]

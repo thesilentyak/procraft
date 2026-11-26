@@ -7,6 +7,11 @@
 # (not kept in git, nor is the project). To run it on an iPad, pick a team under Signing &
 # Capabilities; build-ipa.sh makes an unsigned .ipa instead.
 name: ProCraft
+# the home screen's Recent artwork widget, an extension needing signing of its own (an App ID, the
+# app group and a profile: see widget.yml): built only when PROCRAFT_WIDGET=YES
+include:
+  - path: widget.yml
+    enable: ${PROCRAFT_WIDGET}
 options:
   bundleIdPrefix: io.github.artcraftandroid
   deploymentTarget:
@@ -27,6 +32,24 @@ targets:
         optional: true
       - path: Generated/Assets.xcassets
         optional: true
+      # the typeface text starts in, the Android app's
+      - path: ../android/app/src/main/assets/fonts
+        type: folder
+        buildPhase: resources
+      # the panoramas a model is lit by, the Android app's
+      - path: ../android/app/src/main/assets/environments
+        type: folder
+        buildPhase: resources
+      # the licences of what the core and the app are made with
+      - path: ../android/app/src/main/assets/licenses.txt
+        buildPhase: resources
+      # its page in the system's Settings
+      - path: Settings.bundle
+        type: folder
+        buildPhase: resources
+      # the app's picture, for About
+      - path: ../android/app/src/main/res/drawable-nodpi/procraft_mark.png
+        buildPhase: resources
     preBuildScripts:
       - name: The core and its bindings (Rust)
         script: bash "$PROJECT_DIR/build-rust.sh"
@@ -41,10 +64,72 @@ targets:
         LSRequiresIPhoneOS: true
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
+          # a second display's own scene, for Project canvas
+          UISceneConfigurations:
+            UIWindowSceneSessionRoleExternalDisplayNonInteractive:
+              - UISceneConfigurationName: Projection
+                UISceneDelegateClassName: $(PRODUCT_MODULE_NAME).ProjectionSceneDelegate
         # a mouse's or trackpad's clicks come as a pointer's, not as fingers
         UIApplicationSupportsIndirectInputEvents: true
         UILaunchScreen: {}
         UIRequiresFullScreen: false
+        NSCameraUsageDescription: A photo you take can become a palette of its colours.
+        # the Recent artwork widget's tap: procraft://recent opens the artwork worked on last
+        CFBundleURLTypes:
+          - CFBundleURLName: io.github.artcraftandroid.procraft
+            CFBundleURLSchemes: [procraft]
+        # what other apps can open here: copied in for the gallery to bring in, as Import does
+        LSSupportsOpeningDocumentsInPlace: false
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: ProCraft artwork
+            LSHandlerRank: Owner
+            LSItemContentTypes: [io.github.artcraftandroid.procraft.artwork]
+          # asked about where the app stands, not brought into the gallery
+          - CFBundleTypeName: ProCraft plugin
+            LSHandlerRank: Owner
+            LSItemContentTypes: [io.github.artcraftandroid.procraft.plugin]
+          - CFBundleTypeName: Artwork, brushes and palettes
+            LSHandlerRank: Alternate
+            LSItemContentTypes:
+              - io.github.artcraftandroid.procraft.layered
+              - io.github.artcraftandroid.procraft.brushes
+              - io.github.artcraftandroid.procraft.palette
+          - CFBundleTypeName: Pictures
+            LSHandlerRank: Alternate
+            LSItemContentTypes: [public.image, com.adobe.pdf, com.adobe.photoshop-image]
+          - CFBundleTypeName: 3D models
+            LSHandlerRank: Alternate
+            LSItemContentTypes:
+              - com.pixar.universal-scene-description-mobile
+              - com.pixar.universal-scene-description
+              - public.geometry-definition-format
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: io.github.artcraftandroid.procraft.artwork
+            UTTypeDescription: ProCraft artwork
+            UTTypeConformsTo: [public.data, public.content]
+            UTTypeTagSpecification:
+              public.filename-extension: [procraft]
+          - UTTypeIdentifier: io.github.artcraftandroid.procraft.plugin
+            UTTypeDescription: ProCraft plugin
+            UTTypeConformsTo: [public.data, public.content]
+            UTTypeTagSpecification:
+              public.filename-extension: [procraft-plugin, procraftplugin]
+        UTImportedTypeDeclarations:
+          - UTTypeIdentifier: io.github.artcraftandroid.procraft.layered
+            UTTypeDescription: Layered artwork
+            UTTypeConformsTo: [public.data, public.content]
+            UTTypeTagSpecification:
+              public.filename-extension: ["procreate"]
+          - UTTypeIdentifier: io.github.artcraftandroid.procraft.brushes
+            UTTypeDescription: Brushes
+            UTTypeConformsTo: [public.data, public.content]
+            UTTypeTagSpecification:
+              public.filename-extension: [brush, brushset, brushlibrary, abr, gbr, gih, vbr, kpp, sut, sutg]
+          - UTTypeIdentifier: io.github.artcraftandroid.procraft.palette
+            UTTypeDescription: Palette
+            UTTypeConformsTo: [public.data, public.content]
+            UTTypeTagSpecification:
+              public.filename-extension: [swatches, aco, ase]
         UISupportedInterfaceOrientations~ipad:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationPortraitUpsideDown

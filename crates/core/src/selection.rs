@@ -1,8 +1,10 @@
 //! Selections: shapes drawn on the window become a selection on the canvas, which painting keeps
 //! inside, and which can be inverted, feathered, saved, filled or copied to a layer of its own.
 
+use procraft_engine::document::LayerId;
 use procraft_engine::geom::Vec2;
 use procraft_engine::selection::{ColourFlood, Combine, Mask, feather_radius};
+use procraft_gpu::FillPreview;
 
 use crate::{CanvasSession, State};
 
@@ -23,16 +25,29 @@ impl From<SelectionJoin> for Combine {
 }
 
 /// How the selection shows: bands over what is not selected, or what is selected tinted (while
-/// selecting by colour) or covered (while its threshold is being dragged).
+/// selecting by colour) or covered (while its threshold is being dragged), or filled with the paint
+/// colour on the current layer, in its place among the layers (Color Fill, which fills it as the
+/// selection tool closes; bands while that layer can't be filled).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum SelectionDisplay {
     Stripes,
     Tint,
     Fill,
+    ColourFill,
 }
 
 /// Points around an ellipse drawn as a polygon.
 const ELLIPSE_POINTS: usize = 128;
+
+/// While a colour selection's threshold is dragged: the layer it goes by (the current one, or
+/// the reference layer when another is it), read once as the drag began at the artwork's
+/// `revision` then, and measured from where it began.
+pub(crate) struct ColourSource {
+    layer: LayerId,
+    revision: u64,
+    pixels: Vec<u8>,
+    flood: ColourFlood,
+}
 
 impl State {
     /// Shows the selection on the canvas (or none when nothing is selected).
@@ -48,10 +63,14 @@ impl State {
 
     /// The selection as it is now becomes one undo step, called `name`, that puts `before` back.
     pub(crate) fn record_selection(&mut self, before: Option<Mask>, name: &str) {
+        self.let_go_of_colour_drag();
         self.finish_stroke();
         self.settle();
         if self.selection.as_ref().is_some_and(Mask::is_empty) {
             self.selection = None;
+        }
+        if self.selection.is_none() {
+            self.selection_outlines.clear();
         }
         if self.selection == before {
             return;
@@ -61,6 +80,106 @@ impl State {
             canvas.name_next_step(name);
             canvas.change_selection(gpu, &mut self.doc, coverage, before.map(|m| m.data));
             self.revision += 1;
+        }
+    }
+
+    /// Whether layer `id` takes a fill of what is selected: not a plugin's, nor locked.
+    fn fills_selected(&self, id: LayerId) -> bool {
+        self.doc.layer(id).is_some_and(|l| l.plugin.is_none()) && !self.doc.is_locked(id)
+    }
+
+    /// What Color Fill shows while the selection tool is open: the paint colour filling what is
+    /// selected on the current layer, in that layer's place among the others (those above it
+    /// cover it), if the layer takes the fill. None otherwise.
+    pub(crate) fn colour_fill_preview(&self) -> Option<FillPreview> {
+        if self.selection_display != SelectionDisplay::ColourFill
+            || self.selection.is_none()
+            || self.transform.is_some()
+        {
+            return None;
+        }
+        let current = self.doc.current();
+        let layer = self.doc.layer(current).filter(|_| self.fills_selected(current))?;
+        Some(FillPreview {
+            layer: current,
+            colour: self.color.map(|c| c.clamp(0.0, 1.0)),
+            alpha_lock: layer.alpha_lock,
+        })
+    }
+
+    /// Fills the selection on the current layer with the paint colour, as one undo step (run at
+    /// once); false if there is nothing selected or the layer can't be filled.
+    pub(crate) fn fill_selected(&mut self) -> bool {
+        let current = self.doc.current();
+        if !self.fills_selected(current) {
+            return false;
+        }
+        let Some(mask) = self.selection.clone() else { return false };
+        // only what is selected changes
+        let Some(rect) = crate::layer_ops::mask_rect(&mask) else { return false };
+        let Some(mut pixels) = self.layer_part(current, rect) else { return false };
+        let [r, g, b] = self.color.map(|c| c.clamp(0.0, 1.0));
+        let alpha_lock = self.doc.layer(current).is_some_and(|l| l.alpha_lock);
+        for (px, &m) in pixels.as_chunks_mut::<4>().0.iter_mut().zip(&crate::layer_ops::mask_part(&mask, rect)) {
+            let [pr, pg, pb, pa] = px;
+            if m == 0 {
+                continue;
+            }
+            // the colour over what is there, as much as is selected (only where there is paint,
+            // with the alpha locked)
+            let k = f32::from(m) / 255.0;
+            let a = f32::from(*pa) / 255.0;
+            let (cover, out_a) = if alpha_lock { (k * a, a) } else { (k, k + a * (1.0 - k)) };
+            for (dst, src) in [(&mut *pr, r), (&mut *pg, g), (&mut *pb, b)] {
+                *dst = to_byte(src * cover + f32::from(*dst) / 255.0 * (1.0 - k));
+            }
+            *pa = to_byte(out_a);
+        }
+        let Some(canvas) = self.canvas.as_mut() else { return false };
+        canvas.write_layer_part(current, rect, pixels);
+        self.flush();
+        self.revision += 1;
+        true
+    }
+
+    /// Color Fill as the selection tool closes: what is selected is filled with the paint colour
+    /// and the selection ends, as one undo step (undoing it brings the selection back). False if
+    /// nothing is selected or the current layer can't be filled (the selection then stays).
+    pub(crate) fn colour_fill_and_end(&mut self) -> bool {
+        if self.selection.is_none() {
+            return false;
+        }
+        self.finish_stroke();
+        self.settle();
+        self.flush();
+        let steps = |st: &State| st.canvas.as_deref().map_or(0, procraft_gpu::Canvas::steps_made);
+        let before = steps(self);
+        if !self.fill_selected() {
+            return false;
+        }
+        let made = self.canvas.as_deref().and_then(procraft_gpu::Canvas::undo_step).filter(|_| steps(self) > before);
+        self.drop_selection_with_step(made);
+        true
+    }
+
+    /// Lets go of the selection as part of step `made`, when that is the last step: undoing it
+    /// brings the selection back with what it undoes. Otherwise as a step of its own.
+    pub(crate) fn drop_selection_with_step(&mut self, made: Option<u64>) {
+        self.finish_stroke();
+        self.settle();
+        let Some(before) = self.selection.take() else { return };
+        self.feather_base = None;
+        self.selection_outlines.clear();
+        let folded = match (made, self.canvas.as_mut(), self.gpu.as_ref()) {
+            (Some(made), Some(canvas), Some(gpu)) => {
+                canvas.change_selection_with_step(gpu, &mut self.doc, None, Some(before.data.clone()), made)
+            }
+            _ => false,
+        };
+        if folded {
+            self.revision += 1;
+        } else {
+            self.record_selection(Some(before), "clear selection");
         }
     }
 
@@ -86,12 +205,33 @@ impl State {
         }
     }
 
+    /// A colour selection's threshold drag left unfinished (its touch lost) is over: the selection
+    /// as it is now is the one there is.
+    fn let_go_of_colour_drag(&mut self) {
+        self.colour_source = None;
+        self.selection_before = None;
+    }
+
+    /// A colour selection's threshold drag that will not end (its touch taken back) is taken back:
+    /// the selection is again as it was before it. False if none was under way.
+    pub(crate) fn take_back_colour_drag(&mut self) -> bool {
+        self.colour_source = None;
+        let Some(before) = self.selection_before.take() else { return false };
+        self.selection = before;
+        self.feather_base = None;
+        self.show_selection();
+        true
+    }
+
     /// Takes the selection back from the canvas (after an undo or redo).
     pub(crate) fn sync_selection(&mut self) {
+        self.let_go_of_colour_drag();
         let (w, h) = (self.doc.width(), self.doc.height());
         self.selection =
             self.canvas.as_ref().and_then(|c| c.selection()).map(|c| Mask { width: w, height: h, data: c.to_vec() });
         self.feather_base = None;
+        // the shapes' paths no longer go with what is selected
+        self.selection_outlines.clear();
     }
 
     /// The canvas pixel under window point (`x`, `y`), if there is one: through the view, or on a
@@ -109,16 +249,6 @@ impl State {
     fn to_canvas_points(&self, window: &[Vec2]) -> Option<Vec<Vec2>> {
         let view = self.view?;
         window.iter().map(|&p| view.screen_to_canvas(p).filter(|c| c.is_finite())).collect()
-    }
-
-    /// The current layer's pixels, after any queued work.
-    pub(crate) fn current_pixels(&mut self) -> Option<Vec<u8>> {
-        self.finish_stroke();
-        self.settle();
-        self.flush();
-        let current = self.doc.current();
-        let (Some(canvas), Some(gpu)) = (self.canvas.as_mut(), self.gpu.as_ref()) else { return None };
-        canvas.read_layer(gpu, current).ok()
     }
 }
 
@@ -157,14 +287,21 @@ impl CanvasSession {
         let st = &mut *guard;
         let Some(seed) = st.window_texel(x, y) else { return };
         let (w, h) = (st.doc.width(), st.doc.height());
-        // the layer is read and measured from the seed once for the whole drag
+        let current = st.doc.current();
+        let layer = st.doc.reference().filter(|&r| r != current).unwrap_or(current);
+        // the layer is read and measured from the seed once for the whole drag: kept while it is
+        // still the layer to go by and nothing has changed since
         let (pixels, flood) = match st.colour_source.take() {
-            Some((px, flood)) if flood.seed() == seed => (px, Some(flood)),
-            Some((px, _)) => (px, None),
-            None => {
-                let current = st.doc.current();
-                let source = st.doc.reference().filter(|&r| r != current).unwrap_or(current);
-                let Some(px) = st.layer_pixels(source) else { return };
+            Some(kept) if kept.layer == layer && kept.revision == st.revision => {
+                let flood = (kept.flood.seed() == seed).then_some(kept.flood);
+                (kept.pixels, flood)
+            }
+            _ => {
+                // what a drag left unfinished showed goes, as it was never kept
+                if let Some(before) = st.selection_before.take() {
+                    st.selection = before;
+                }
+                let Some(px) = st.layer_pixels(layer) else { return };
                 st.selection_before = Some(st.selection.clone());
                 (px, None)
             }
@@ -183,7 +320,8 @@ impl CanvasSession {
         st.selection = before.clone();
         if live {
             st.join(shape, join, false);
-            st.colour_source = Some((pixels, flood));
+            let revision = st.revision;
+            st.colour_source = Some(ColourSource { layer, revision, pixels, flood });
         } else {
             // the drag ends: one step from before it
             st.join(shape, join, false);
@@ -248,14 +386,26 @@ impl CanvasSession {
         let Some((_, kept)) = st.feather_base.as_mut().filter(|(now, _)| *now == base) else { return };
         *kept = room;
         st.selection = Some(m);
+        // while the slider is held, the line where it now fades out to a tenth shows
+        st.feather_edge = true;
         st.show_selection();
         self.shared.frame(st);
+    }
+
+    /// The feather's slider let go of: the line where the selection fades out goes.
+    pub fn select_feather_let_go(&self) {
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        if std::mem::take(&mut st.feather_edge) {
+            self.shared.frame(st);
+        }
     }
 
     /// The feather popover closed: its feathering becomes one undo step.
     pub fn select_feather_done(&self) {
         let mut guard = self.shared.lock();
         let st = &mut *guard;
+        st.feather_edge = false;
         if let Some((base, _)) = st.feather_base.take() {
             st.record_selection(Some(base), "feather");
             self.shared.frame(st);
@@ -276,6 +426,14 @@ impl CanvasSession {
         self.shared.lock().selection.is_some()
     }
 
+    /// The paths of the shapes joined to the selection while the selection tool has been open,
+    /// each closed (canvas pixels, x and y in turn), to show dashed over the canvas: gone as the
+    /// tool closes, the selection goes or is loaded, or a step is undone or redone.
+    pub fn selection_outlines(&self) -> Vec<Vec<f32>> {
+        let st = self.shared.lock();
+        st.selection_outlines.iter().map(|path| path.iter().flat_map(|p| [p.x, p.y]).collect()).collect()
+    }
+
     /// Keeps the selection to load again later; returns how many are kept.
     pub fn save_selection(&self) -> u32 {
         let mut st = self.shared.lock();
@@ -292,6 +450,7 @@ impl CanvasSession {
         let Some(m) = st.saved_selections.get(index as usize).cloned() else { return false };
         let before = st.selection.replace(m);
         st.feather_base = None;
+        st.selection_outlines.clear();
         st.record_selection(before, "load selection");
         self.shared.frame(st);
         true
@@ -346,35 +505,7 @@ impl CanvasSession {
     pub fn fill_selection(&self) {
         let mut guard = self.shared.lock();
         let st = &mut *guard;
-        let current = st.doc.current();
-        if st.doc.layer(current).is_none_or(|l| l.plugin.is_some()) || st.doc.is_locked(current) {
-            return;
-        }
-        let Some(mask) = st.selection.clone() else { return };
-        // only what is selected changes
-        let Some(rect) = crate::layer_ops::mask_rect(&mask) else { return };
-        let Some(mut pixels) = st.layer_part(current, rect) else { return };
-        let [r, g, b] = st.color.map(|c| c.clamp(0.0, 1.0));
-        let alpha_lock = st.doc.layer(current).is_some_and(|l| l.alpha_lock);
-        for (px, &m) in pixels.as_chunks_mut::<4>().0.iter_mut().zip(&crate::layer_ops::mask_part(&mask, rect)) {
-            let [pr, pg, pb, pa] = px;
-            if m == 0 {
-                continue;
-            }
-            // the colour over what is there, as much as is selected (only where there is paint,
-            // with the alpha locked)
-            let k = f32::from(m) / 255.0;
-            let a = f32::from(*pa) / 255.0;
-            let (cover, out_a) = if alpha_lock { (k * a, a) } else { (k, k + a * (1.0 - k)) };
-            for (dst, src) in [(&mut *pr, r), (&mut *pg, g), (&mut *pb, b)] {
-                *dst = to_byte(src * cover + f32::from(*dst) / 255.0 * (1.0 - k));
-            }
-            *pa = to_byte(out_a);
-        }
-        if let Some(canvas) = st.canvas.as_mut() {
-            canvas.write_layer_part(current, rect, pixels);
-            st.flush();
-            st.revision += 1;
+        if st.fill_selected() {
             self.shared.frame(st);
         }
     }
@@ -417,17 +548,36 @@ impl CanvasSession {
 
 impl CanvasSession {
     fn select_window_polygon(&self, window: &[Vec2], join: SelectionJoin) {
+        // (read before the canvas is held: the touches are held first where both are)
+        let tool_open = self.selection_tool_open();
         let mut guard = self.shared.lock();
         let st = &mut *guard;
-        let shape = if st.scene_shown() {
+        let (shape, outline) = if st.scene_shown() {
             let Some(shape) = st.scene_mask(window) else { return };
-            shape
+            (shape, None)
         } else {
             let Some(points) = st.to_canvas_points(window) else { return };
-            Mask::polygon(st.doc.width(), st.doc.height(), &points)
+            (Mask::polygon(st.doc.width(), st.doc.height(), &points), Some(points))
         };
         st.join(shape, join, true);
+        // its path shows dashed while the tool is open
+        if let Some(points) = outline.filter(|_| tool_open && st.selection.is_some()) {
+            st.selection_outlines.push(points);
+        }
         self.shared.frame(st);
+    }
+
+    /// A colour selection being slid is taken back with its touch, the selection again as it was
+    /// and shown tinted; false if none was under way.
+    pub(crate) fn take_back_colour_drag(&self) -> bool {
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        if !st.take_back_colour_drag() {
+            return false;
+        }
+        st.selection_display = SelectionDisplay::Tint;
+        self.shared.frame(st);
+        true
     }
 }
 

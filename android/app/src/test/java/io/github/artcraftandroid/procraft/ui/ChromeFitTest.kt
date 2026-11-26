@@ -3,6 +3,7 @@ package io.github.artcraftandroid.procraft.ui
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -27,7 +28,36 @@ class ChromeFitTest {
 
     @Test
     fun theTopBarsEndsNeverMeet() {
-        for (width in widths(354, 2000)) assertTrue("$width", Pc.barFit(width).needs <= width)
+        // down to a phone's 300 across (#318: on a Galaxy A30s, narrower than 354, the tools had
+        // covered Selection and Transform)
+        for (width in widths(300, 2000)) assertTrue("$width", Pc.barFit(width).needs <= width)
+        assertEquals(26.dp, Pc.barFit(300.dp).button)
+        assertEquals(28.dp, Pc.barFit(340.dp).button)
+        assertEquals(32.dp, Pc.barFit(360.dp).button)
+    }
+
+    @Test
+    fun aTopBarButtonsGlyphShrinksOnlyBelowThirtyTwo() {
+        for (width in listOf(32.dp, 36.dp, 44.dp)) assertEquals(1f, Pc.barGlyphScale(width))
+        assertEquals(26f / 32f, Pc.barGlyphScale(26.dp), 1e-4f)
+        // so the glyphs crowd no more than on the 32 step (the tools' 44 frame on a 32 pitch)
+        for (width in widths(300, 353)) {
+            val fit = Pc.barFit(width)
+            assertTrue("$width", 44.dp * Pc.barGlyphScale(fit.button) <= fit.button * 1.375f + 0.01.dp)
+        }
+    }
+
+    @Test
+    fun theBrushStudioLaysItsPadBesideItsSettingsOnlyWithRoomForItsButtons() {
+        // a tablet on its side, as measured: pages, settings and pad side by side
+        assertTrue(studioSideBySide(landscape = true, 1133.dp))
+        assertTrue(studioSideBySide(landscape = true, 1014.dp))
+        // a phone on its side (#318: the pad had about 80 across, Done squeezed to nothing), and half
+        // a tablet on its side: the pages as a rail, the pad over the settings
+        for (width in listOf(640.dp, 732.dp, 780.dp, 850.dp, 1013.dp)) assertFalse("$width", studioSideBySide(landscape = true, width))
+        // upright, always the rail
+        assertFalse(studioSideBySide(landscape = false, 1280.dp))
+        assertEquals(360.dp, PadLeast)
     }
 
     @Test
@@ -40,32 +70,6 @@ class ChromeFitTest {
         assertEquals(62.dp, Pc.toolCentreFromRight(0, 1200.dp))
         assertEquals(342.dp, Pc.toolCentreFromRight(4, 1200.dp))
         assertEquals(134.dp, Pc.actionCentre(0, 1200.dp))
-    }
-
-    @Test
-    fun aTabletsSideBarStaysWhereItWasMeasured() {
-        // portrait top 333.5, landscape top 130
-        assertEquals(333.5f, Pc.sideBarFit(1133.dp).top.value, 0.1f)
-        assertEquals(130f, Pc.sideBarFit(744.dp).top.value, 0.1f)
-        for (height in widths(580, 2000)) {
-            val fit = Pc.sideBarFit(height)
-            assertEquals(Pc.SliderHeight, fit.track)
-            assertEquals(height * Pc.SIDE_BAR_CENTRE - Pc.SideBarHeight / 2, fit.top)
-            assertTrue(fit.top >= Pc.BarHeight)
-        }
-    }
-
-    @Test
-    fun theSideBarFitsUnderTheTopBarOfAShortWindow() {
-        for (height in widths(328, 579)) {
-            val fit = Pc.sideBarFit(height)
-            assertEquals(Pc.BarHeight, fit.top)
-            val bar = Pc.SideBarHeight - (Pc.SliderHeight - fit.track) * 2
-            assertTrue("$height", fit.top + bar <= height)
-            assertTrue(fit.track <= Pc.SliderHeight)
-        }
-        // no jump where the two meet
-        assertEquals(170f, Pc.sideBarFit(579.dp).track.value, 0.6f)
     }
 
     @Test

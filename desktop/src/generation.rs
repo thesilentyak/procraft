@@ -1452,7 +1452,7 @@ impl GenerationUi {
         let corner = pos2(rect.left(), rect.top() - reach);
         egui::Area::new(Id::unique("generate results")).fixed_pos(corner).order(Order::Foreground).show(ctx, |ui| {
             ui.allocate_rect(rect, Sense::click());
-            panel::floating_frame(ui, look, "generate results frame", rect, backdrops);
+            panel::floating_frame(ui, look, "generate results frame", rect, 1.0, backdrops);
             ui.painter().rect_filled(rect, 22.0, argb(BAR_FILL));
             let cy = rect.center().y;
             let mut x = rect.left() + 16.0;
@@ -1746,7 +1746,7 @@ impl GenerationUi {
         let mut open = false;
         egui::Area::new(Id::unique("results tray tab")).fixed_pos(rect.min).order(Order::Foreground).show(ctx, |ui| {
             open = ui.allocate_rect(rect, Sense::click()).clicked();
-            panel::floating_frame(ui, look, "results tray tab frame", rect, backdrops);
+            panel::floating_frame(ui, look, "results tray tab frame", rect, 1.0, backdrops);
             ui.painter().rect_filled(rect, TAB_HEIGHT / 2.0, argb(BAR_FILL));
             let cell = Rect::from_min_size(pos2(rect.left() + 8.0, rect.top() + 7.0), vec2(28.0, 28.0));
             match (progress, picture) {

@@ -138,7 +138,9 @@ pub(crate) fn seconds_for(share: f32) -> f32 {
 
 /// The hole growing over the fill just made.
 pub(crate) struct Reveal {
-    began: Instant,
+    /// When it was first shown: it grows from then, however long the fill took to show, so its
+    /// first frame is always its first size.
+    began: Option<Instant>,
     seconds: f32,
     /// Its corners at first and at last, canvas pixels.
     from: [Corner; 6],
@@ -188,7 +190,7 @@ impl Reveal {
             }
             Some(out)
         };
-        Some(Reveal { began: Instant::now(), seconds, from: map(from)?, to: map(to)? })
+        Some(Reveal { began: None, seconds, from: map(from)?, to: map(to)? })
     }
 
     /// How long it takes.
@@ -197,15 +199,17 @@ impl Reveal {
         Duration::from_secs_f32(self.seconds)
     }
 
-    /// The hole's outline `seconds` after it began.
-    #[cfg(test)]
-    pub(crate) fn hole_after(&self, seconds: f32) -> Option<Vec<[f32; 2]>> {
-        self.hole_at(self.began + Duration::from_secs_f32(seconds))
+    /// The hole's outline for a frame shown at `now` (canvas pixels): the first frame asked for
+    /// begins it. None once it has grown.
+    pub(crate) fn hole_at(&mut self, now: Instant) -> Option<Vec<[f32; 2]>> {
+        let began = *self.began.get_or_insert(now);
+        self.hole_after(now.saturating_duration_since(began).as_secs_f32())
     }
 
-    /// The hole's outline at `now` (canvas pixels); none once it has grown.
-    pub(crate) fn hole_at(&self, now: Instant) -> Option<Vec<[f32; 2]>> {
-        let t = now.saturating_duration_since(self.began).as_secs_f32() / self.seconds.max(1e-3);
+    /// The hole's outline `seconds` after it was first shown (canvas pixels); none once it has
+    /// grown.
+    pub(crate) fn hole_after(&self, seconds: f32) -> Option<Vec<[f32; 2]>> {
+        let t = seconds.max(0.0) / self.seconds.max(1e-3);
         if t >= 1.0 {
             return None;
         }
@@ -292,7 +296,7 @@ mod tests {
         let rect = IRect::new(100, 200, 400, 300);
         let drop = view.to_screen().apply(Vec2::new(250.0, 250.0));
         let r = Reveal::new(drop, rect, &view, (800, 800), 2.0, &mut Shake::new(3)).unwrap();
-        let first = r.hole_at(r.began).unwrap();
+        let first = r.hole_after(0.0).unwrap();
         // ten points is twenty window pixels: on the canvas, through the view's zoom
         let zoom = view.to_screen().scale_factor();
         let centre = on_canvas(&view, drop);
@@ -301,7 +305,7 @@ mod tests {
             assert!((d - 20.0).abs() < 0.5, "{d}");
         }
         // near the end every corner of the fill's box is inside the hole
-        let last = r.hole_at(r.began + r.duration().mul_f32(0.999)).unwrap();
+        let last = r.hole_after(r.duration().as_secs_f32() * 0.999).unwrap();
         let inside = |q: Vec2| {
             let mut crossings = 0;
             for (i, a) in last.iter().enumerate() {
@@ -316,7 +320,7 @@ mod tests {
             assert!(inside(Vec2::new(x as f32, y as f32)), "({x}, {y})");
         }
         // and then it has grown
-        assert!(r.hole_at(r.began + r.duration()).is_none());
+        assert!(r.hole_after(r.duration().as_secs_f32()).is_none());
     }
 
     #[test]
@@ -329,5 +333,119 @@ mod tests {
         assert!(small < 0.201, "{small}");
         // the fitted canvas is the whole window here
         assert!((whole - 0.5).abs() < 0.01, "{whole}");
+    }
+
+    /// The area inside `outline` (canvas pixels) as a circle's radius, in points (`to_points`
+    /// points a canvas pixel).
+    fn radius_points(outline: &[[f32; 2]], to_points: f32) -> f32 {
+        let n = outline.len();
+        let twice: f32 = (0..n)
+            .map(|i| {
+                let (a, b) = (outline[i], outline[(i + 1) % n]);
+                a[0] * b[1] - b[0] * a[1]
+            })
+            .sum();
+        (twice.abs() / 2.0 / PI).sqrt() * to_points
+    }
+
+    /// A 1000 pixel canvas fitted in an 800 pixel window, two pixels a point; the points a canvas
+    /// pixel is; and the middle of the window, where the colour lands.
+    fn fitted() -> (View, f32, Vec2) {
+        let view = View::fit((1000, 1000), (800, 800));
+        let to_points = view.to_screen().scale_factor() / 2.0;
+        (view, to_points, Vec2::new(400.0, 400.0))
+    }
+
+    #[test]
+    fn it_begins_growing_when_it_is_first_shown_however_late_that_is() {
+        let (view, to_points, drop) = fitted();
+        // a small fill: a fifth of a second
+        let mut r =
+            Reveal::new(drop, IRect::new(480, 480, 520, 520), &view, (800, 800), 2.0, &mut Shake::new(5)).unwrap();
+        // its first frame comes 150 ms after it was made (the fill took that long to show): it
+        // shows at its first size, ten points round the drop, not three quarters of the way on
+        let first = Instant::now() + Duration::from_millis(150);
+        let shown = r.hole_at(first).unwrap();
+        let radius = radius_points(&shown, to_points);
+        assert!((radius - START).abs() < 0.3, "the first frame's hole reaches {radius} pt from the drop, not {START}");
+        assert_eq!(shown, r.hole_after(0.0).unwrap());
+        // and it grows for its whole time from then
+        let seconds = r.duration().as_secs_f32();
+        assert!((seconds - 0.2).abs() < 0.001, "{seconds}");
+        assert!(r.hole_at(first + Duration::from_secs_f32(seconds - 0.001)).is_some());
+        assert!(r.hole_at(first + Duration::from_secs_f32(seconds)).is_none());
+    }
+
+    #[test]
+    fn its_front_grows_every_frame_as_its_curve_says_for_a_big_fill_and_a_small_one() {
+        let (view, to_points, drop) = fitted();
+        let frame = 1.0 / 60.0;
+        // the whole canvas (the whole view: half a second) and a box 16 points square (a fifth)
+        for (rect, seconds) in [(IRect::new(0, 0, 1000, 1000), 0.5), (IRect::new(480, 480, 520, 520), 0.2)] {
+            let mut r = Reveal::new(drop, rect, &view, (800, 800), 2.0, &mut Shake::new(9)).unwrap();
+            let start = Instant::now();
+            let radii: Vec<f32> = (0..)
+                .map_while(|k| r.hole_at(start + Duration::from_secs_f32(k as f32 * frame)))
+                .map(|o| radius_points(&o, to_points))
+                .collect();
+            // as many frames as its time takes at 60 a second, give or take one
+            let frames = radii.len() as f32;
+            assert!((frames - seconds * 60.0).abs() <= 1.0, "{frames} frames for {seconds} s");
+            // from ten points, never back, and no frame's step past what the curve's steepest part
+            // (four times its average pace, at its end) moves in a frame
+            assert!((radii[0] - START).abs() < 0.3, "{}", radii[0]);
+            let last = radius_points(&r.hole_after(seconds * 0.99999).unwrap(), to_points);
+            let steps: Vec<f32> = radii.windows(2).map(|w| w[1] - w[0]).collect();
+            assert!(steps.iter().all(|&s| s >= -0.05), "it shrank: {radii:?}");
+            let biggest = steps.iter().copied().fold(0.0, f32::max);
+            let most = 4.0 * frame / seconds * (last - START) * 1.15;
+            assert!(biggest <= most, "a step of {biggest} pt, past {most} ({seconds} s)");
+            // slow at first and quicker each frame: a tenth of the way in it has moved less than a
+            // fiftieth of the way, and each step is at least as big as the one before (to a
+            // hundredth of the whole)
+            let tenth = radii[(frames * 0.1) as usize];
+            assert!(tenth - START < (last - START) * 0.02, "{tenth}");
+            let slack = (last - START) * 0.01;
+            assert!(steps.windows(2).all(|w| w[1] >= w[0] - slack), "{steps:?}");
+        }
+    }
+
+    #[test]
+    fn it_keeps_the_pace_measured_frame_by_frame() {
+        // how far along it was each thirtieth of a second of a spread lasting 0.3 s, as measured
+        // from a recording (the hole's area, against where it starts and ends)
+        let measured = [0.001, 0.013, 0.037, 0.076, 0.131, 0.203];
+        for (k, m) in measured.iter().enumerate() {
+            let e = eased(k as f32 / 30.0 / 0.3);
+            assert!((e - m).abs() < 0.03, "frame {k}: {e} against {m}");
+        }
+    }
+
+    #[test]
+    fn each_frame_tests_few_of_the_veil_s_pixels_against_the_hole() {
+        use procraft_gpu::{VeilCell, VeilCells};
+        let (view, _, drop) = fitted();
+        // a target pixel in canvas pixels: the hole's edge is smoothed over that
+        let margin = 1.0 / view.to_screen().scale_factor();
+        // the whole canvas, a wide box and a small one, frame by frame at 60 a second: the share
+        // of the veil whose pixels are each tested against the hole (every one, before it was
+        // drawn a cell at a time), on average and at most
+        let fills = [
+            (IRect::new(0, 0, 1000, 1000), 0.04, 0.12),
+            (IRect::new(100, 380, 900, 620), 0.04, 0.12),
+            (IRect::new(480, 480, 520, 520), 0.04, 0.12),
+        ];
+        for (rect, mean_most, any_most) in fills {
+            let mut r = Reveal::new(drop, rect, &view, (800, 800), 2.0, &mut Shake::new(4)).unwrap();
+            let start = Instant::now();
+            let shares: Vec<f32> = (0..)
+                .map_while(|k| r.hole_at(start + Duration::from_secs_f32(k as f32 / 60.0)))
+                .map(|hole| VeilCells::of(rect, &hole, margin).share(VeilCell::Edge))
+                .collect();
+            let mean = shares.iter().sum::<f32>() / shares.len() as f32;
+            let most = shares.iter().copied().fold(0.0, f32::max);
+            eprintln!("{rect:?}: tested {:.1}% of the veil on average, {:.1}% at most", mean * 100.0, most * 100.0);
+            assert!(mean <= mean_most && most <= any_most, "{rect:?}: {mean} on average, {most} at most");
+        }
     }
 }

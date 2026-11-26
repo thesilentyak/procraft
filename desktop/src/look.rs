@@ -114,21 +114,31 @@ pub mod pc {
     pub const ACTION_DISC_SIZE: f32 = 32.0;
     pub const COLOR_DOT: f32 = 31.0;
 
+    // the bar and the tracks translucent, each straight over what is behind (#2d2d2d and #676767
+    // over white; light 235 and 244); the thumbs opaque (#a6a6a6, white on the light look), each
+    // with a soft shadow a point below it
     pub const SIDE_BAR: Themed = Themed(0xE7171717, 0xCFE5E5E5);
     pub const SLIDER_TRACK: Themed = Themed(0xC93E3E3E, 0xBFF0F0F0);
-    pub const SLIDER_RIM: Themed = Themed(0xB96E6E6E, 0xFFE9E9E9);
+    /// A lighter rim round each track, more of what is behind showing through it (150 over white;
+    /// light 249).
+    pub const SLIDER_RIM: Themed = Themed(0xB96E6E6E, 0xB9F7F7F7);
     pub const SLIDER_RIM_WIDTH: f32 = 0.8;
-    pub const SLIDER_THUMB: Themed = Themed(0xFFA6A6A6, 0xFFF8F8F8);
-    pub const SIDE_GLYPH: Themed = Themed(0xFF969696, 0xFF646464);
-    pub const SIDE_GLYPH_DISABLED: Themed = Themed(0x1AFFFFFF, 0x33000000);
+    /// A hairline round each track's window in the bar, a little darker than the bar (38 against
+    /// the dark bar's 45 over white, about 220 against the light bar's 235).
+    pub const SLIDER_EDGE: Themed = Themed(0x28000000, 0x10000000);
+    pub const SLIDER_EDGE_WIDTH: f32 = 0.5;
+    pub const SLIDER_THUMB: Themed = Themed(0xFFA6A6A6, 0xFFFFFFFF);
+    /// A value saved on a slider (a notch): a short bar across the track, mid grey and see-through
+    /// on either look, so that it shows on the dark track and the light one (119 over the dark
+    /// track's 103 and 162 over the light one's 244, over white).
+    pub const NOTCH_MARK: u32 = 0xB3808080;
+    /// The modify outline and undo and redo: light, the dark look's grey turned over (105, and
+    /// about 204 greyed out over the light bar).
+    pub const SIDE_GLYPH: Themed = Themed(0xFF969696, 0xFF696969);
+    pub const SIDE_GLYPH_DISABLED: Themed = Themed(0x1AFFFFFF, 0x22000000);
     pub const SIDE_BAR_WIDTH: f32 = 51.0;
     pub const SIDE_BAR_HEIGHT: f32 = 519.0;
     pub const SIDE_BAR_CORNER: f32 = 20.0;
-    /// Where the side bar's centre sits, as a fraction of the window's height.
-    pub const SIDE_BAR_CENTRE: f32 = 0.5234;
-    /// Left under the side bar in a window too short for its measured tracks, and how short they go.
-    const SHORT_SIDE_BAR_FOOT: f32 = 17.0;
-    const SHORTEST_TRACK: f32 = 44.0;
     pub const SLIDER_WIDTH: f32 = 40.0;
     pub const SLIDER_HEIGHT: f32 = 170.0;
     pub const SLIDER_CORNER: f32 = 13.0;
@@ -161,19 +171,6 @@ pub mod pc {
             BAR_MARGIN * 2.0 + GALLERY_WIDTH + (BAR_BUTTON_WIDTH + action) * 4.0 + BAR_BUTTON_WIDTH * 5.0 + tool * 4.0
         };
         [measured, (8.0, 14.0)].into_iter().find(|&gaps| needs(gaps) <= width).unwrap_or((2.0, 4.0))
-    }
-
-    /// The side bar in a window `height` tall: its top from the window's, and how long each of its
-    /// two tracks is. At `SIDE_BAR_CENTRE` with its measured tracks wherever that clears the top
-    /// bar; in a shorter window just under the top bar, its tracks giving up what it is short of,
-    /// so that all of it can be reached.
-    pub fn side_bar_fit(height: f32) -> (f32, f32) {
-        let top = height * SIDE_BAR_CENTRE - SIDE_BAR_HEIGHT / 2.0;
-        if top >= BAR_HEIGHT {
-            return (top, SLIDER_HEIGHT);
-        }
-        let rest = SIDE_BAR_HEIGHT - SLIDER_HEIGHT * 2.0;
-        (BAR_HEIGHT, ((height - BAR_HEIGHT - SHORT_SIDE_BAR_FOOT - rest) / 2.0).clamp(SHORTEST_TRACK, SLIDER_HEIGHT))
     }
 }
 
@@ -516,27 +513,67 @@ const ALL: Rect = Rect { min: pos2(0.0, 0.0), max: pos2(1.0, 1.0) };
 #[derive(Default)]
 pub struct Look {
     icons: HashMap<(&'static str, u32), TextureHandle>,
+    /// Icons a plugin draws (path data on the icons' grid), by it and their size in pixels.
+    path_icons: HashMap<(String, u32), TextureHandle>,
     /// Each drawn shape's texture and what it was drawn from.
     shapes: HashMap<&'static str, (u64, TextureHandle)>,
+    /// How many times as big as its points what is drawn on a layer shows, where that isn't 1: a
+    /// part of the interface a plugin sizes. Its icons and shapes are drawn for the pixels they
+    /// show on.
+    zooms: HashMap<egui::LayerId, f32>,
 }
 
 impl Look {
+    /// What is drawn on `layer` from now on shows `zoom` times as big as its points (1: as they
+    /// are).
+    pub fn set_zoom(&mut self, layer: egui::LayerId, zoom: f32) {
+        if zoom == 1.0 {
+            self.zooms.remove(&layer);
+        } else {
+            self.zooms.insert(layer, zoom);
+        }
+    }
+
+    /// How many pixels a point of what `ui` draws shows on.
+    fn pixels_per_point(&self, ui: &Ui) -> f32 {
+        let ppp = ui.ctx().pixels_per_point();
+        self.zooms.get(&ui.layer_id()).map_or(ppp, |zoom| ppp * zoom)
+    }
+
     /// `icon` shown `width` points across (its frame scaled to it), centred at `centre`, in `colour`.
     pub fn icon(&mut self, ui: &Ui, icon: &Icon, centre: Pos2, width: f32, colour: Color32) {
-        let ppp = ui.ctx().pixels_per_point();
+        self.icon_on(ui, ui.painter(), icon, centre, width, colour);
+    }
+
+    /// [`Look::icon`] drawn with `painter`, within what it clips to.
+    pub fn icon_on(&mut self, ui: &Ui, painter: &Painter, icon: &Icon, centre: Pos2, width: f32, colour: Color32) {
+        let ppp = self.pixels_per_point(ui);
         let px = (width * ppp).round().max(1.0) as u32;
         let texture = self
             .icons
             .entry((icon.name, px))
             .or_insert_with(|| ui.ctx().load_texture(icon.name, raster_icon(icon, px), TextureOptions::LINEAR));
         let height = width * icon.height / icon.width;
-        ui.painter().image(texture.id(), Rect::from_center_size(centre, vec2(width, height)), ALL, colour);
+        painter.image(texture.id(), Rect::from_center_size(centre, vec2(width, height)), ALL, colour);
+    }
+
+    /// A plugin's icon, SVG path data on the interface icons' 24-unit grid (as the core checked and
+    /// wrote it), filled even-odd to fill `rect`, in `colour`.
+    pub fn path_icon(&mut self, ui: &Ui, d: &str, rect: Rect, colour: Color32) {
+        let ppp = self.pixels_per_point(ui);
+        let px = (rect.width() * ppp).round().max(1.0) as u32;
+        let texture = self.path_icons.entry((d.to_owned(), px)).or_insert_with(|| {
+            let icon = Icon { name: "plugin icon", width: 24.0, height: 24.0, parts: &[] };
+            let svg = format!(r##"<path d="{d}" fill="#fff" fill-rule="evenodd"/>"##);
+            ui.ctx().load_texture("plugin icon", raster_svg(&icon, &svg, px), TextureOptions::LINEAR)
+        });
+        ui.painter().image(texture.id(), rect, ALL, colour);
     }
 
     /// `icon` stretched to fill `rect` (drawn as wide as it, then squeezed or stretched to its
     /// height), in `colour`.
     pub fn icon_in(&mut self, ui: &Ui, icon: &Icon, rect: Rect, colour: Color32) {
-        let ppp = ui.ctx().pixels_per_point();
+        let ppp = self.pixels_per_point(ui);
         let px = (rect.width() * ppp).round().max(1.0) as u32;
         let texture = self
             .icons
@@ -555,7 +592,7 @@ impl Look {
         rect: Rect,
         draw: impl FnOnce(&mut tiny_skia::Pixmap, tiny_skia::Transform),
     ) {
-        let ppp = ui.ctx().pixels_per_point();
+        let ppp = self.pixels_per_point(ui);
         let (w, h) = ((rect.width() * ppp).ceil().max(1.0) as u32, (rect.height() * ppp).ceil().max(1.0) as u32);
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         // drawn again when the interface turns light or dark
@@ -585,7 +622,7 @@ impl Look {
 
 /// `icon` drawn white `px` pixels across.
 fn raster_icon(icon: &Icon, px: u32) -> egui::ColorImage {
-    let mut svg = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {} {}">"#, icon.width, icon.height);
+    let mut svg = String::new();
     for part in icon.parts {
         if part.fill {
             let rule = if part.even_odd { "evenodd" } else { "nonzero" };
@@ -598,7 +635,15 @@ fn raster_icon(icon: &Icon, px: u32) -> egui::ColorImage {
             ));
         }
     }
-    svg.push_str("</svg>");
+    raster_svg(icon, &svg, px)
+}
+
+/// The SVG elements `parts`, drawn in `icon`'s frame, `px` pixels across.
+fn raster_svg(icon: &Icon, parts: &str, px: u32) -> egui::ColorImage {
+    let svg = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {} {}">{parts}</svg>"#,
+        icon.width, icon.height
+    );
     let ph = ((px as f32) * icon.height / icon.width).round().max(1.0) as u32;
     let drawn = resvg::usvg::Tree::from_str(&svg, &resvg::usvg::Options::default()).ok().and_then(|tree| {
         let mut pixmap = tiny_skia::Pixmap::new(px, ph)?;
@@ -755,20 +800,44 @@ mod tests {
         }
     }
 
+    /// The grey (0..255) `top` (0xAARRGGBB, a grey) shows over an `under` grey.
+    fn over(top: u32, under: f32) -> f32 {
+        let [a, g, ..] = top.to_be_bytes();
+        let a = f32::from(a) / 255.0;
+        f32::from(g) * a + under * (1.0 - a)
+    }
+
     #[test]
-    fn the_side_bar_stays_as_measured_or_fits_under_the_top_bar() {
-        // portrait top 333.5, landscape top 130
-        assert!((pc::side_bar_fit(1133.0).0 - 333.5).abs() < 0.1);
-        assert!((pc::side_bar_fit(744.0).0 - 130.0).abs() < 0.1);
-        for height in 580..2000 {
-            assert_eq!(pc::side_bar_fit(height as f32).1, pc::SLIDER_HEIGHT);
+    fn a_saved_value_s_mark_shows_on_the_track_in_either_look() {
+        for track in [pc::SLIDER_TRACK.0, pc::SLIDER_TRACK.1] {
+            // over the white canvas, the black surround and a mid grey
+            for behind in [255.0, 0.0, 128.0] {
+                let under = over(track, behind);
+                let mark = over(pc::NOTCH_MARK, under);
+                assert!((mark - under).abs() >= 15.0, "{track:x} over {behind}: {mark} on {under}");
+            }
         }
-        for height in 480..580 {
-            let height = height as f32;
-            let (top, track) = pc::side_bar_fit(height);
-            assert_eq!(top, pc::BAR_HEIGHT);
-            assert!(top + pc::SIDE_BAR_HEIGHT - (pc::SLIDER_HEIGHT - track) * 2.0 <= height, "{height}");
+        // as measured over white: 119 on the dark track's 103, 162 on the light one's 244
+        let (dark, light) = (over(pc::SLIDER_TRACK.0, 255.0), over(pc::SLIDER_TRACK.1, 255.0));
+        assert!((dark - 103.0).abs() < 2.0 && (over(pc::NOTCH_MARK, dark) - 119.0).abs() < 2.0);
+        assert!((light - 244.0).abs() < 2.0 && (over(pc::NOTCH_MARK, light) - 162.0).abs() < 2.0);
+    }
+
+    #[test]
+    fn the_side_bar_s_tracks_thumbs_and_glyphs_are_as_measured_in_either_look() {
+        // over white: the rims 150 and 249, the hairlines round the windows 38 and about 220
+        for (light, rim, edge) in [(false, 150.0, 38.0), (true, 249.0, 220.0)] {
+            let pick = |c: super::Themed| if light { c.1 } else { c.0 };
+            let (bar, track) = (over(pick(pc::SIDE_BAR), 255.0), over(pick(pc::SLIDER_TRACK), 255.0));
+            let shown = over(pick(pc::SLIDER_RIM), 255.0);
+            assert!((shown - rim).abs() < 2.0 && shown > track + 4.0, "{light}: rim {shown}");
+            let shown = over(pick(pc::SLIDER_EDGE), bar);
+            assert!((shown - edge).abs() < 3.0 && shown < bar - 5.0, "{light}: edge {shown}");
         }
+        // light: a white thumb, and the dark look's glyph grey turned over; greyed out, about 204
+        assert_eq!(pc::SLIDER_THUMB.1, 0xFFFFFFFF);
+        assert_eq!(pc::SIDE_GLYPH.1 & 0xFF, 0xFF - (pc::SIDE_GLYPH.0 & 0xFF));
+        assert!((over(pc::SIDE_GLYPH_DISABLED.1, over(pc::SIDE_BAR.1, 255.0)) - 204.0).abs() < 2.0);
     }
 
     #[test]

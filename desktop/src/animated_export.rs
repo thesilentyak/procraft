@@ -230,7 +230,7 @@ impl AnimatedExport {
                 Animated::Png => session.export_apng(file, side, fps, transparent).map_err(|e| e.to_string()),
                 Animated::Mp4 | Animated::Hevc => {
                     let info = session.info();
-                    let order = session.animation_sequence();
+                    let order = session.animation_play_order();
                     let most = if web_ready { WEB_READY_SIDE } else { MAX_VIDEO_SIDE };
                     let hevc = format == Animated::Hevc;
                     crate::video::write_mp4(
@@ -725,7 +725,7 @@ fn file_size(bytes: u64) -> String {
 /// The file made copied where the person picks; true once saved (false if they cancelled).
 fn save_as(made: &std::path::Path, format: Animated) -> bool {
     let name = made.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let Some(to) = rfd::FileDialog::new()
+    let Some(to) = crate::files::dialog()
         .set_title(format!("Share as {}", format.title()))
         .set_file_name(name)
         .add_filter(format.title(), &[format.extension()])

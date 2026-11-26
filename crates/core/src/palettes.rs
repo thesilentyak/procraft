@@ -147,10 +147,23 @@ impl Palettes {
         Some(palette::write_swatches(p, &crate::layers::srgb_profile()))
     }
 
-    /// A palette of the main colours of a picture (`pixels` 0xAARRGGBB), light to dark, added at
-    /// the end; false if it has none (all see-through).
+    /// A palette of a picture's colours (`pixels` 0xAARRGGBB, straight, sRGB), by hue, added at
+    /// the end (see [`palette::main_colours`]: a picture of few colours gives exactly its own);
+    /// false if it has none (all see-through).
     pub fn add_from_pixels(&self, pixels: Vec<u32>) -> bool {
-        let opaque: Vec<u32> = pixels.iter().filter(|p| *p >> 24 > 128).map(|p| p & 0xFF_FFFF).collect();
+        self.add_picture_colours(pixels.into_iter())
+    }
+
+    /// [`Self::add_from_pixels`] with the pixels as bytes, four a pixel (alpha, red, green, blue):
+    /// a whole picture crosses from the app at once, not a number at a time.
+    pub fn add_from_argb(&self, argb: Vec<u8>) -> bool {
+        self.add_picture_colours(argb.as_chunks::<4>().0.iter().map(|p| u32::from_be_bytes(*p)))
+    }
+}
+
+impl Palettes {
+    fn add_picture_colours(&self, pixels: impl Iterator<Item = u32>) -> bool {
+        let opaque: Vec<u32> = pixels.filter(|p| *p >> 24 > 128).map(|p| p & 0xFF_FFFF).collect();
         let colours = palette::main_colours(&opaque, palette::SLOTS);
         if colours.is_empty() {
             return false;
@@ -249,7 +262,7 @@ impl Palettes {
                 let _ = std::fs::create_dir_all(dir);
             }
             let tmp = file.with_extension("json.tmp");
-            let written = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, file));
+            let written = crate::storage::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, file));
             let mut failure = self.failure.lock().unwrap_or_else(|e| e.into_inner());
             match written {
                 Ok(()) => failure.1 = false,
@@ -310,6 +323,11 @@ mod tests {
         assert!(!p.import_file(vec![1, 2, 3], None));
         assert!(p.add_from_pixels(vec![0xFF102030, 0x00FFFFFF, 0xFFF0E0D0]));
         assert_eq!(p.list().last().map(|q| q.colors[..3].to_vec()), Some(vec![Some(0xF0E0D0), Some(0x102030), None]));
+        // the same as bytes, as the tablet sends a picture (the see-through pixel left out)
+        let argb: Vec<u8> = [0xFF102030u32, 0x00FFFFFF, 0xFFF0E0D0].iter().flat_map(|p| p.to_be_bytes()).collect();
+        assert!(p.add_from_argb(argb));
+        assert_eq!(p.list().last().map(|q| q.colors[..3].to_vec()), Some(vec![Some(0xF0E0D0), Some(0x102030), None]));
+        assert!(!p.add_from_argb(vec![0, 1, 2, 3]), "all see-through");
     }
 
     #[test]

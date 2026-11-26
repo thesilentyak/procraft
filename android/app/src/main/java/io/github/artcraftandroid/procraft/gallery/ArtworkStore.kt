@@ -13,15 +13,33 @@ sealed interface GalleryEntry {
     val modified: Long
 }
 
-/** A saved artwork: its folder (see the native library's `project.rs` for what is inside). */
-data class Artwork(override val dir: File, override val name: String, val width: Int, val height: Int, override val modified: Long) : GalleryEntry {
+/**
+ * A saved artwork: its folder (see the native library's `project.rs` for what is inside), and how
+ * many quarter turns clockwise it shows turned by, as its canvas was left.
+ */
+data class Artwork(override val dir: File, override val name: String, val width: Int, val height: Int, override val modified: Long, val turns: Int = 0) : GalleryEntry {
+    /** Its thumbnail, turned as it shows. */
     val thumbnail: File get() = File(dir, "thumbnail.png")
+
+    /** Its width over its height as it shows (turned on its side, the other way). */
+    val ratio: Float get() {
+        val upright = if (width > 0 && height > 0) width.toFloat() / height else 0.75f
+        return if (turns % 2 != 0) 1f / upright else upright
+    }
 }
 
 /** Artworks kept together: a folder holding their folders, in their own order. */
 data class Stack(override val dir: File, override val name: String, val artworks: List<Artwork>) : GalleryEntry {
     override val modified: Long get() = artworks.maxOfOrNull { it.modified } ?: dir.lastModified()
 }
+
+/**
+ * What Select's actions act on (the shared core's rules, crates/core gallery.rs): the [entries]
+ * picked in the order shown (Duplicate and Delete take a stack whole), the [artworks] Preview shows
+ * and Share shares (a picked stack's all of them), whether Stack can put them together, and what
+ * Delete asks first.
+ */
+class Pick(val entries: List<GalleryEntry>, val artworks: List<Artwork>, val canStack: Boolean, val deleteTitle: String, val deleteMessage: String)
 
 /**
  * The artworks in the app's private storage, one folder each, some in stacks (a folder of them),
@@ -42,10 +60,19 @@ class ArtworkStore(val root: File) {
 
     fun newFolder(at: File = root): File = File(core.newFolder(folder(at)))
 
+    /** What the [plugins] bring in from a folder of theirs as the gallery opens (a long call, not for the main thread). */
+    fun bringIn(plugins: io.github.artcraftandroid.procraft.core.Plugins): io.github.artcraftandroid.procraft.core.FolderBroughtIn = plugins.galleryOpened(core)
+
     fun delete(a: Artwork) = core.delete(a.dir.path)
 
     /** A copy under the same name, right after the original. */
     fun duplicate(a: Artwork): File = File(core.duplicate(a.dir.path))
+
+    /** Stack [s] and every artwork in it gone. */
+    fun deleteStack(s: Stack) = core.delete(s.dir.path)
+
+    /** A copy of stack [s], right after it: a copy of each of its artworks, in its order. */
+    fun duplicateStack(s: Stack): File = File(core.duplicate(s.dir.path))
 
     /**
      * [e] moved to [to] (its place in the order without it) in folder [into]: the gallery or a
@@ -61,12 +88,39 @@ class ArtworkStore(val root: File) {
     /** A new stack in the gallery holding [artworks] (moved into it), where the first of them was, in the gallery's order. */
     fun stack(artworks: List<Artwork>): File = File(core.stack(artworks.map { it.dir.path }))
 
+    /**
+     * The gallery's [entries] (artworks and stacks, as Select picks them) put together in one stack
+     * where the first was, all their artworks in the gallery's order: the first stack picked takes
+     * in the rest, keeping its name; with no stack picked it is a new one.
+     */
+    fun stackPicked(entries: List<GalleryEntry>): File = File(core.stackPicked(entries.map { it.dir.path }))
+
+    /** Of the [entries] shown (in a stack's if [inStack]), those whose folders are named in [picked], as Select's actions take them. */
+    fun pick(entries: List<GalleryEntry>, picked: Collection<String>, inStack: Boolean): Pick {
+        val chosen = entries.filter { it.dir.name in picked }
+        val p = io.github.artcraftandroid.procraft.core.galleryPick(entries.map(::core), chosen.map { it.dir.path }, inStack)
+        return Pick(
+            entries = p.dirs.mapNotNull { d -> chosen.firstOrNull { it.dir.path == d } },
+            artworks = p.artworks.map(::artwork),
+            canStack = p.canStack,
+            deleteTitle = p.deleteTitle,
+            deleteMessage = p.deleteMessage,
+        )
+    }
+
+    private fun core(e: GalleryEntry): CoreGalleryEntry = when (e) {
+        is Artwork -> CoreGalleryEntry.Artwork(core(e))
+        is Stack -> CoreGalleryEntry.Stack(e.dir.path, e.name, e.artworks.map(::core))
+    }
+
+    private fun core(a: Artwork) = GalleryArtwork(a.dir.path, a.name, a.width.toUInt(), a.height.toUInt(), a.modified, a.turns.toUInt())
+
     /** Puts artworks the gallery can't show in a new stack, Recovered Artworks; how many it found. */
     fun recoverLost(): Int = core.recoverLostArtworks().toInt()
 
     fun renameStack(s: Stack, name: String) = core.renameStack(s.dir.path, name)
 
-    private fun artwork(a: GalleryArtwork) = Artwork(File(a.dir), a.name, a.width.toInt(), a.height.toInt(), a.modifiedMs)
+    private fun artwork(a: GalleryArtwork) = Artwork(File(a.dir), a.name, a.width.toInt(), a.height.toInt(), a.modifiedMs, a.turns.toInt())
 
     private fun entry(e: CoreGalleryEntry): GalleryEntry = when (e) {
         is CoreGalleryEntry.Artwork -> artwork(e.artwork)

@@ -1,6 +1,7 @@
 // How the selection shows over the canvas, fixed to the window: faint diagonal bands, dark and
 // light by turns, drifting over what is not selected; or what is selected multiplied by a colour
-// (a tint) or covered by one.
+// (a tint) or covered by one. And, as its feathering is dragged, a line where it fades out to a
+// tenth selected: dark, or in the colour covering it.
 
 struct SelectionUniform {
     // window pixel to the canvas's unit square: (a, b, c, d) of x' = a·x + c·y + e, y' = b·x + d·y + f
@@ -9,9 +10,14 @@ struct SelectionUniform {
     m1: vec4<f32>,
     // (colour for a tint or fill, the bands' coverage)
     v: vec4<f32>,
-    // (0 bands, 1 tint, 2 fill; 1 when the target encodes sRGB itself; unused)
+    // (0 bands, 1 tint, 2 fill, 3 the line alone; 1 when the target encodes sRGB itself; 1 to draw
+    // the line where it fades out; 1 to draw it alone in the colour, as Color Fill's shows on the
+    // layer)
     mode: vec4<f32>,
 }
+
+// The line's grey, where no colour covers the selection.
+const EDGE_INK: f32 = 0.08;
 
 @group(0) @binding(0) var mask: texture_2d<f32>;
 @group(0) @binding(1) var smp: sampler;
@@ -37,11 +43,28 @@ fn fs_selection(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         discard;
     }
     let selected = textureSampleLevel(mask, smp, u, 0.0).r;
+    let mode = i32(su.mode.x + 0.5);
     var c = su.v.rgb;
     if (su.mode.y > 0.5) {
         c = srgb_to_linear(c);
     }
-    let mode = i32(su.mode.x + 0.5);
+    // the line, a window pixel wide whatever the zoom: a pixel under a tenth selected beside one
+    // at a tenth or more, in the fill's colour where the selection shows covered by one, else dark
+    if (su.mode.z > 0.5 && selected < 0.1) {
+        let across = vec2<f32>(su.m0.x, su.m0.y);
+        let down = vec2<f32>(su.m0.z, su.m0.w);
+        let near = max(
+            max(textureSampleLevel(mask, smp, u + across, 0.0).r, textureSampleLevel(mask, smp, u - across, 0.0).r),
+            max(textureSampleLevel(mask, smp, u + down, 0.0).r, textureSampleLevel(mask, smp, u - down, 0.0).r),
+        );
+        if (near >= 0.1) {
+            // (multiplied, black is black too)
+            return vec4<f32>(select(vec3<f32>(EDGE_INK), c, mode == 2 || su.mode.w > 0.5), 1.0);
+        }
+    }
+    if (mode == 3) {
+        discard;
+    }
     if (mode == 1) {
         // multiplied (the pipeline blends by multiplying)
         return vec4<f32>(mix(vec3<f32>(1.0), c, selected), 1.0);

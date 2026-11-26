@@ -7,6 +7,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.MutatePriority
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -14,8 +15,6 @@ import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.scrollBy
-import androidx.compose.foundation.gestures.snapping.SnapPosition
-import androidx.compose.foundation.gestures.snapping.rememberSnapFlingBehavior
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -30,6 +29,8 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.requiredSize
+import androidx.compose.foundation.layout.wrapContentSize
+import androidx.compose.foundation.layout.requiredWidth
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
@@ -43,6 +44,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -51,6 +53,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -58,6 +62,7 @@ import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.geometry.CornerRadius
@@ -77,6 +82,7 @@ import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -93,8 +99,13 @@ import io.github.artcraftandroid.procraft.canvas.CanvasViewModel
 import io.github.artcraftandroid.procraft.core.LayerInfo
 import io.github.artcraftandroid.procraft.core.LayerOption
 import io.github.artcraftandroid.procraft.core.LayerType
+import io.github.artcraftandroid.procraft.core.RowDrop
+import io.github.artcraftandroid.procraft.core.blendCoast
+import io.github.artcraftandroid.procraft.core.blendCoastAt
+import io.github.artcraftandroid.procraft.core.blendTap
+import io.github.artcraftandroid.procraft.core.blendTapAt
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
-import kotlin.math.abs
 import kotlin.math.roundToInt
 
 private val LayersWidth = 384.dp
@@ -105,11 +116,25 @@ private val RowGap = 1.dp
 /** A dragged row this near an end of the list scrolls it, at most this far a second. */
 private val DragEdge = 56.dp
 private val DragScroll = 480.dp
+/** A dragged row this far out past the panel's side is lifted out of it, to drop elsewhere. */
+private val LiftReach = 24.dp
 private val ListCorner = 8.dp
 /** A group's row height, and how far in each level of group sits. */
 private val GroupHeight = 44.dp
 private val GroupIndent = 21.dp
 private val GroupLine = Color(0xFF4E4E4E)
+/**
+ * A closed group's row is taller: its line (20 under the row's top and 20 over its bottom) opens
+ * into a window 4 in from them, on its layers' rows drawn small; opening or closing, over this long.
+ */
+private val GroupClosedHeight = 82.dp
+private val GroupLineInset = 20.dp
+private val GroupWindowInset = 4.dp
+private const val GROUP_TURN_MS = 150
+/** The rows' width in the list, which a closed group's window draws its layers' rows to fit. */
+private val ListWidth = 360.dp
+/** A row's thumbnail (a group's line) held over by a dragged row long enough to take it. */
+private val HeldOutline = Color.White
 private val MaskOwnerRow = Color(0xFF2C5281)
 /** Swiping a row left shows these buttons, each this wide, this far apart. */
 private val SwipeButton = 82.dp
@@ -127,12 +152,13 @@ private val OptionsTop = 57.dp
 
 /**
  * The layers panel: top layer first. Tap a layer to make it current, tap the current one for its
- * options, tap the blend letter for blend mode and opacity, hold and drag to reorder, swipe left
- * for lock, duplicate and delete, swipe right to pick it to act on with the current one (the
- * title's menu then groups, merges, shares, duplicates or deletes them).
+ * options, tap the blend letter for blend mode and opacity, hold and drag to reorder (out past the
+ * panel's side, it is lifted out to drop on the canvas or, through the gallery, into another
+ * artwork), swipe left for lock, duplicate and delete, swipe right to pick it to act on with the
+ * current one (the title's menu then groups, merges, shares, duplicates or deletes them).
  */
 @Composable
-fun LayersPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier) {
+fun LayersPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier, floating: FloatingFrame? = null) {
     var options by remember { mutableStateOf<ULong?>(null) }
     var blendFor by remember { mutableStateOf<ULong?>(null) }
     // blend modes opening under a layer: the rows under it go at once and the panel grows over where
@@ -162,6 +188,8 @@ fun LayersPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier) 
     var titleMenu by remember { mutableStateOf(false) }
     // the + offering plugins' kinds of layer beside a plain one
     var addMenu by remember { mutableStateOf(false) }
+    // the filter layers' list the +'s Filter Layer opens
+    var filterList by remember { mutableStateOf(false) }
     var deletingChosen by remember { mutableStateOf(false) }
     val context = androidx.compose.ui.platform.LocalContext.current
     val scope = rememberCoroutineScope()
@@ -169,37 +197,66 @@ fun LayersPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier) 
     var dragOffset by remember { mutableFloatStateOf(0f) }
     // the rows that go with the dragged one (its mask, a group's layers)
     var dragUnit by remember { mutableStateOf(emptySet<ULong>()) }
+    // where the dragged row lands if let go now, and the row it has been held over long enough to
+    // go onto it (its thumbnail outlined)
+    var dropAt by remember { mutableStateOf<RowDrop?>(null) }
+    var heldOver by remember { mutableStateOf<ULong?>(null) }
     // where each row is in the window: for dropping a dragged row and placing the options
     val rows = remember { mutableMapOf<ULong, Rect>() }
+    // where layers held out of a panel drop: on its rows, within its box
+    DisposableEffect(rows) {
+        vm.layerRows = rows
+        onDispose {
+            // (a panel torn off shows floating as it goes from where it hung: that one's rows stay)
+            if (vm.layerRows === rows) {
+                vm.layerRows = emptyMap()
+                vm.layersBox = null
+            }
+        }
+    }
 
     // a model's meshes are pictured as the model is seen when the panel opens
     if (vm.modelOpen) LaunchedEffect(Unit) { vm.refreshSubmeshThumbnails() }
-    Popover(LayersWidth, arrowX, modifier) {
+    // floating in a window of its own: as wide as the window, no arrow, a strip over it and under it
+    val side = if (floating != null) ArrowSide.NONE else ArrowSide.TOP
+    Popover(floating?.width ?: LayersWidth, arrowX, modifier.onGloballyPositioned { vm.layersBox = it.boundsInWindow() }, side = side) {
+        floating?.let { FloatingTop(it) }
         // kept while they fade out
         val open = options?.let { id -> vm.layers.firstOrNull { it.id == id }?.let { l -> rows[id]?.let { l to it } } }
         val last = remember { arrayOfNulls<Pair<LayerInfo, Rect>>(1) }
         if (open != null) last[0] = open
         last[0]?.let { (l, row) -> LayerOptions(open != null, vm, l, row.center.y, onRename = { renaming = l.id }, onDone = { options = null }) }
-        PanelHeader(
-            "Layers",
-            chevronOn = vm.anyPicked,
-            onTitle = { titleMenu = !titleMenu },
-            menu = {
-                LayersTitleMenu(titleMenu, vm, onDismiss = { titleMenu = false }, onShare = {
-                    scope.launch {
-                        val files = vm.chosenLayerFiles()
-                        if (files.isNotEmpty()) shareFiles(context, files, "image/png")
-                    }
-                }, onDelete = { deletingChosen = true })
-            },
-        ) {
-            val kinds = vm.layerKinds()
-            Box(
-                Modifier.padding(top = 12.dp).size(40.dp, 41.dp).clickable { if (kinds.isEmpty()) vm.addLayer() else addMenu = true },
-                contentAlignment = Alignment.Center,
+        Box {
+            PanelHeader(
+                "Layers",
+                chevronOn = vm.anyPicked,
+                onTitle = { titleMenu = !titleMenu },
+                menu = {
+                    LayersTitleMenu(titleMenu, vm, onDismiss = { titleMenu = false }, onShare = {
+                        scope.launch {
+                            val files = vm.chosenLayerFiles()
+                            if (files.isNotEmpty()) shareFiles(context, files, "image/png")
+                        }
+                    }, onDelete = { deletingChosen = true })
+                },
             ) {
-                Icon(PcIcons.PlusMedium, contentDescription = "New layer", tint = Pc.PanelGlyph, modifier = Modifier.requiredSize(41.dp))
-                NewLayerMenu(addMenu && kinds.isNotEmpty(), kinds, vm, onDismiss = { addMenu = false })
+                val kinds = vm.layerKinds()
+                val filters = vm.layerFilters()
+                val asks = kinds.isNotEmpty() || filters.isNotEmpty()
+                Box(
+                    Modifier.padding(top = 12.dp).size(40.dp, 41.dp).clickable { if (!asks) vm.addLayer() else addMenu = true },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(PcIcons.PlusMedium, contentDescription = "New layer", tint = Pc.PanelGlyph, modifier = Modifier.requiredSize(41.dp))
+                    NewLayerMenu(addMenu && asks, kinds, filters.isNotEmpty(), vm, onDismiss = { addMenu = false }, onFilters = { filterList = true })
+                }
+                if (filterList) {
+                    FilterLayerList(filters, onPick = { filterList = false; vm.addFilterLayer(it) }, onClose = { filterList = false })
+                }
+            }
+            // hanging from its button, its grabber tears it off into a window of its own, while a plugin lets it
+            if (floating == null && io.github.artcraftandroid.procraft.core.FloatingPanel.LAYERS in Pc.floatingPanels) {
+                PanelGrabber(vm, io.github.artcraftandroid.procraft.core.FloatingPanel.LAYERS)
             }
         }
         // a layer added at the top of what shows comes in there, the rows under it sliding down,
@@ -219,14 +276,31 @@ fun LayersPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier) 
         val rowGap = with(LocalDensity.current) { RowGap.toPx() }
         val dragEdge = with(LocalDensity.current) { DragEdge.toPx() }
         val dragScroll = with(LocalDensity.current) { DragScroll.toPx() }
+        val liftReach = with(LocalDensity.current) { LiftReach.toPx() }
         LaunchedEffect(dragId) {
             val id = dragId ?: return@LaunchedEffect
             var last = androidx.compose.runtime.withFrameNanos { it }
+            // the row under the dragged one's middle, and since when
+            var over: ULong? = null
+            var overSince = last
+            // placed again only when it moves or a hold comes due
+            var placedFor: Pair<Float, ULong?>? = null
             while (true) {
                 val now = androidx.compose.runtime.withFrameNanos { it }
                 val seconds = (now - last) / 1e9f
                 last = now
                 val y = (rows[id] ?: continue).center.y + dragOffset
+                // held over one row a moment, it goes onto it when let go
+                val under = rows.entries.firstOrNull { (k, r) -> k !in dragUnit && y >= r.top && y < r.bottom }?.key
+                if (under != over) {
+                    over = under
+                    overSince = now
+                }
+                heldOver = over.takeIf { (now - overSince) / 1e9f >= vm.rowHoldSeconds }
+                if (placedFor != y to heldOver) {
+                    placedFor = y to heldOver
+                    dropAt = vm.rowDrop(id, rows, y, heldOver)
+                }
                 val box = listBox[0]
                 val towards = when {
                     y < box.top + dragEdge -> (y - box.top - dragEdge) / dragEdge
@@ -239,7 +313,8 @@ fun LayersPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier) 
         // two rows being pinched, each following its finger part of the way
         var squeeze by remember { mutableStateOf<Squeeze?>(null) }
         LazyColumn(
-            Modifier.weight(1f, fill = false).padding(horizontal = 12.dp)
+            // (floating, it fills its window)
+            Modifier.weight(1f, fill = floating != null).padding(horizontal = 12.dp)
                 .onGloballyPositioned {
                     listAt = it.positionInWindow()
                     listBox[0] = it.boundsInWindow()
@@ -262,7 +337,7 @@ fun LayersPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier) 
                 val pinnable = androidx.compose.ui.layout.LocalPinnableContainer.current
                 val pinned = remember { arrayOfNulls<androidx.compose.ui.layout.PinnableContainer.PinnedHandle>(1) }
                 val aside by androidx.compose.animation.core.animateFloatAsState(
-                    remember(l.id) { androidx.compose.runtime.derivedStateOf { dragId?.let { makingWay(l.id, it, dragUnit, dragOffset, rows, rowGap) } ?: 0f } }.value,
+                    remember(l.id) { androidx.compose.runtime.derivedStateOf { if (dragId == null) 0f else makingWay(l.id, dragUnit, dropAt, rows, rowGap) } }.value,
                     Motion.rowFade(),
                 )
                 Column(
@@ -290,18 +365,31 @@ fun LayersPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier) 
                                     dragId = l.id
                                     dragOffset = 0f
                                     dragUnit = vm.movingWith(l) + l.id
+                                    dropAt = null
+                                    heldOver = null
                                     swiped = null
                                     pinned[0] = pinnable?.pin()
                                 },
                                 onDrag = { change, amount ->
                                     change.consume()
                                     dragOffset += amount.y
+                                    // dragged out past the panel's side, the row (with what goes with it) is
+                                    // lifted out, held by the finger from then on wherever it goes
+                                    val at = vm.fingersAt[change.id]
+                                    val box = vm.layersBox
+                                    if (at != null && box != null && (at.x < box.left - liftReach || at.x > box.right + liftReach)) {
+                                        val corner = (rows[l.id]?.topLeft ?: at) + Offset(0f, dragOffset)
+                                        vm.liftLayers(l, change.id, at, corner)
+                                    }
                                 },
                                 onDragEnd = {
-                                    rows[l.id]?.let { drop(vm, l, it.center.y + dragOffset, rows) }
+                                    // where its middle came to rest, placed as the core places it
+                                    rows[l.id]?.let { vm.dropRow(l, vm.rowDrop(l.id, rows, it.center.y + dragOffset, heldOver)) }
                                     dragId = null
                                     dragOffset = 0f
                                     dragUnit = emptySet()
+                                    dropAt = null
+                                    heldOver = null
                                     pinned[0]?.release()
                                     pinned[0] = null
                                 },
@@ -309,6 +397,8 @@ fun LayersPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier) 
                                     dragId = null
                                     dragOffset = 0f
                                     dragUnit = emptySet()
+                                    dropAt = null
+                                    heldOver = null
                                     pinned[0]?.release()
                                     pinned[0] = null
                                 },
@@ -345,8 +435,10 @@ fun LayersPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier) 
                         }
                     }
                     SwipeRow(vm, l, open = swiped == l.id, enabled = dragId == null, onOpen = { swiped = if (it) l.id else null }, onPick = { vm.pickLayer(l) }) {
+                        // held over long enough to go onto it: its thumbnail (a group's line) outlined
+                        val held = (dropAt as? RowDrop.Onto)?.target == l.id
                         if (l.kind == LayerType.GROUP) {
-                            GroupRow(vm, l, shape, name, onTap, indent) { vm.toggleCollapsed(l) }
+                            GroupRow(vm, l, shape, name, onTap, indent, held) { vm.toggleCollapsed(l) }
                         } else LayerRow(
                             vm,
                             l,
@@ -367,6 +459,7 @@ fun LayersPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier) 
                             onCube = if (vm.modelOpen && l.kind != LayerType.MASK) ({ vm.toggleChannelTray(l.id) }) else null,
                             cubeLit = vm.modelOpen && l.current && vm.channelTileChosen,
                             selected = l.current && !(vm.modelOpen && vm.channelTileChosen),
+                            held = held,
                         )
                     }
                     if (vm.modelOpen && vm.channelTrayFor == l.id) ChannelTray(vm, l)
@@ -378,7 +471,7 @@ fun LayersPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier) 
                             androidx.compose.animation.fadeIn(Motion.blendOpen()),
                         exit = androidx.compose.animation.shrinkVertically(Motion.blendCloseSize(), shrinkTowards = Alignment.Top) +
                             androidx.compose.animation.fadeOut(Motion.blendClose()),
-                    ) { BlendEditor(vm, l) }
+                    ) { BlendEditor(vm, l, open = blendFor == l.id) }
                 }
             }
             if (!vm.modelOpen) {
@@ -432,9 +525,15 @@ fun LayersPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier) 
                 Box(
                     Modifier.animateItem(null, if (dragId != null || blendAt >= 0) null else Motion.rowMove(), null)
                         .padding(top = 10.dp).graphicsLayer { alpha = if (blendAt >= 0) belowShown else 1f },
-                ) { BackgroundRow(vm) }
+                ) {
+                    Column {
+                        BackgroundRow(vm)
+                        PluginLayersRows(vm)
+                    }
+                }
             }
         }
+        floating?.let { FloatingBottom(it) }
     }
     // Delete on a locked layer's row: why not, OK alone
     Alert(
@@ -511,9 +610,19 @@ private fun LayersTitleMenu(open: Boolean, vm: CanvasViewModel, onDismiss: () ->
     }
 }
 
-/** The + with plugins' kinds of layer on: a plain layer, or one of each kind, named as the plugin names it. */
+/**
+ * The + with plugins' kinds of layer on: a plain layer, or one of each kind, named as the plugin names it; with
+ * filter layers offered ([filters]), a Filter Layer that lists them ([onFilters]).
+ */
 @Composable
-private fun NewLayerMenu(open: Boolean, kinds: List<io.github.artcraftandroid.procraft.core.PluginKind>, vm: CanvasViewModel, onDismiss: () -> Unit) {
+private fun NewLayerMenu(
+    open: Boolean,
+    kinds: List<io.github.artcraftandroid.procraft.core.PluginKind>,
+    filters: Boolean,
+    vm: CanvasViewModel,
+    onDismiss: () -> Unit,
+    onFilters: () -> Unit,
+) {
     LibraryMenu(
         open,
         androidx.compose.ui.graphics.TransformOrigin(1f, 0f),
@@ -521,46 +630,63 @@ private fun NewLayerMenu(open: Boolean, kinds: List<io.github.artcraftandroid.pr
         onDismiss,
         overPanel = true,
     ) {
-        MenuItem(PcIcons.MenuNewSet, "Layer") {
+        MenuItem(PcIcons.MenuNewLayer, "Layer") {
             onDismiss()
             vm.addLayer()
         }
         for (kind in kinds) {
-            MenuItem(PcIcons.MenuNewBrush, kind.label) {
+            // beside its badge, as its layers' thumbnails show it (a plug when it draws none)
+            val badge = remember(kind) { io.github.artcraftandroid.procraft.core.pluginKindBadge(kind) }
+            val ink = Pc.MenuInk
+            MenuItem(kind.label, ink, null, onClick = {
                 onDismiss()
                 vm.addPluginLayer(kind.key)
+            }) {
+                androidx.compose.foundation.Canvas(Modifier.size(MenuBadgeWidth, MenuBadgeHeight)) { badgeDrawing(badge, ink, MenuBadgeLine.toPx()) }
+            }
+        }
+        if (filters) {
+            val badge = remember { io.github.artcraftandroid.procraft.core.filterLayerBadge() }
+            val ink = Pc.MenuInk
+            MenuItem("Filter Layer", ink, null, onClick = {
+                onDismiss()
+                onFilters()
+            }) {
+                androidx.compose.foundation.Canvas(Modifier.size(MenuBadgeWidth, MenuBadgeHeight)) { badgeDrawing(badge, ink, MenuBadgeLine.toPx()) }
             }
         }
     }
 }
 
-/** Drops [l] where its row's middle came to rest: just above or below the row it is over. */
+/** A kind's badge as a menu row's glyph: its box 1.6 times a thumbnail's (18 by 14), its lines as thick as the menu glyphs'. */
+private val MenuBadgeWidth = 28.8.dp
+private val MenuBadgeHeight = 22.4.dp
+private val MenuBadgeLine = 2.4.dp
+
 /**
- * How far row [id] stands aside while [dragged] (with the rest of [unit]) is dragged [offset] from
- * its place: past the row's middle, the row takes the room the dragged rows left, so the gap shows
- * where they will land.
+ * How far row [id] stands aside while the rows of [unit] are dragged: the rows between where they
+ * were and where they land ([place]) take the room they left, so the gap shows where they will
+ * land; held onto a row ([RowDrop.Onto]), or over their own place, none moves.
  */
-private fun makingWay(id: ULong, dragged: ULong, unit: Set<ULong>, offset: Float, rows: Map<ULong, Rect>, gap: Float): Float {
+internal fun makingWay(id: ULong, unit: Set<ULong>, place: RowDrop?, rows: Map<ULong, Rect>, gap: Float): Float {
     if (id in unit) return 0f
     val row = rows[id] ?: return 0f
-    val y = (rows[dragged] ?: return 0f).center.y + offset
     val moved = unit.mapNotNull { rows[it] }
+    if (moved.isEmpty()) return 0f
     val (top, bottom) = moved.minOf { it.top } to moved.maxOf { it.bottom }
     val room = bottom - top + gap
+    // the line between the rows they land between
+    val slot = when (place) {
+        is RowDrop.Above -> rows[place.target]?.top ?: return 0f
+        is RowDrop.Below -> rows[place.target]?.bottom ?: return 0f
+        is RowDrop.Bottom -> Float.POSITIVE_INFINITY
+        else -> return 0f
+    }
     return when {
-        row.bottom <= top && y < row.center.y -> room
-        row.top >= bottom && y > row.center.y -> -room
+        row.bottom <= top && row.top >= slot -> room
+        row.top >= bottom && row.bottom <= slot -> -room
         else -> 0f
     }
-}
-
-private fun drop(vm: CanvasViewModel, l: LayerInfo, y: Float, rows: Map<ULong, Rect>) {
-    val unit = vm.movingWith(l)
-    val others = vm.layers.filter { it.id !in unit && !vm.hidden(it) }.mapNotNull { o -> rows[o.id]?.let { o to it } }
-    val (target, row) = others.firstOrNull { (_, r) -> y >= r.top && y < r.bottom }
-        ?: others.minByOrNull { (_, r) -> abs(r.center.y - y) }
-        ?: return
-    vm.moveNextTo(l, target, above = y < row.center.y)
 }
 
 /**
@@ -684,7 +810,11 @@ private fun LockedName(l: LayerInfo, ink: Color, name: @Composable (Color, Modif
     }
 }
 
-/** A group's row: a line where a thumbnail would be, its name, its open or closed arrow and its box. */
+/**
+ * A group's row: where a thumbnail would be, a line while it is open or, closed (the row taller),
+ * a window on its layers' rows drawn small; its name, its open or closed arrow and its box. Held
+ * over by a dragged row long enough to take it ([held]), the line or window is outlined.
+ */
 @Composable
 private fun GroupRow(
     vm: CanvasViewModel,
@@ -693,22 +823,110 @@ private fun GroupRow(
     name: @Composable (Color, Modifier) -> Unit,
     onTap: () -> Unit,
     indent: Dp,
+    held: Boolean,
     onToggle: () -> Unit,
 ) {
+    val height by androidx.compose.animation.core.animateDpAsState(
+        if (l.collapsed) GroupClosedHeight else GroupHeight,
+        androidx.compose.animation.core.tween(GROUP_TURN_MS, easing = androidx.compose.animation.core.LinearEasing),
+        label = "group row",
+    )
+    // 0 open, 1 closed: the line's 20 above and below become 4, the line the window between
+    val closed = ((height - GroupHeight) / (GroupClosedHeight - GroupHeight)).coerceIn(0f, 1f)
+    val inset = androidx.compose.ui.unit.lerp(GroupLineInset, GroupWindowInset, closed)
+    val window = RoundedCornerShape(androidx.compose.ui.unit.lerp(2.dp, 4.dp, closed))
     Row(
-        Modifier.fillMaxWidth().height(GroupHeight).clip(shape)
+        Modifier.fillMaxWidth().height(height).clip(shape)
             .background(if (l.current) Pc.RowSelected else if (l.picked) PickedRow else Pc.LayerRow)
+            .labelled(l)
             .clickable(onClick = onTap)
             .padding(start = indent + GroupIndent * l.depth.toInt()),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         val ink = if (l.current || l.picked) Color.White else Pc.PanelTitle
-        Box(Modifier.padding(start = 4.dp).size(93.dp, 4.dp).clip(RoundedCornerShape(2.dp)).background(GroupLine))
+        Box(
+            Modifier.padding(start = 4.dp).size(93.dp, height - inset * 2).clip(window).background(GroupLine)
+                .then(if (held) Modifier.border(2.dp, HeldOutline, window) else Modifier),
+        ) {
+            if (closed > 0f) GroupContents(vm, l)
+        }
         LockedName(l, ink, name, Modifier.weight(1f))
         Box(Modifier.offset(x = 8.dp).size(44.dp, GroupHeight).clickable(onClick = onToggle), contentAlignment = Alignment.Center) {
             Icon(if (l.collapsed) PcIcons.ChevronRight else PcIcons.ChevronDown, contentDescription = if (l.collapsed) "Open" else "Close", tint = ink, modifier = Modifier.size(16.dp))
         }
         Box(Modifier.size(44.dp, GroupHeight).visibilityTouch(vm, l), contentAlignment = Alignment.Center) {
+            CheckBox(l.visible && !l.soloedOut, if (l.current || l.picked) Color.White else Pc.CheckFill)
+        }
+        Spacer(Modifier.width(8.dp))
+    }
+}
+
+/**
+ * A closed group's layers' rows as the panel would list them open, drawn small to fit its window's
+ * width less 1 on each side, from its top: their fills, thumbnails, names, blend letters and boxes.
+ */
+@Composable
+private fun GroupContents(vm: CanvasViewModel, group: LayerInfo) {
+    // a group closed inside it keeps its own layers out
+    val inside = vm.layers.filter { l ->
+        vm.isInside(l, group.id) && vm.layers.none { it.kind == LayerType.GROUP && it.collapsed && it.id != group.id && vm.isInside(l, it.id) && vm.isInside(it, group.id) }
+    }
+    androidx.compose.foundation.layout.BoxWithConstraints(Modifier.fillMaxSize()) {
+        val scale = (maxWidth - 2.dp) / ListWidth
+        Column(
+            Modifier.wrapContentSize(Alignment.TopStart, unbounded = true).requiredWidth(ListWidth)
+                .graphicsLayer {
+                    scaleX = scale
+                    scaleY = scale
+                    transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0f, 0f)
+                    translationX = 1.dp.toPx()
+                    translationY = 1.dp.toPx()
+                },
+            verticalArrangement = Arrangement.spacedBy(RowGap),
+        ) {
+            inside.forEach { MiniRow(vm, it, (it.depth.toInt() - group.depth.toInt() - 1).coerceAtLeast(0)) }
+        }
+    }
+}
+
+/** A row of a closed group's window, as its row in the list looks, without its controls. */
+@Composable
+private fun MiniRow(vm: CanvasViewModel, l: LayerInfo, depth: Int) {
+    val mask = l.kind == LayerType.MASK
+    val masked = vm.hasMask(l)
+    val group = l.kind == LayerType.GROUP
+    val ink = if (l.current || l.picked) Color.White else Pc.PanelTitle
+    Row(
+        Modifier.fillMaxWidth().height(if (group) GroupHeight else if (mask || masked) MaskedRowHeight else RowHeight)
+            .background(if (l.current) Pc.RowSelected else if (l.picked) PickedRow else Pc.LayerRow)
+            .labelled(l)
+            .padding(start = GroupIndent * depth),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (group) {
+            Box(Modifier.padding(start = 4.dp).size(93.dp, 4.dp).clip(RoundedCornerShape(2.dp)).background(GroupLine))
+        } else {
+            val corner = 4.dp
+            val thumbShape = when {
+                mask -> RoundedCornerShape(topStart = corner, topEnd = corner)
+                masked -> RoundedCornerShape(bottomStart = corner, bottomEnd = corner)
+                else -> RoundedCornerShape(corner)
+            }
+            Box(Modifier.padding(start = 4.dp).offset(y = if (mask) 2.dp else if (masked) (-2).dp else 0.dp)) { Thumb(vm, l, thumbShape) }
+        }
+        Text(l.name, color = ink, fontSize = 17.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f).padding(start = 29.dp, end = 6.dp))
+        if (group) {
+            Box(Modifier.offset(x = 8.dp).size(44.dp, GroupHeight), contentAlignment = Alignment.Center) {
+                Icon(if (l.collapsed) PcIcons.ChevronRight else PcIcons.ChevronDown, contentDescription = null, tint = ink, modifier = Modifier.size(16.dp))
+            }
+        } else if (mask) {
+            Spacer(Modifier.width(36.dp))
+        } else {
+            Box(Modifier.offset(x = 8.dp).size(44.dp, 47.dp), contentAlignment = Alignment.Center) {
+                Text(blendCode(vm, l.blend), color = if (l.locked && !l.current && !l.picked) LockedLetter else ink, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+            }
+        }
+        Box(Modifier.size(44.dp, 47.dp), contentAlignment = Alignment.Center) {
             CheckBox(l.visible && !l.soloedOut, if (l.current || l.picked) Color.White else Pc.CheckFill)
         }
         Spacer(Modifier.width(8.dp))
@@ -729,6 +947,7 @@ private fun LayerRow(
     onCube: (() -> Unit)? = null,
     cubeLit: Boolean = false,
     selected: Boolean = l.current,
+    held: Boolean = false,
 ) {
     val mask = l.kind == LayerType.MASK
     val masked = vm.hasMask(l)
@@ -736,6 +955,7 @@ private fun LayerRow(
         Modifier.fillMaxWidth().height(if (mask || masked) MaskedRowHeight else RowHeight).clip(shape)
             // the layer a selected mask belongs to shows a darker blue
             .background(if (selected) Pc.RowSelected else if (l.picked) PickedRow else if (owner) MaskOwnerRow else Pc.LayerRow)
+            .labelled(l)
             .clickable(onClick = onTap)
             .padding(start = indent + (if (l.clipped) 18.dp else 0.dp) + GroupIndent * l.depth.toInt()),
         verticalAlignment = Alignment.CenterVertically,
@@ -754,7 +974,7 @@ private fun LayerRow(
             masked -> (-2).dp
             else -> 0.dp
         }
-        Box(Modifier.padding(start = 4.dp).offset(y = shift)) { Thumb(vm, l, thumbShape) }
+        Box(Modifier.padding(start = 4.dp).offset(y = shift)) { Thumb(vm, l, thumbShape, held) }
         // what the layer is, under its name (which stays in the middle): the reference layer, one
         // drawing assist is on for, a private one, a model's layer shared by its texture set's meshes
         val tag = when {
@@ -866,9 +1086,11 @@ private fun CheckBox(checked: Boolean, fill: Color) {
 }
 
 @Composable
-private fun Thumb(vm: CanvasViewModel, l: LayerInfo, shape: Shape) {
+private fun Thumb(vm: CanvasViewModel, l: LayerInfo, shape: Shape, held: Boolean = false) {
     Box(
         Modifier.size(width = 93.dp, height = 61.dp).clip(shape)
+            // held over by a dragged row long enough to take it
+            .then(if (held) Modifier.border(2.dp, HeldOutline, shape) else Modifier)
             // a mask's thumbnail sits on white
             .then(
                 when {
@@ -891,38 +1113,56 @@ private fun Thumb(vm: CanvasViewModel, l: LayerInfo, shape: Shape) {
         // a plugin's layer: its kind's badge in its corner, as its manifest draws it
         l.pluginBadge?.let { badge ->
             androidx.compose.foundation.Canvas(Modifier.align(Alignment.BottomEnd).padding(3.dp).size(18.dp, 14.dp)) {
-                val (w, h) = size.width to size.height
                 drawRoundRect(PluginBadgeBehind, cornerRadius = androidx.compose.ui.geometry.CornerRadius(4.dp.toPx()))
-                for (line in badge.lines) {
-                    val p = line.points
-                    if (p.size < 4) continue
-                    val path = Path().apply {
-                        moveTo(w * p[0], h * p[1])
-                        var i = 2
-                        while (i + 1 < p.size) {
-                            if (line.curved && i + 5 < p.size) {
-                                cubicTo(w * p[i], h * p[i + 1], w * p[i + 2], h * p[i + 3], w * p[i + 4], h * p[i + 5])
-                                i += 6
-                            } else {
-                                lineTo(w * p[i], h * p[i + 1])
-                                i += 2
-                            }
-                        }
-                    }
-                    drawPath(path, Color.White, style = androidx.compose.ui.graphics.drawscope.Stroke(1.5.dp.toPx()))
-                }
-                val node = 3.dp.toPx()
-                for (i in 0 until badge.dots.size / 2) {
-                    val (x, y) = w * badge.dots[2 * i] to h * badge.dots[2 * i + 1]
-                    drawRect(Color.White, Offset(x - node / 2, y - node / 2), Size(node, node))
-                }
+                badgeDrawing(badge, Color.White, 1.5.dp.toPx())
             }
         }
     }
 }
 
+/** How wide the colour a plugin labels a layer with shows, down the left edge of its row. */
+private val LabelWidth = 5.dp
+
+/** The colour a plugin labels [l] with, if one does, down the left edge of its row. */
+private fun Modifier.labelled(l: LayerInfo): Modifier {
+    val label = l.label ?: return this
+    val colour = Color(0xFF000000L or label.toLong())
+    return drawBehind { drawRect(colour, size = Size(LabelWidth.toPx(), size.height)) }
+}
+
 /** The badge behind a plugin's layer's glyph on its thumbnail. */
 private val PluginBadgeBehind = Color(0x99000000)
+
+/**
+ * A plugin's [badge]'s lines and dots in [ink] over the whole of this scope (its box, 0 to 1 across and down): its lines
+ * [width] thick, its dots squares twice that across.
+ */
+private fun DrawScope.badgeDrawing(badge: io.github.artcraftandroid.procraft.core.PluginBadge, ink: Color, width: Float) {
+    val (w, h) = size.width to size.height
+    for (line in badge.lines) {
+        val p = line.points
+        if (p.size < 4) continue
+        val path = Path().apply {
+            moveTo(w * p[0], h * p[1])
+            var i = 2
+            while (i + 1 < p.size) {
+                if (line.curved && i + 5 < p.size) {
+                    cubicTo(w * p[i], h * p[i + 1], w * p[i + 2], h * p[i + 3], w * p[i + 4], h * p[i + 5])
+                    i += 6
+                } else {
+                    lineTo(w * p[i], h * p[i + 1])
+                    i += 2
+                }
+            }
+        }
+        drawPath(path, ink, style = androidx.compose.ui.graphics.drawscope.Stroke(width))
+    }
+    val node = width * 2
+    for (i in 0 until badge.dots.size / 2) {
+        val (x, y) = w * badge.dots[2 * i] to h * badge.dots[2 * i + 1]
+        drawRect(ink, Offset(x - node / 2, y - node / 2), Size(node, node))
+    }
+}
 
 /** The transparency checkerboard behind thumbnails. */
 private fun androidx.compose.ui.graphics.drawscope.DrawScope.checker() {
@@ -953,7 +1193,7 @@ private fun blendCode(vm: CanvasViewModel, blend: UInt): String {
 private val TWO_LETTER_BLENDS = setOf("Darken", "Shade", "Lighten", "Subtract", "Divide", "Saturation")
 
 @Composable
-private fun BlendEditor(vm: CanvasViewModel, l: LayerInfo) {
+private fun BlendEditor(vm: CanvasViewModel, l: LayerInfo, open: Boolean) {
     var opacity by remember(l.id) { mutableFloatStateOf(l.opacity) }
     Column(Modifier.fillMaxWidth().padding(top = 22.dp, bottom = 15.dp)) {
         Row(Modifier.padding(horizontal = 13.dp).fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -968,43 +1208,128 @@ private fun BlendEditor(vm: CanvasViewModel, l: LayerInfo) {
             },
             onDone = { vm.setLayerOpacity(l, opacity, done = true) },
         )
-        // a picker: the rows snap to the list's middle and the row there is the layer's mode (set
-        // once a scroll settles); the ends padded so every row can reach the middle, the layer's
-        // mode there when it opens
+        // a picker: the rows slide under a band fixed in the middle, the row there the layer's mode
+        // as it moves (one undo step a movement); let go, the list slows straight onto a row; a
+        // tap on another row makes it the mode at once and scrolls it to the band, untouchable
         val modes = vm.blendModeList
-        val layer by rememberUpdatedState(l)
+        val owner = vm.session
+        var shownMode by remember(owner, l.id) { mutableStateOf(l.blend) }
+        var tapping by remember(owner, l.id) { mutableStateOf(false) }
         val list = rememberLazyListState(modes.indexOfFirst { it.id == l.blend }.coerceAtLeast(0))
         val scope = rememberCoroutineScope()
-        LaunchedEffect(list.isScrollInProgress) {
-            if (list.isScrollInProgress) return@LaunchedEffect
-            val info = list.layoutInfo
-            val middle = (info.viewportStartOffset + info.viewportEndOffset) / 2
-            val at = info.visibleItemsInfo.minByOrNull { kotlin.math.abs(it.offset + it.size / 2 - middle) } ?: return@LaunchedEffect
-            val m = modes.getOrNull(at.index) ?: return@LaunchedEffect
-            if (m.id != layer.blend) vm.setBlend(layer, m.id)
+        val density = LocalDensity.current.density
+        val (rowPx, before, after) = with(LocalDensity.current) {
+            val height = BlendRow.roundToPx()
+            val padding = BlendListHeight.roundToPx() - height
+            // Divide the padding in pixels so the last row can center at every density.
+            Triple(height, (padding / 2).toDp(), (padding - padding / 2).toDp())
         }
-        LazyColumn(
-            Modifier.padding(top = 11.dp).fillMaxWidth().height(BlendListHeight).clip(RoundedCornerShape(12.dp)).background(Pc.LayerRow),
-            state = list,
-            contentPadding = PaddingValues(vertical = (BlendListHeight - BlendRow) / 2),
-            flingBehavior = rememberSnapFlingBehavior(list, SnapPosition.Center),
+        val bandTop = with(LocalDensity.current) { before.roundToPx() }
+        val position by remember(list, rowPx) {
+            derivedStateOf { list.firstVisibleItemIndex * rowPx + list.firstVisibleItemScrollOffset }
+        }
+        val centered by remember(rowPx) { derivedStateOf { (position + rowPx / 2) / rowPx } }
+        val fling = remember(rowPx, density, modes.size) { BlendFling(rowPx, density, modes.size) { position } }
+
+        fun preview(index: Int) {
+            val mode = modes.getOrNull(index) ?: return
+            if (tapping || mode.id == shownMode) return
+            shownMode = mode.id
+            vm.previewBlend(owner, l.id, mode.id)
+        }
+
+        LaunchedEffect(open, owner, list, modes, rowPx) {
+            if (!open) return@LaunchedEffect
+            // the mode under the band as the list moves, by finger or by itself
+            launch { snapshotFlow { centered }.collect { preview(it) } }
+            snapshotFlow { if (list.isScrollInProgress) null else position }.collect { idlePosition ->
+                if (idlePosition == null) return@collect
+                // Give a fling starting as the drag ends a frame to take over the list.
+                withFrameNanos { }
+                if (list.isScrollInProgress || position != idlePosition || tapping) return@collect
+                if (position % rowPx != 0) {
+                    // stopped between rows (a touch caught it moving): onto the nearest
+                    val coast = blendCoast(position / density, 0f, rowPx / density, modes.size.toUInt())
+                    coroutineScope { launch { list.scroll { followBlend(rowPx, density, { position }) { blendCoastAt(coast, it) } } } }
+                } else {
+                    preview(centered)
+                    vm.finishBlend(owner)
+                }
+            }
+        }
+        DisposableEffect(open, owner, l.id) {
+            onDispose { if (open) vm.finishBlend(owner) }
+        }
+        LaunchedEffect(open, l.blend, rowPx) {
+            if (!open || l.blend == shownMode) return@LaunchedEffect
+            // Undo and redo can change the mode while the picker is open.
+            shownMode = l.blend
+            val index = modes.indexOfFirst { it.id == l.blend }
+            if (index >= 0) list.scrollToItem(index)
+        }
+
+        val highlight = Pc.RowSelected
+        Box(
+            Modifier.padding(top = 11.dp).fillMaxWidth().height(BlendListHeight)
+                .clip(RoundedCornerShape(12.dp)).background(Pc.LayerRow)
+                .drawBehind { drawRect(highlight, Offset(0f, bandTop.toFloat()), Size(size.width, rowPx.toFloat())) },
         ) {
-            itemsIndexed(modes) { i, m ->
-                val chosen = m.id == l.blend
-                val ink = if (chosen) Color.White else Pc.PanelTitle
-                Row(
-                    Modifier.fillMaxWidth().height(BlendRow).background(if (chosen) Pc.RowSelected else Color.Transparent)
-                        .clickable { scope.launch { list.animateScrollToItem(i) } }.padding(start = 12.dp, end = 18.5.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(m.name, color = ink, fontSize = 17.sp, maxLines = 1, modifier = Modifier.weight(1f))
-                    // its 26 frame centred 31.5 in from the right; grey unless chosen
-                    PcIcons.BlendGlyphs[m.name]?.let {
-                        Icon(it, contentDescription = null, tint = if (chosen) Color.White else BlendGlyphInk, modifier = Modifier.size(26.dp))
+            LazyColumn(
+                Modifier.fillMaxSize(),
+                state = list,
+                contentPadding = PaddingValues(top = before, bottom = after),
+                flingBehavior = fling,
+                userScrollEnabled = !tapping,
+            ) {
+                itemsIndexed(modes) { i, m ->
+                    Box(
+                        Modifier.fillMaxWidth().height(BlendRow)
+                            .clickable(enabled = !tapping) {
+                                val from = position / density
+                                val to = blendTap(i.toUInt(), from, rowPx / density, modes.size.toUInt()) ?: return@clickable
+                                shownMode = m.id
+                                vm.setBlend(l, m.id)
+                                tapping = true
+                                scope.launch {
+                                    try {
+                                        list.scroll(MutatePriority.PreventUserInput) {
+                                            followBlend(rowPx, density, { position }) { blendTapAt(from, to, it) }
+                                        }
+                                    } finally {
+                                        tapping = false
+                                    }
+                                }
+                            },
+                    ) {
+                        // grey outside the band and white inside it: a name half under it is half and half
+                        BlendLabel(
+                            m.name, Pc.PanelTitle, BlendGlyphInk,
+                            Modifier.drawWithContent {
+                                val (top, bottom) = blendBandInRow(position, i, rowPx)
+                                clipRect(top = top, bottom = bottom, clipOp = ClipOp.Difference) { this@drawWithContent.drawContent() }
+                            },
+                        )
+                        BlendLabel(
+                            m.name, Color.White, Color.White,
+                            // (read out once, from the grey copy)
+                            Modifier.clearAndSetSemantics { }.drawWithContent {
+                                val (top, bottom) = blendBandInRow(position, i, rowPx)
+                                clipRect(top = top, bottom = bottom) { this@drawWithContent.drawContent() }
+                            },
+                        )
                     }
                 }
             }
         }
+    }
+}
+
+/** A blend mode's name and glyph, in [ink] and [glyphInk]. */
+@Composable
+private fun BlendLabel(name: String, ink: Color, glyphInk: Color, modifier: Modifier = Modifier) {
+    Row(modifier.fillMaxSize().padding(start = 12.dp, end = 18.5.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(name, color = ink, fontSize = 17.sp, maxLines = 1, modifier = Modifier.weight(1f))
+        PcIcons.BlendGlyphs[name]?.let { Icon(it, contentDescription = null, tint = glyphInk, modifier = Modifier.size(26.dp)) }
     }
 }
 
@@ -1096,6 +1421,7 @@ private fun LayerOptions(open: Boolean, vm: CanvasViewModel, l: LayerInfo, rowY:
                         LayerOption.INVERT -> { { vm.invertLayer(l) } }
                         LayerOption.REFERENCE -> { { vm.toggleReference(l) } }
                         LayerOption.EDIT_TEXT -> { { vm.editText(l) } }
+                        LayerOption.FILTER_SETTINGS -> { { vm.startFilterLayerSettings(l) } }
                         LayerOption.RASTERIZE -> { { vm.rasterize(l) } }
                         LayerOption.RECOLOUR -> { { vm.restyleStrokes(l, colour = true) } }
                         LayerOption.APPLY_BRUSH -> { { vm.restyleStrokes(l, colour = false) } }
@@ -1267,6 +1593,24 @@ private fun BackgroundRow(vm: CanvasViewModel) {
             CheckBox(bg.visible, Pc.CheckFill)
         }
         Spacer(Modifier.width(8.dp))
+    }
+}
+
+/**
+ * The actions the plugins that are on put in the Layers panel, under the background's row: a row
+ * each, by its label, as the background's is drawn. A tap runs it, as one in the Canvas tab does.
+ */
+@Composable
+private fun PluginLayersRows(vm: CanvasViewModel) {
+    val actions = remember(vm.pluginList) { vm.plugins.actionsIn(io.github.artcraftandroid.procraft.core.PluginPlace.LAYERS) }
+    for (action in actions) {
+        Row(
+            Modifier.padding(top = 10.dp).fillMaxWidth().height(50.dp).clip(RoundedCornerShape(17.dp)).background(Pc.BackgroundRow)
+                .clickable { vm.runPluginAction(action.key) },
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(action.label, color = Pc.PanelTitle, fontSize = 17.sp, maxLines = 1, modifier = Modifier.weight(1f).padding(start = 18.dp, end = 18.dp))
+        }
     }
 }
 

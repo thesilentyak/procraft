@@ -156,6 +156,13 @@ const PART_CARD: egui::Vec2 = vec2(340.0, 111.0);
 const PART_CARD_FILL: u32 = 0xFF212121;
 const COMBINE_ROW: f32 = 51.0;
 const PART_CARD_GAP: f32 = 3.0;
+/// The Uncombine callout a held Secondary card shows: its size, how far under the press it hangs,
+/// how long the press is held first (seconds), and its light fill and dark word, as measured.
+const CALLOUT: egui::Vec2 = vec2(104.0, 36.0);
+const CALLOUT_DROP: f32 = 10.0;
+const CALLOUT_HOLD: f64 = 0.5;
+const CALLOUT_FILL: u32 = 0xFFE9E9E9;
+const CALLOUT_INK: u32 = 0xFF1C1C1C;
 
 const PAGES: &[Page] = &[
     Page {
@@ -723,9 +730,11 @@ pub struct Studio {
     randomise_tapped: bool,
     /// The frame the pad menu opened in (the press that opened it doesn't close it).
     pad_menu_frame: u64,
-    /// The brush's sample stroke, and when it is drawn again.
+    /// The brush's sample stroke, when it is drawn again, and the one being drawn on a thread of its
+    /// own (a plugin's brush engine may take seconds over a brush's first).
     preview: Option<TextureHandle>,
     preview_due: Option<Instant>,
+    preview_drawing: Option<std::sync::mpsc::Receiver<Option<egui::ColorImage>>>,
     /// The source images, by kind; the Disclosure cards open.
     sources: HashMap<String, TextureHandle>,
     open_cards: HashSet<&'static str>,
@@ -745,6 +754,10 @@ pub struct Studio {
     part_previews: [Option<TextureHandle>; 2],
     parts_stale: bool,
     part_cards: Option<Pos2>,
+    /// The Secondary card pressed (when, where), and the Uncombine callout a held press shows
+    /// (where the press was).
+    part_press: Option<(f64, Pos2)>,
+    part_callout: Option<Pos2>,
     /// A wide window (the pages' card, sources as squares); the brush's About; the pad shown as a
     /// sphere (and since when it was told).
     wide: bool,
@@ -771,6 +784,8 @@ impl Studio {
         self.other_tab = 0;
         self.parts_stale = self.dual;
         self.part_cards = None;
+        self.part_press = None;
+        self.part_callout = None;
         self.new_brush = new;
         // white on the dark pad, black on the light
         self.pad_colour = if crate::look::light() { PAD_BLACK } else { PAD_WHITE };
@@ -874,16 +889,17 @@ impl Studio {
     }
 
     /// The parts as cards over the column, Combine Mode between them: a card tapped shows that
-    /// part and they stay; a tap anywhere else closes them.
+    /// part and they stay; the Secondary card held offers Uncombine in a callout under the press;
+    /// a tap anywhere else closes them.
     fn part_cards_view(&mut self, ctx: &egui::Context, look: &mut Look, session: &CanvasSession) {
         let Some(at) = self.part_cards else { return };
         let row_top = at.y + PART_CARD.y + PART_CARD_GAP;
         let row = Rect::from_min_size(pos2(at.x, row_top), vec2(PART_CARD.x, COMBINE_ROW));
         let below = pos2(at.x, row.bottom() + PART_CARD_GAP);
-        // Uncombine under them
-        let parting =
-            Rect::from_min_size(pos2(at.x, below.y + PART_CARD.y + PART_CARD_GAP), vec2(PART_CARD.x, COMBINE_ROW));
-        let whole = Rect::from_min_size(at, vec2(PART_CARD.x, parting.bottom() - at.y));
+        let whole = Rect::from_min_size(at, vec2(PART_CARD.x, below.y + PART_CARD.y - at.y));
+        let now = ctx.input(|i| i.time);
+        let callout =
+            self.part_callout.map(|p| Rect::from_center_size(pos2(p.x, p.y + CALLOUT_DROP + CALLOUT.y / 2.0), CALLOUT));
         egui::Area::new(Id::unique("studio parts")).fixed_pos(at).order(Order::Foreground).show(ctx, |ui| {
             ui.allocate_rect(whole, Sense::click());
             ui.painter().rect_filled(whole, 12, argb(TABS_FILL));
@@ -896,7 +912,23 @@ impl Studio {
                 let ink = if on { Color32::WHITE } else { argb(PAGE_INK) };
                 text(ui.painter(), label, Align2::LEFT_TOP, name, 12.5, Weight::SemiBold, ink);
                 self.part_preview(ui, i, card.shrink2(vec2(30.0, 20.0)));
-                if ui.interact(card, ui.scope_id().with(("part card", i)), Sense::click()).clicked() {
+                let response = ui.interact(card, ui.scope_id().with(("part card", i)), Sense::click_and_drag());
+                if second {
+                    // held still: the Uncombine callout under the press, the press itself taken
+                    if response.is_pointer_button_down_on() && !response.dragged() {
+                        let press = *self
+                            .part_press
+                            .get_or_insert((now, response.interact_pointer_pos().unwrap_or(card.center())));
+                        if self.part_callout.is_none() && now - press.0 >= CALLOUT_HOLD {
+                            self.part_callout = Some(press.1);
+                        } else if self.part_callout.is_none() {
+                            ui.ctx().request_repaint();
+                        }
+                    } else {
+                        self.part_press = None;
+                    }
+                }
+                if response.clicked() && self.part_callout.is_none() {
                     self.show_part(ctx, session, second);
                 }
             }
@@ -913,26 +945,48 @@ impl Studio {
             if ui.interact(row, ui.scope_id().with("combine mode"), Sense::click()).clicked() {
                 self.blend_list = Some((COMBINE_MODE, row.center().y, true));
             }
-            let left = pos2(parting.left() + 11.0, parting.center().y);
-            text(ui.painter(), left, Align2::LEFT_CENTER, "Uncombine", 17.0, Weight::Regular, argb(pc::ACCENT));
-            if ui.interact(parting, ui.scope_id().with("uncombine"), Sense::click()).clicked() {
-                self.part_cards = None;
-                self.uncombine_alert.ask(crate::alert::Asking {
-                    title: "Uncombine these brushes?".into(),
-                    message: "The pair becomes two brushes again, side by side in the set. It can't be undone.".into(),
-                    action: "Uncombine".into(),
-                    icon: None,
-                    destructive: false,
-                    extra: None,
-                    first: None,
-                    alone: false,
-                });
-            }
         });
-        let outside =
-            ctx.input(|i| i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| !whole.contains(p)));
-        if outside && self.blend_list.is_none() {
-            self.part_cards = None;
+        if let Some(rect) = callout {
+            egui::Area::new(Id::unique("studio uncombine")).fixed_pos(rect.min).order(Order::Tooltip).show(ctx, |ui| {
+                ui.allocate_rect(rect, Sense::click());
+                ui.painter().rect_filled(rect, CALLOUT.y / 2.0, argb(CALLOUT_FILL));
+                text(
+                    ui.painter(),
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    "Uncombine",
+                    15.0,
+                    Weight::Regular,
+                    argb(CALLOUT_INK),
+                );
+                if ui.interact(rect, ui.scope_id().with("uncombine"), Sense::click()).clicked() {
+                    self.part_cards = None;
+                    self.part_callout = None;
+                    self.part_press = None;
+                    self.uncombine_alert.ask(crate::alert::Asking {
+                        title: "Uncombine these brushes?".into(),
+                        message: "The pair becomes two brushes again, side by side in the set. It can't be undone."
+                            .into(),
+                        action: "Uncombine".into(),
+                        icon: Some(&icons::ALERT_QUESTION),
+                        destructive: false,
+                        extra: None,
+                        first: None,
+                        alone: false,
+                    });
+                }
+            });
+        }
+        // a press outside the callout closes it (one outside the cards, them too)
+        let pressed = ctx.input(|i| i.pointer.any_pressed().then(|| i.pointer.interact_pos()).flatten());
+        if let Some(p) = pressed {
+            if callout.is_some_and(|c| !c.contains(p)) {
+                self.part_callout = None;
+            }
+            if !whole.contains(p) && callout.is_none_or(|c| !c.contains(p)) && self.blend_list.is_none() {
+                self.part_cards = None;
+                self.part_callout = None;
+            }
         }
     }
 
@@ -998,9 +1052,19 @@ impl Studio {
             return None;
         }
         self.plugin_rows = plugin_rows(&prefs.plugins);
-        if self.preview_due.is_some_and(|due| Instant::now() >= due) {
+        if let Some(drawing) = &self.preview_drawing {
+            match drawing.try_recv() {
+                Ok(image) => {
+                    self.preview = image.map(|i| ctx.load_texture("studio preview", i, egui::TextureOptions::LINEAR));
+                    self.preview_drawing = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint_after(Duration::from_millis(50)),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.preview_drawing = None,
+            }
+        }
+        if self.preview_due.is_some_and(|due| Instant::now() >= due) && self.preview_drawing.is_none() {
             self.preview_due = None;
-            self.preview = brush_preview(ctx, session);
+            self.preview_drawing = brush_preview(session);
         } else if let Some(due) = self.preview_due {
             ctx.request_repaint_after(due.saturating_duration_since(Instant::now()));
         }
@@ -1692,6 +1756,9 @@ impl Studio {
         if response.drag_started() {
             self.pad_menu = false;
             pad.begin_own_stroke();
+            if let Some((id, _)) = pen {
+                pad.set_pen_tilt_known(crate::pen::lean(id).is_some());
+            }
             pad.stroke_begin(kind, vec![sample(p, None)]);
             self.pad_stroke = true;
         } else if self.pad_stroke && response.dragged() {
@@ -1977,12 +2044,20 @@ fn control_height(c: &Control, width: f32) -> f32 {
     }
 }
 
-/// The brush's sample stroke for the Preview page's card.
-fn brush_preview(ctx: &egui::Context, session: &CanvasSession) -> Option<TextureHandle> {
-    let b = session.current_brush();
-    let t = session.brush_preview(b.set, b.index, 1060, 324)?;
-    let image = egui::ColorImage::from_rgba_premultiplied([t.width as usize, t.height as usize], &t.rgba);
-    Some(ctx.load_texture("studio preview", image, egui::TextureOptions::LINEAR))
+/// The brush's sample stroke for the Preview page's card, drawn on a thread of its own: the
+/// interface never waits on it (a plugin's brush engine may take seconds over a brush's first).
+fn brush_preview(session: &Arc<CanvasSession>) -> Option<std::sync::mpsc::Receiver<Option<egui::ColorImage>>> {
+    let (done, drawing) = std::sync::mpsc::channel();
+    let session = Arc::clone(session);
+    let thread = std::thread::Builder::new().name("studio preview".into());
+    let started = thread.spawn(move || {
+        let b = session.current_brush();
+        let image = session
+            .brush_preview(b.set, b.index, 1060, 324)
+            .map(|t| egui::ColorImage::from_rgba_premultiplied([t.width as usize, t.height as usize], &t.rgba));
+        let _ = done.send(image);
+    });
+    started.ok().map(|_| drawing)
 }
 
 /// A blend mode's name, as the picker shows it (a file may give the grain a layer mode its list
@@ -2741,7 +2816,8 @@ mod tests {
     }
 
     impl Open {
-        fn frame(&mut self, events: Vec<Event>) {
+        /// A frame, and what it drew.
+        fn frame(&mut self, events: Vec<Event>) -> Vec<egui::epaint::ClippedShape> {
             self.time += 1.0 / 60.0;
             let raw = RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1200.0, 700.0))),
@@ -2754,6 +2830,7 @@ mod tests {
                 studio.show(ui.ctx(), look, session, prefs);
             });
             output.textures_delta.clear();
+            output.shapes
         }
 
         fn click(&mut self, at: Pos2) {
@@ -2766,6 +2843,111 @@ mod tests {
             self.frame(vec![Event::PointerMoved(at), button(true)]);
             self.frame(vec![button(false)]);
         }
+    }
+
+    /// Where `words` were drawn among a frame's `shapes` (their top left), if they were.
+    fn drawn(shapes: &[egui::epaint::ClippedShape], words: &str) -> Option<Pos2> {
+        fn find(shape: &egui::Shape, words: &str) -> Option<Pos2> {
+            match shape {
+                egui::Shape::Text(t) if t.galley.text() == words => Some(t.pos),
+                egui::Shape::Vec(all) => all.iter().find_map(|s| find(s, words)),
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|c| find(&c.shape, words))
+    }
+
+    #[test]
+    fn a_page_scrolls_with_a_pen_dragged_up_it_as_a_touch_or_as_the_mouse_pointer() {
+        let open = || {
+            let mut open = Open {
+                ctx: egui::Context::default(),
+                look: Look::default(),
+                prefs: crate::prefs::Prefs::default(),
+                studio: Studio::default(),
+                session: CanvasSession::new(64, 64),
+                time: 0.0,
+            };
+            open.studio.begin(&open.ctx.clone(), &open.session, None);
+            // a page longer than the window
+            open.studio.tab = PAGES.iter().position(|p| p.name == "Color dynamics").unwrap();
+            open.frame(Vec::new());
+            open.frame(Vec::new());
+            open
+        };
+        let heading = "Stroke color jitter";
+        // how far up a pen dragged 200 points up from the heading takes it, the interface told it
+        // is on a touch screen first if `told` (egui drags a list only once it has had a touch,
+        // from the frame after)
+        let scrolled = |touches: bool, told: bool| {
+            let mut open = open();
+            if told {
+                let mut raw = RawInput::default();
+                crate::input::PenTouchScreen::default().tell(&mut raw, true);
+                open.frame(raw.events);
+            }
+            let from = drawn(&open.frame(Vec::new()), heading).unwrap();
+            let mut last = Vec::new();
+            for events in crate::input::pen_drag(from + vec2(10.0, 8.0), vec2(0.0, -200.0), touches) {
+                last = open.frame(events);
+            }
+            from.y - drawn(&last, heading).unwrap().y
+        };
+        // the system's pen, which has touched before: its touches drag the page
+        let by_touch = scrolled(true, true);
+        assert!(by_touch > 150.0, "{by_touch}");
+        // a tablet's pen moving the mouse pointer: egui drags a list only on a touch screen
+        assert_eq!(scrolled(false, false), 0.0, "the mouse pointer alone");
+        let by_pointer = scrolled(false, true);
+        assert!(by_pointer > 150.0, "{by_pointer}");
+    }
+
+    #[test]
+    fn a_dual_brush_s_secondary_card_held_offers_uncombine_which_asks_first() {
+        let session = CanvasSession::new(64, 64);
+        // in the set of ours from before, whose brushes are no dual brushes
+        let ours = session.brush_library().len() as u32 - 1;
+        assert!(session.select_brush(ours, 0) && session.combine_brushes(ours, 0, 1));
+        let mut open = Open {
+            ctx: egui::Context::default(),
+            look: Look::default(),
+            prefs: crate::prefs::Prefs::default(),
+            studio: Studio::default(),
+            session,
+            time: 0.0,
+        };
+        open.studio.begin(&open.ctx.clone(), &open.session, None);
+        assert!(open.studio.dual);
+        open.frame(Vec::new());
+        // the cards opened over the studio, as tapping the shown part does
+        let at = pos2(8.0, 46.0);
+        open.studio.part_cards = Some(at);
+        open.frame(Vec::new());
+        open.frame(Vec::new());
+        // the cards: the first, Combine Mode, the second; no Uncombine row under them
+        let second = pos2(at.x + 170.0, at.y + PART_CARD.y + PART_CARD_GAP + COMBINE_ROW + PART_CARD_GAP + 55.0);
+        let button = |pressed| Event::PointerButton {
+            pos: second,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        open.frame(vec![Event::PointerMoved(second), button(true)]);
+        for _ in 0..12 {
+            open.frame(Vec::new());
+        }
+        assert!(open.studio.part_callout.is_none(), "a short hold is still a tap");
+        for _ in 0..30 {
+            open.frame(Vec::new());
+        }
+        assert_eq!(open.studio.part_callout, Some(second), "held, the callout comes under the press");
+        open.frame(vec![button(false)]);
+        assert!(!open.studio.second, "letting go of the hold doesn't show the second");
+        // the callout hangs under the press; tapped, it asks before parting the pair
+        open.click(pos2(second.x, second.y + CALLOUT_DROP + CALLOUT.y / 2.0));
+        assert!(open.studio.uncombine_alert.is_open());
+        assert!(open.studio.part_cards.is_none() && open.studio.part_callout.is_none());
+        assert!(open.session.studio_is_dual(), "nothing parted before the answer");
     }
 
     #[test]

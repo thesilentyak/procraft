@@ -140,7 +140,7 @@ fn write(folder: &Path, id: u64, pixels: &[u8]) -> bool {
     let written = fs::create_dir_all(folder).map_err(|e| crate::project::file_error("keeping a brush's grain", e));
     let written = written.and_then(|()| {
         crate::project::write_atomically(&path, |p| {
-            fs::write(p, pixels).map_err(|e| crate::project::file_error("keeping a brush's grain", e))
+            crate::storage::write(p, pixels).map_err(|e| crate::project::file_error("keeping a brush's grain", e))
         })
     });
     if let Err(e) = &written {
@@ -633,6 +633,63 @@ mod tests {
             let (_, style, _) = st.stroke_brush(crate::ToolKind::Paint, layer);
             assert!(style.full_grain.is_some() && style.grain_side == 1024.0, "{mode:?}");
         }
+    }
+
+    /// A dual brush whose second has a grain of its own, an image 1500 pixels a side (the first
+    /// a plain round pen).
+    fn dual_file_with_a_grainy_second() -> Vec<u8> {
+        let mut second = Brush { name: "Grainy".to_owned(), ..Brush::round_pen() };
+        second.grain.mode = GrainMode::Moving;
+        second.grain.depth = 1.0;
+        let first = Brush { name: "Paired".to_owned(), secondary: Some(Box::new(second)), ..Brush::round_pen() };
+        let side = 1500u32;
+        let pixels: Vec<u8> = (0..side * side).map(|i| (i % 251) as u8).collect();
+        let (shape, grain) = (sized_gray_png(8, 8, &[255; 64]), sized_gray_png(side, side, &pixels));
+        let thumbnail = crate::project::rgba_png(1, 1, &[0, 0, 0, 0]);
+        let plain = |secondary| Pictures {
+            shape_png: &shape,
+            grain_png: None,
+            metallic_png: None,
+            roughness_png: None,
+            thumbnail_png: &thumbnail,
+            author_png: None,
+            signature_png: None,
+            secondary,
+        };
+        let second = Pictures { grain_png: Some(&grain), ..plain(None) };
+        brushfile::write(&first, "", &plain(Some(Box::new(second))))
+    }
+
+    #[test]
+    fn a_dual_brush_s_second_draws_and_keeps_its_own_grain_at_its_own_size() {
+        let dir = folder("second-grain");
+        let s = CanvasSession::new(64, 64);
+        s.save_brush_library_file(dir.join("library.json").to_string_lossy().into_owned());
+        let set = s.import_brushes(dual_file_with_a_grainy_second()).unwrap();
+        let second = |s: &CanvasSession| {
+            let st = s.shared.lock();
+            let paired = st.library.iter().find_map(|set| set.brushes.iter().find(|b| b.name == "Paired")).cloned();
+            *paired.unwrap().secondary.unwrap()
+        };
+        // kept from the file at the most a grain keeps (it was read at 256 before)
+        let full = second(&s).grain_file_now().and_then(|f| f.full.clone()).expect("the second's own image");
+        assert_eq!(full.side, 1024);
+        // its stroke reads it
+        if let Ok(gpu) = procraft_gpu::Gpu::headless() {
+            s.use_gpu(gpu);
+            assert!(s.select_brush(set, 0));
+            let mut st = s.shared.lock();
+            let layer = st.doc.current();
+            let (first, style, _) = st.stroke_brush(crate::ToolKind::Paint, layer);
+            let (_, second, _) = st.second_brush(crate::ToolKind::Paint, layer, &first, &style).unwrap();
+            assert!(second.style.full_grain.is_some() && second.style.grain_side == 1024.0);
+        }
+        // and written out with it, it comes back with it
+        let bytes = s.brush_as_file(set, 0).unwrap();
+        let other = CanvasSession::new(64, 64);
+        other.import_brushes(bytes).unwrap();
+        assert_eq!(second(&other).grain_file_now().and_then(|f| f.full.as_ref()).map(|g| g.side), Some(1024));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

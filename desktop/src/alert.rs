@@ -138,6 +138,19 @@ impl Alert {
         self.open
     }
 
+    /// Up again at once, whole, just as it was (after an answer that keeps it asking).
+    pub fn reopen(&mut self) {
+        self.open = true;
+        let came_in = std::time::Duration::from_secs_f32(IN);
+        self.since = Some(Instant::now().checked_sub(came_in).unwrap_or_else(Instant::now));
+    }
+
+    /// What it asks, or last asked.
+    #[cfg(test)]
+    pub fn asking(&self) -> Option<&Asking> {
+        self.asking.as_ref()
+    }
+
     fn close(&mut self) {
         self.open = false;
         self.since = Some(Instant::now());

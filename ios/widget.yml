@@ -1,0 +1,59 @@
+# The home screen's Recent artwork widget (ios/RecentWidget), added to the project by project.yml
+# when PROCRAFT_WIDGET=YES:
+#
+#   PROCRAFT_WIDGET=YES ios/build-ipa.sh
+#
+# The widget is an app extension: it has a bundle id of its own and shares a folder with the app
+# (an app group), where the app keeps the picture of the artwork worked on last. Building it needs
+# no Apple account (build-ipa.sh signs nothing); installing a signed app with it needs, on the
+# developer account:
+#
+#   1. App Groups: a group with the id group.io.github.artcraftandroid.procraft
+#   2. The app's App ID (io.github.artcraftandroid.procraft): the App Groups capability on, with
+#      that group; then its provisioning profile made again (IOS_PROVISIONING_PROFILE)
+#   3. An App ID for the widget, io.github.artcraftandroid.procraft.RecentWidget, with App Groups
+#      on and the same group, and an ad hoc provisioning profile for it on the same certificate and
+#      devices (IOS_WIDGET_PROVISIONING_PROFILE, base64, for ios/sign-ipa.sh)
+#
+# Without the widget's profile, sign-ipa.sh signs the app without its widget. Without the group,
+# the app keeps no picture and the widget shows the app's mark.
+targets:
+  ProCraft:
+    dependencies:
+      - target: RecentWidget
+    entitlements:
+      path: Generated/ProCraft.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.io.github.artcraftandroid.procraft
+  RecentWidget:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: RecentWidget
+      # the app's mark, shown while there is no artwork yet
+      - path: ../android/app/src/main/res/drawable-nodpi/procraft_mark.png
+        buildPhase: resources
+    info:
+      path: Generated/RecentWidget-Info.plist
+      properties:
+        CFBundleDisplayName: Recent artwork
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    entitlements:
+      path: Generated/RecentWidget.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.io.github.artcraftandroid.procraft
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.artcraftandroid.procraft.RecentWidget
+        PRODUCT_NAME: RecentWidget
+        TARGETED_DEVICE_FAMILY: "2"
+        SWIFT_VERSION: "5.0"
+        CODE_SIGN_STYLE: Automatic
+        APPLICATION_EXTENSION_API_ONLY: YES
+        SKIP_INSTALL: YES
+        ENABLE_USER_SCRIPT_SANDBOXING: NO

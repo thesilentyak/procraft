@@ -46,6 +46,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.artcraftandroid.procraft.canvas.CanvasViewModel
 import io.github.artcraftandroid.procraft.canvas.keptPlugins
+import io.github.artcraftandroid.procraft.canvas.wideColorByDefault
 import io.github.artcraftandroid.procraft.ui.Pc
 import io.github.artcraftandroid.procraft.ui.Switch
 import io.github.artcraftandroid.procraft.ui.fittedInterfaceSize
@@ -119,6 +120,13 @@ private val Groups: List<Pair<String, List<Setting>>> = listOf(
             "A tap lands where the finger first touched, even if it drifts before lifting.", false,
         ),
     ),
+    "Display" to listOf(
+        Toggle(
+            CanvasViewModel.WIDE_COLOR, "Wide Color",
+            "Display P3 canvases show their brightest colors. Turn off if the bars blur or colors look dull on this screen.",
+            wideColorByDefault(),
+        ),
+    ),
 )
 
 @Composable
@@ -144,11 +152,25 @@ private fun SettingsScreen(prefs: android.content.SharedPreferences, onDone: () 
                     }
                 }
             }
-            // the licences of what the app is made with
+            // the licences of what the app is made with; and the app's log to share, with no canvas
+            // to open for Help's (an artwork that closes the app as it opens, say)
+            val context = androidx.compose.ui.platform.LocalContext.current
+            val scope = androidx.compose.runtime.rememberCoroutineScope()
             Column(Modifier.padding(top = 24.dp).fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Group)) {
                 Row(Modifier.fillMaxWidth().clickable { licences = true }.padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text("Licenses", color = Ink, fontSize = 17.sp, modifier = Modifier.weight(1f))
                     Text("›", color = Dim, fontSize = 20.sp)
+                }
+                Box(Modifier.padding(start = 16.dp).fillMaxWidth().height(1.dp).background(Line))
+                Row(
+                    Modifier.fillMaxWidth().clickable {
+                        io.github.artcraftandroid.procraft.ui.shareLog(context, scope) {
+                            android.widget.Toast.makeText(context, io.github.artcraftandroid.procraft.ui.LOG_NOT_READY, android.widget.Toast.LENGTH_LONG).show()
+                        }
+                    }.padding(horizontal = 16.dp, vertical = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("Share Log", color = Blue, fontSize = 17.sp)
                 }
             }
         }

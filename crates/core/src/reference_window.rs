@@ -12,6 +12,30 @@ use crate::{CanvasSession, ReferenceView};
 /// The window's imported picture, beside the artwork's layers.
 pub(crate) const REFERENCE_PICTURE: &str = "reference.png";
 
+/// The most pixels a window keeps its imported picture with on its longer side: as many as the
+/// largest window shows it with on a dense screen. A picture costs a window at most 16 MB of
+/// pixels so, however big the photo was (one 4000 square kept whole took 61 MB, and as much again
+/// where it was drawn).
+pub(crate) const PICTURE_MOST: u32 = 2048;
+
+/// The most Reference windows an artwork has open at once: its own and those a plugin lets be opened
+/// besides (the reference windows' hook).
+pub(crate) const MOST_REFERENCE_WINDOWS: usize = 8;
+
+/// The picture of window `index` besides the artwork's own (0 the first of them), beside its layers:
+/// `reference-2.png` for the second window, and so on.
+pub(crate) fn more_picture(index: usize) -> String {
+    format!("reference-{}.png", index + 2)
+}
+
+/// A window opened besides the artwork's own, kept with it as its own is: where it is and what it
+/// shows, and its imported picture, if it has one.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MoreReference {
+    pub(crate) window: ReferenceWindow,
+    pub(crate) picture: Option<Arc<Vec<u8>>>,
+}
+
 /// What the window shows. `Model`, the model itself, only on a model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum ReferenceShows {
@@ -118,6 +142,50 @@ pub(crate) fn upright(png: Vec<u8>, orientation: i64) -> Vec<u8> {
     }
 }
 
+/// A picture's size, in pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ReferencePictureSize {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// The size a window keeps a picture `width` x `height` (pixels) at: as it is up to
+/// [`PICTURE_MOST`] on its longer side, else made that big, its shape kept (a pixel at least each
+/// way).
+#[uniffi::export]
+pub fn reference_picture_size(width: u32, height: u32) -> ReferencePictureSize {
+    let long = width.max(height);
+    if long <= PICTURE_MOST {
+        return ReferencePictureSize { width, height };
+    }
+    let scale = f64::from(PICTURE_MOST) / f64::from(long);
+    let side = |v: u32| ((f64::from(v) * scale).round() as u32).clamp(1, PICTURE_MOST);
+    ReferencePictureSize { width: side(width), height: side(height) }
+}
+
+/// `png` as a window keeps it: one bigger than [`reference_picture_size`] says made that size (a
+/// PNG again); one that can't be read, or is no bigger, as it is.
+pub(crate) fn kept_picture(png: Vec<u8>) -> Vec<u8> {
+    let size = image::ImageReader::new(Cursor::new(&png))
+        .with_guessed_format()
+        .ok()
+        .and_then(|reader| reader.into_dimensions().ok());
+    let Some((width, height)) = size else { return png };
+    let kept = reference_picture_size(width, height);
+    if (kept.width, kept.height) == (width, height) {
+        return png;
+    }
+    let Ok(picture) = image::load_from_memory(&png) else { return png };
+    let whole = picture.into_rgba8();
+    let smaller = image::imageops::resize(&whole, kept.width, kept.height, image::imageops::FilterType::Triangle);
+    drop(whole);
+    let mut out = Cursor::new(Vec::new());
+    match smaller.write_to(&mut out, image::ImageFormat::Png) {
+        Ok(()) => out.into_inner(),
+        Err(_) => png,
+    }
+}
+
 /// A window's size, in points: its width, and its picture's height between the bars.
 #[derive(Clone, Copy, Debug, PartialEq, uniffi::Record)]
 pub struct ReferenceSize {
@@ -132,6 +200,16 @@ pub struct ReferenceSize {
 pub fn reference_window_size(width: f32, height: f32, screen_width: f32, screen_height: f32) -> ReferenceSize {
     let [width, height] =
         procraft_engine::reference_window::fitted_size([width, height], [screen_width, screen_height]);
+    ReferenceSize { width, height }
+}
+
+/// The size a window shows at until it is sized, on a canvas `canvas_width` x `canvas_height`
+/// pixels: 350 wide, and as tall with its bars as the canvas's shape makes it, so the canvas fills
+/// it (within the window's least and most); its width and its picture's height between the bars,
+/// points, as [`reference_window_size`] takes them.
+#[uniffi::export]
+pub fn reference_window_first_size(canvas_width: u32, canvas_height: u32) -> ReferenceSize {
+    let [width, height] = procraft_engine::reference_window::first_size([canvas_width, canvas_height]);
     ReferenceSize { width, height }
 }
 
@@ -179,8 +257,10 @@ impl CanvasSession {
         self.shared.lock().reference_picture.as_deref().cloned()
     }
 
-    /// `png` is now the window's imported picture.
+    /// `png` is now the window's imported picture, kept no bigger than [`reference_picture_size`]
+    /// says.
     pub fn set_reference_picture(&self, png: Vec<u8>) {
+        let png = kept_picture(png);
         let mut st = self.shared.lock();
         st.reference_picture = Some(Arc::new(png));
         st.revision += 1;
@@ -190,6 +270,113 @@ impl CanvasSession {
     pub fn clear_reference_picture(&self) {
         let mut st = self.shared.lock();
         if st.reference_picture.take().is_some() {
+            st.revision += 1;
+        }
+    }
+
+    /// The whole picture for the Reference windows that show the canvas, as
+    /// [`CanvasSession::canvas_thumbnail`] makes it, but read back from the GPU once while the
+    /// artwork stays as it is: every window showing the canvas takes the same, so more windows
+    /// cost no more reads. None before the canvas exists. Read once the frames have laid what
+    /// they lay a share at a time (the stroke's end it is read after), which the read would
+    /// otherwise lay at once, frames and touches waiting on it: not from the thread that draws
+    /// (both apps read it on a thread of their own).
+    pub fn reference_canvas(&self, max_side: u32) -> Option<crate::ThumbnailImage> {
+        let _ = self.shared.await_frames_laid();
+        let edits = self.edits();
+        {
+            let st = self.shared.lock();
+            if let Some((at, side, picture)) = &st.reference_canvas
+                && (*at, *side) == (edits, max_side)
+            {
+                return Some(picture.as_ref().clone());
+            }
+        }
+        let picture = self.canvas_thumbnail(max_side)?;
+        self.shared.lock().reference_canvas = Some((edits, max_side, Arc::new(picture.clone())));
+        Some(picture)
+    }
+
+    /// How many Reference windows the artwork has: its own (shown or not), then those opened
+    /// besides it, while a plugin lets more than one be open (the reference windows' hook).
+    pub fn reference_window_count(&self) -> u32 {
+        1 + self.shared.lock().more_references.len() as u32
+    }
+
+    /// Window `index` as the artwork left it: 0 its own ([`CanvasSession::reference_window`]),
+    /// then those opened besides; none past them.
+    pub fn reference_window_at(&self, index: u32) -> Option<ReferenceWindowState> {
+        let st = self.shared.lock();
+        let model = st.scene.is_some();
+        match index.checked_sub(1) {
+            None => Some(state_of(&st.reference_window, model)),
+            Some(more) => st.more_references.get(more as usize).map(|m| state_of(&m.window, model)),
+        }
+    }
+
+    /// Window `index` has changed (see [`CanvasSession::set_reference_window`]).
+    pub fn set_reference_window_at(&self, index: u32, state: ReferenceWindowState) {
+        let Some(more) = index.checked_sub(1) else { return self.set_reference_window(state) };
+        let mut st = self.shared.lock();
+        let model = st.scene.is_some();
+        let Some(m) = st.more_references.get_mut(more as usize) else { return };
+        let mut next = m.window.clone();
+        take_state(&mut next, state, model);
+        if next != m.window {
+            m.window = next;
+            st.revision += 1;
+        }
+    }
+
+    /// Window `index`'s imported picture, a PNG; none if it has none (or there is no such window).
+    pub fn reference_picture_at(&self, index: u32) -> Option<Vec<u8>> {
+        let Some(more) = index.checked_sub(1) else { return self.reference_picture() };
+        self.shared.lock().more_references.get(more as usize).and_then(|m| m.picture.as_deref().cloned())
+    }
+
+    /// `png` is now window `index`'s imported picture (see [`CanvasSession::set_reference_picture`]).
+    pub fn set_reference_picture_at(&self, index: u32, png: Vec<u8>) {
+        let Some(more) = index.checked_sub(1) else { return self.set_reference_picture(png) };
+        let png = kept_picture(png);
+        let mut st = self.shared.lock();
+        if let Some(m) = st.more_references.get_mut(more as usize) {
+            m.picture = Some(Arc::new(png));
+            st.revision += 1;
+        }
+    }
+
+    /// Window `index`'s imported picture goes.
+    pub fn clear_reference_picture_at(&self, index: u32) {
+        let Some(more) = index.checked_sub(1) else { return self.clear_reference_picture() };
+        let mut st = self.shared.lock();
+        if st.more_references.get_mut(more as usize).is_some_and(|m| m.picture.take().is_some()) {
+            st.revision += 1;
+        }
+    }
+
+    /// Another Reference window opened besides those the artwork has, as `state` says (shown): its
+    /// index. None once the artwork has as many as it may ([`MOST_REFERENCE_WINDOWS`]); how many a
+    /// plugin lets be open is the app's to keep to.
+    pub fn add_reference_window(&self, state: ReferenceWindowState) -> Option<u32> {
+        let mut st = self.shared.lock();
+        if 1 + st.more_references.len() >= MOST_REFERENCE_WINDOWS {
+            return None;
+        }
+        let model = st.scene.is_some();
+        let mut window = ReferenceWindow::default();
+        take_state(&mut window, ReferenceWindowState { shown: true, ..state }, model);
+        st.more_references.push(MoreReference { window, picture: None });
+        st.revision += 1;
+        Some(st.more_references.len() as u32)
+    }
+
+    /// Window `index` besides the artwork's own closed, its picture with it: those after it each
+    /// take the index before theirs. The artwork's own stays (hide it with its state's `shown`).
+    pub fn remove_reference_window(&self, index: u32) {
+        let Some(more) = index.checked_sub(1) else { return };
+        let mut st = self.shared.lock();
+        if (more as usize) < st.more_references.len() {
+            st.more_references.remove(more as usize);
             st.revision += 1;
         }
     }
@@ -266,6 +453,39 @@ mod tests {
     }
 
     #[test]
+    fn windows_opened_besides_come_back_with_the_artwork_each_with_its_picture() {
+        let dir = folder("more");
+        let s = CanvasSession::new(64, 48);
+        assert_eq!((s.reference_window_count(), s.reference_window_at(1)), (1, None));
+        assert_eq!(s.add_reference_window(ReferenceWindowState { shown: false, ..state() }), Some(1));
+        assert_eq!(s.add_reference_window(ReferenceWindowState { x: 90.0, ..state() }), Some(2));
+        // shown however asked for
+        assert!(s.reference_window_at(1).is_some_and(|w| w.shown));
+        s.set_reference_picture_at(2, b"second".to_vec());
+        s.save(path(&dir)).unwrap();
+        assert!(dir.join(more_picture(1)).exists() && !dir.join(more_picture(0)).exists());
+        let opened = CanvasSession::open(path(&dir)).unwrap();
+        assert_eq!(opened.reference_window_count(), 3);
+        assert_eq!(opened.reference_window_at(2).map(|w| w.x), Some(90.0));
+        assert_eq!(opened.reference_picture_at(2).as_deref(), Some(&b"second"[..]));
+        assert_eq!((opened.reference_picture_at(1), opened.reference_window_at(3)), (None, None));
+        // the artwork's own is as it was
+        assert!(!opened.reference_window().shown);
+        // the first of them closed: the next takes its index, its picture with it
+        opened.remove_reference_window(1);
+        assert_eq!(opened.reference_window_count(), 2);
+        assert_eq!(opened.reference_picture_at(1).as_deref(), Some(&b"second"[..]));
+        opened.save(path(&dir)).unwrap();
+        assert!(dir.join(more_picture(0)).exists() && !dir.join(more_picture(1)).exists());
+        // eight at once at most
+        for _ in 0..10 {
+            opened.add_reference_window(state());
+        }
+        assert_eq!(opened.reference_window_count() as usize, MOST_REFERENCE_WINDOWS);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn two_artworks_keep_windows_of_their_own() {
         let (one, two) = (folder("one"), folder("two"));
         let a = CanvasSession::new(64, 48);
@@ -321,6 +541,7 @@ mod tests {
             time_lapse: None,
             reference: Some(&window),
             reference_picture: Some(png.get_ref()),
+            turns: 0,
         });
         let package = std::env::temp_dir().join(format!("procraft-reference-package-{}.procraft", std::process::id()));
         std::fs::write(&package, &bytes).unwrap();
@@ -398,6 +619,7 @@ mod tests {
             time_lapse: None,
             reference: Some(&window),
             reference_picture: None,
+            turns: 0,
         });
         let package = std::env::temp_dir().join(format!("procraft-reference-3d-{}.procraft", std::process::id()));
         std::fs::write(&package, &bytes).unwrap();
@@ -434,6 +656,65 @@ mod tests {
         assert_eq!(place(f32::NAN, f32::INFINITY), ReferencePlace { x: 0.0, y: 0.0 });
         let big = reference_window_fitted(50.0, 50.0, 800.0, 900.0, 600.0, 400.0);
         assert_eq!(big, ReferencePlace { x: 0.0, y: 0.0 });
+    }
+
+    /// A picture `width` x `height` as a PNG: a gradient, quick to make and to pack.
+    fn picture(width: u32, height: u32) -> Vec<u8> {
+        let pixels = image::RgbImage::from_fn(width, height, |x, y| image::Rgb([x as u8, y as u8, (x ^ y) as u8]));
+        let mut png = Cursor::new(Vec::new());
+        pixels.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        png.into_inner()
+    }
+
+    #[test]
+    fn a_big_picture_is_kept_no_bigger_than_the_largest_window_shows_it() {
+        // a 4000 square, a 48 and a 200 megapixel photo, one at the most, one smaller, a strip
+        let cases = [
+            ((4000, 4000), (2048, 2048)),
+            ((8000, 6000), (2048, 1536)),
+            ((16320, 12240), (2048, 1536)),
+            ((3000, 5000), (1229, 2048)),
+            ((2048, 1000), (2048, 1000)),
+            ((1000, 500), (1000, 500)),
+            ((1, 10000), (1, 2048)),
+            ((0, 0), (0, 0)),
+        ];
+        for ((w, h), (kw, kh)) in cases {
+            assert_eq!(reference_picture_size(w, h), ReferencePictureSize { width: kw, height: kh }, "{w} x {h}");
+        }
+        // a 4000 square's pixels as a window holds them: 16 MiB, where kept whole (all the app
+        // made smaller was a picture over 4096) they took 61 MiB, and as much again drawn
+        let kept = reference_picture_size(4000, 4000);
+        let bytes = |w: u32, h: u32| f64::from(w) * f64::from(h) * 4.0 / f64::from(1 << 20);
+        let (now, whole) = (bytes(kept.width, kept.height), bytes(4000, 4000));
+        println!(
+            "a 4000 x 4000 picture is held at {} x {}: {now:.1} MiB (whole {whole:.1} MiB)",
+            kept.width, kept.height
+        );
+        assert!(now <= 16.0, "{now} MiB");
+    }
+
+    #[test]
+    fn a_big_picture_given_to_a_window_is_kept_smaller_and_a_small_one_as_it_was() {
+        let s = CanvasSession::new(64, 48);
+        let big = picture(4000, 3000);
+        s.set_reference_picture(big.clone());
+        let held = s.reference_picture().unwrap();
+        let kept = image::load_from_memory(&held).unwrap();
+        assert_eq!((kept.width(), kept.height()), (2048, 1536));
+        println!("a 4000 x 3000 PNG of {} KB is kept as one of {} KB", big.len() >> 10, held.len() >> 10);
+        assert!(held.len() < big.len() / 2, "{} {}", held.len(), big.len());
+        // the windows opened besides it likewise
+        assert_eq!(s.add_reference_window(state()), Some(1));
+        s.set_reference_picture_at(1, picture(3000, 5000));
+        let kept = image::load_from_memory(&s.reference_picture_at(1).unwrap()).unwrap();
+        assert_eq!((kept.width(), kept.height()), (1229, 2048));
+        // one no bigger, and one that can't be read, are kept byte for byte
+        let small = picture(300, 200);
+        s.set_reference_picture(small.clone());
+        assert_eq!(s.reference_picture(), Some(small));
+        s.set_reference_picture_at(1, b"not a picture".to_vec());
+        assert_eq!(s.reference_picture_at(1).as_deref(), Some(&b"not a picture"[..]));
     }
 
     #[test]

@@ -348,47 +348,141 @@ fn hsb_to_rgb(h: f32, s: f32, v: f32) -> u32 {
     hsb(f64::from(h), f64::from(s), f64::from(v))
 }
 
-/// Up to `count` colours standing for `pixels` (0xRRGGBB): the colours split again and again at
-/// the middle of their widest channel, each part's mean kept; lightest first.
+/// How many colours a palette made from a picture is picked from: one more than it holds.
+pub const PICTURE_COLOURS: usize = 31;
+/// A picture of no more different colours than this gives its own colours; one of more, colours
+/// standing for them.
+const OWN_COLOURS_MOST: usize = 256;
+/// The rounds the colours standing for a picture of many are settled in.
+const SETTLING_ROUNDS: usize = 20;
+
+/// The colours of a palette made from a picture (`pixels` 0xRRGGBB), the first `count` of them by
+/// hue (greys first). A picture of up to 256 different colours gives its own, exactly (the
+/// [`PICTURE_COLOURS`] most used, where it has more); one of more gives that many colours standing
+/// for them: its colours grouped by a median cut, then each taken to the group whose mean is
+/// nearest, over [`SETTLING_ROUNDS`] rounds, each group's mean kept.
 pub fn main_colours(pixels: &[u32], count: usize) -> Vec<u32> {
-    if pixels.is_empty() {
-        return Vec::new();
+    let mut colours = picture_colours(pixels);
+    colours.sort_unstable();
+    colours.dedup();
+    // by hue, greys (hue 0) first, ties as they were (by their numbers)
+    colours.sort_by(|a, b| rgb_to_hsb(*a)[0].total_cmp(&rgb_to_hsb(*b)[0]));
+    colours.truncate(count);
+    colours
+}
+
+/// A picture's colours as [`main_colours`] picks them, in no order.
+fn picture_colours(pixels: &[u32]) -> Vec<u32> {
+    // each colour's count, until there are too many to give them all; and the picture's colours
+    // in 32768 boxes (five bits a channel), each's sums and count
+    let mut own: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+    let mut many = false;
+    let mut boxes = vec![[0u64; 4]; 1 << 15];
+    for &p in pixels {
+        let c = p & 0xFF_FFFF;
+        if !many {
+            *own.entry(c).or_insert(0) += 1;
+            many = own.len() > OWN_COLOURS_MOST;
+        }
+        let [_, r, g, b] = c.to_be_bytes();
+        let at = usize::from(r >> 3) << 10 | usize::from(g >> 3) << 5 | usize::from(b >> 3);
+        if let Some(s) = boxes.get_mut(at) {
+            *s = [s[0] + u64::from(r), s[1] + u64::from(g), s[2] + u64::from(b), s[3] + 1];
+        }
     }
-    let ch = |c: u32, k: usize| (c >> (16 - 8 * k)) & 0xFF;
-    let spread_of = |b: &[u32], k: usize| {
-        let (lo, hi) = b.iter().fold((u32::MAX, 0), |(lo, hi), &c| (lo.min(ch(c, k)), hi.max(ch(c, k))));
-        hi.saturating_sub(lo)
+    if !many {
+        // the most used first, ties by their numbers
+        let mut counted: Vec<(u32, u64)> = own.into_iter().collect();
+        counted.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        return counted.into_iter().take(PICTURE_COLOURS).map(|(c, _)| c).collect();
+    }
+    let points: Vec<[u64; 4]> = boxes.into_iter().filter(|s| s[3] > 0).collect();
+    settled_colours(&points, PICTURE_COLOURS)
+}
+
+/// Channel `k` of `v` (0 past its three).
+fn channel(v: [f64; 3], k: usize) -> f64 {
+    v.get(k).copied().unwrap_or(0.0)
+}
+
+/// Up to `count` colours standing for `points` (each a box of colours: its red, green and blue
+/// sums and its count): a median cut, then each point taken to the nearest colour and the colours
+/// made their points' means, round after round.
+fn settled_colours(points: &[[u64; 4]], count: usize) -> Vec<u32> {
+    let mean = |s: [u64; 4]| -> [f64; 3] {
+        let n = s[3].max(1) as f64;
+        [s[0] as f64 / n, s[1] as f64 / n, s[2] as f64 / n]
     };
-    let spread = |b: &[u32]| (0..3).map(|k| spread_of(b, k)).max().unwrap_or(0);
-    let mut boxes: Vec<Vec<u32>> = vec![pixels.to_vec()];
-    while boxes.len() < count {
-        let widest =
-            boxes.iter().enumerate().filter(|(_, b)| b.len() > 1).max_by_key(|(_, b)| spread(b)).map(|(i, _)| i);
-        let Some(i) = widest else { break };
-        let mut b = boxes.swap_remove(i);
-        if spread(&b) == 0 {
-            boxes.push(b);
+    let sum =
+        |group: &[&[u64; 4]]| group.iter().fold([0u64; 4], |a, s| [a[0] + s[0], a[1] + s[1], a[2] + s[2], a[3] + s[3]]);
+    // the median cut: the group of the widest spread in a channel split where half its count is
+    let mut groups: Vec<Vec<&[u64; 4]>> = vec![points.iter().collect()];
+    while groups.len() < count {
+        let spread = |g: &[&[u64; 4]], k: usize| {
+            let (lo, hi) = g
+                .iter()
+                .map(|s| channel(mean(**s), k))
+                .fold((f64::MAX, f64::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
+            hi - lo
+        };
+        let widest = groups
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| g.len() > 1)
+            .map(|(i, g)| {
+                let (k, s) = (0..3).map(|k| (k, spread(g, k))).fold((0, -1.0), |a, b| if b.1 > a.1 { b } else { a });
+                (i, k, s)
+            })
+            .max_by(|a, b| a.2.total_cmp(&b.2));
+        let Some((i, k, _)) = widest else { break };
+        let mut g = groups.swap_remove(i);
+        g.sort_by(|a, b| channel(mean(**a), k).total_cmp(&channel(mean(**b), k)));
+        let half = g.iter().map(|s| s[3]).sum::<u64>() / 2;
+        let mut seen = 0;
+        let cut = g
+            .iter()
+            .position(|s| {
+                seen += s[3];
+                seen >= half
+            })
+            .map_or(1, |p| p + 1)
+            .clamp(1, g.len() - 1);
+        let upper = g.split_off(cut);
+        groups.push(g);
+        groups.push(upper);
+    }
+    let mut centres: Vec<[f64; 3]> = groups.iter().map(|g| mean(sum(g))).collect();
+    let mut sums: Vec<[u64; 4]> = groups.iter().map(|g| sum(g)).collect();
+    // the rounds: each point to its nearest colour, each colour its points' mean (one with none
+    // stays as it was)
+    for _ in 0..SETTLING_ROUNDS {
+        sums = vec![[0u64; 4]; centres.len()];
+        for p in points {
+            let m = mean(*p);
+            let far = |c: &[f64; 3]| c.iter().zip(m).map(|(a, b)| (a - b).powi(2)).sum::<f64>();
+            let nearest = centres.iter().enumerate().min_by(|a, b| far(a.1).total_cmp(&far(b.1))).map_or(0, |(i, _)| i);
+            if let Some(s) = sums.get_mut(nearest) {
+                *s = [s[0] + p[0], s[1] + p[1], s[2] + p[2], s[3] + p[3]];
+            }
+        }
+        let before = centres.clone();
+        for (c, s) in centres.iter_mut().zip(&sums) {
+            if s[3] > 0 {
+                *c = mean(*s);
+            }
+        }
+        if centres == before {
             break;
         }
-        let k = (0..3).max_by_key(|&k| spread_of(&b, k)).unwrap_or(0);
-        b.sort_by_key(|&c| ch(c, k));
-        let upper = b.split_off(b.len() / 2);
-        boxes.push(b);
-        boxes.push(upper);
     }
-    let mut means: Vec<u32> = boxes
-        .iter()
-        .map(|b| {
-            let n = b.len().max(1) as u64;
-            let mean = |k: usize| (b.iter().map(|&c| u64::from(ch(c, k))).sum::<u64>() / n) as u32;
-            mean(0) << 16 | mean(1) << 8 | mean(2)
+    // each group's mean, in whole numbers (rounded down); groups left with nothing dropped
+    sums.iter()
+        .filter(|s| s[3] > 0)
+        .map(|s| {
+            let [r, g, b] = [s[0] / s[3], s[1] / s[3], s[2] / s[3]].map(|v| v.min(255) as u32);
+            r << 16 | g << 8 | b
         })
-        .collect();
-    means.sort_unstable();
-    means.dedup();
-    let light = |c: u32| 0.299 * f64::from(ch(c, 0)) + 0.587 * f64::from(ch(c, 1)) + 0.114 * f64::from(ch(c, 2));
-    means.sort_by(|a, b| light(*b).total_cmp(&light(*a)));
-    means
+        .collect()
 }
 
 /// SHA-256 of `data`.
@@ -569,16 +663,88 @@ mod tests {
         assert_eq!(shown, vec![("Untitled Palette", Some(0x123456)), ("Bare", None)]);
     }
 
+    /// A picture of flat colours (as a Discord report's: seventeen blobs on white, no smoothing)
+    /// gives exactly its colours, each once, by hue; a median cut gave means of neighbouring
+    /// colours instead (four greens for two).
     #[test]
-    fn a_picture_of_two_colours_gives_those_two_lightest_first() {
-        let mut pixels = vec![0x102030; 100];
-        pixels.extend(vec![0xF0E0D0; 50]);
-        assert_eq!(main_colours(&pixels, 30), vec![0xF0E0D0, 0x102030]);
-        let gradient: Vec<u32> = (0..256).map(|v| v << 16 | v << 8 | v).collect();
-        let colours = main_colours(&gradient, 30);
-        assert_eq!(colours.len(), 30);
-        assert!(colours.windows(2).all(|w| matches!(w, [a, b] if a & 0xFF >= b & 0xFF)));
-        assert!(main_colours(&[], 30).is_empty());
+    fn a_picture_of_few_colours_gives_exactly_its_own_by_hue() {
+        const FLAT: [u32; 18] = [
+            0xffffff, 0x662482, 0x5439a2, 0xe60083, 0x75808c, 0x005cc3, 0x000000, 0xa05634, 0x00775e, 0x63bad5,
+            0x00a939, 0xf6d900, 0x9f76b0, 0xff6e94, 0xc81c3c, 0x9ad300, 0x1d81d0, 0xf9723e,
+        ];
+        // white the most (the paper), the rest as much as the blobs cover, one a single pixel
+        let mut pixels: Vec<u32> = vec![0xffffff; 184_487];
+        for (i, &c) in FLAT.iter().enumerate().skip(1) {
+            pixels.extend(std::iter::repeat_n(c, if i == 9 { 1 } else { 3000 + 200 * i }));
+        }
+        let colours = main_colours(&pixels, SLOTS);
+        let mut got = colours.clone();
+        got.sort_unstable();
+        let mut want = FLAT.to_vec();
+        want.sort_unstable();
+        assert_eq!(got, want, "exactly the picture's colours, none made up, none twice");
+        let hues: Vec<f64> = colours.iter().map(|c| rgb_to_hsb(*c)[0]).collect();
+        assert!(hues.windows(2).all(|w| w[0] <= w[1]), "by hue: {colours:06x?}");
+        // greys (no hue) first, by their numbers
+        assert_eq!(colours[..2], [0x000000, 0xffffff]);
+        // the order the pixels come in changes nothing
+        pixels.reverse();
+        assert_eq!(main_colours(&pixels, SLOTS), colours);
+        assert!(main_colours(&[], SLOTS).is_empty());
+    }
+
+    /// Between 32 and 256 colours: the 31 most used, exactly, the first 30 by hue kept; past 256:
+    /// 31 colours standing for them, each near a part of the picture.
+    #[test]
+    fn a_picture_of_many_colours_gives_colours_standing_for_them() {
+        // forty colours, the first thirty-one used more
+        let forty: Vec<u32> = (0..40u32).map(|i| (i * 6) << 16 | (255 - i * 5) << 8 | (i * 3)).collect();
+        let mut pixels = Vec::new();
+        for (i, &c) in forty.iter().enumerate() {
+            pixels.extend(std::iter::repeat_n(c, if i < 31 { 50 } else { 10 }));
+        }
+        let colours = main_colours(&pixels, SLOTS);
+        assert_eq!(colours.len(), SLOTS);
+        assert!(colours.iter().all(|c| forty[..31].contains(c)), "{colours:06x?}");
+        // five colours with a little noise each: thousands of colours, five places
+        let places = [0xd03020u32, 0x2050c0, 0x30a040, 0xf0e0c0, 0x202020];
+        let mut noisy = Vec::new();
+        let mut seed = 12345u32;
+        for &c in &places {
+            for _ in 0..4000 {
+                let [_, r, g, b] = c.to_be_bytes();
+                let mut jitter = |v: u8| {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                    (i32::from(v) + (seed >> 16) as i32 % 13 - 6).clamp(0, 255) as u32
+                };
+                noisy.push(jitter(r) << 16 | jitter(g) << 8 | jitter(b));
+            }
+        }
+        let colours = main_colours(&noisy, SLOTS);
+        assert!(colours.len() > 5 && colours.len() <= SLOTS, "{}", colours.len());
+        let apart = |a: u32, b: u32| {
+            let (a, b) = (a.to_be_bytes(), b.to_be_bytes());
+            (1..4).map(|k| (f64::from(a[k]) - f64::from(b[k])).powi(2)).sum::<f64>().sqrt()
+        };
+        // each colour is one of the places' (within the noise), and each place has one
+        let worst =
+            colours.iter().map(|&c| places.iter().map(|&p| apart(c, p)).fold(f64::MAX, f64::min)).fold(0.0, f64::max);
+        eprintln!("{} colours for five noisy places, the farthest {worst:.1} from its place", colours.len());
+        assert!(worst < 10.0, "{worst}");
+        // (thirty-one colours for five places: each place's noise split among several of them)
+        let each: Vec<usize> =
+            places.iter().map(|&p| colours.iter().filter(|&&c| apart(c, p) < 10.0).count()).collect();
+        eprintln!("colours at each place: {each:?}");
+        assert!(each.iter().all(|&n| n >= 2), "{each:?}");
+        // a smooth ramp, 4096 colours of a dark red to a light blue: thirty along it, end to end
+        let ramp: Vec<u32> =
+            (0..4096u32).map(|i| (200 - i * 160 / 4095) << 16 | (i % 64) << 8 | (40 + i * 200 / 4095)).collect();
+        let colours = main_colours(&ramp, SLOTS);
+        assert_eq!(colours.len(), SLOTS);
+        let blues: Vec<u32> = colours.iter().map(|c| c & 0xFF).collect();
+        let (lo, hi) = (blues.iter().min().copied().unwrap(), blues.iter().max().copied().unwrap());
+        eprintln!("the ramp's blues {lo} to {hi} of 40 to 240");
+        assert!(lo < 60 && hi > 220, "{lo} {hi}");
     }
 
     #[test]

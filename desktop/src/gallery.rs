@@ -1,8 +1,8 @@
 //! The gallery, as the Android app's (ui/GalleryScreen.kt): every artwork as a thumbnail with its
 //! name and size, a stack as its top artwork over two turned cards; over them the app's name (in a
 //! stack, the way back and its name), Select, Import, Photo and +, which opens the New canvas list
-//! (the window's size, then the presets). Select picks artworks to stack, preview, duplicate or
-//! delete. The artworks are the core's store (gallery.rs), kept in the app's folder; the presets
+//! (the window's size, then the presets). Select picks artworks and stacks to stack, preview,
+//! share, duplicate or delete. The artworks are the core's store (gallery.rs), kept in the app's folder; the presets
 //! are the core's too, kept as the Android app keeps them.
 
 use std::collections::HashMap;
@@ -14,7 +14,8 @@ use egui::{
     Align2, Color32, Id, Order, Pos2, Rect, ScrollArea, Sense, Stroke, TextureHandle, Ui, UiBuilder, Vec2, pos2, vec2,
 };
 use procraft_core::{
-    ArtworkStore, CanvasPreset, GalleryArtwork, GalleryEntry, P3, preset_label, presets_from_json, profile_chip,
+    ArtworkStore, CanvasPreset, DragRest, GalleryAction, GalleryArtwork, GalleryEntry, GalleryHeaderFit, GalleryPick,
+    P3, gallery_columns, gallery_header_fit, gallery_pick, preset_label, presets_from_json, profile_chip,
 };
 
 use crate::animated_export::Animated;
@@ -82,6 +83,28 @@ const RENAME_FIELD_FILL: u32 = 0x14FFFFFF;
 /// Renaming's picture rising from its cell, and its fading away when done (seconds).
 const RENAME_RISE_S: f32 = 0.3;
 const RENAME_FADE_S: f32 = 0.15;
+/// Several artworks shared as one PDF from the gallery itself (not a stack) are first named so.
+const GROUP: &str = "Artworks";
+
+/// What a swipe opened the actions of: an artwork, or a stack (its folder and name) and what is
+/// in it.
+struct Swiped {
+    dir: String,
+    name: String,
+    artworks: Vec<GalleryArtwork>,
+    stack: bool,
+}
+
+impl Swiped {
+    fn artwork(a: &GalleryArtwork) -> Swiped {
+        Swiped { dir: a.dir.clone(), name: a.name.clone(), artworks: vec![a.clone()], stack: false }
+    }
+
+    fn stack(dir: &str, name: &str, artworks: &[GalleryArtwork]) -> Swiped {
+        Swiped { dir: dir.to_owned(), name: name.to_owned(), artworks: artworks.to_vec(), stack: true }
+    }
+}
+
 /// A swiped artwork's actions: three pills over its thumbnail, which fades back.
 const SWIPE_PILL: (f32, f32) = (94.0, 56.0);
 const SWIPE_PILL_FILL: Themed = Themed(0xDB1C1C1C, 0xFFF5F5F5);
@@ -126,8 +149,9 @@ pub enum Asked {
     Photo(Option<String>),
     /// These artworks written as this format, where the user picks.
     Share(Vec<GalleryArtwork>, crate::files::Format),
-    /// These artworks written as PDFs keeping their pictures at this JPEG quality.
-    SharePdf(Vec<GalleryArtwork>, u8),
+    /// These artworks written as a PDF keeping their pictures at this JPEG quality: one alone as
+    /// its own, several as one with a page each, first named as given.
+    SharePdf(Vec<GalleryArtwork>, u8, String),
     /// The artwork opened to be shared as this animation, the gallery back after.
     ShareAnimated(GalleryArtwork, Animated),
     /// The artwork lifted and dragged out of the window: handed to the system as a file.
@@ -189,6 +213,8 @@ const FORMATS_WIDTH: f32 = 260.0;
 
 pub struct Gallery {
     pub store: Arc<ArtworkStore>,
+    /// What a plugin brings in from its folder as the gallery opens, brought on a thread of its own.
+    bringing: Option<std::thread::JoinHandle<procraft_core::FolderBroughtIn>>,
     entries: Vec<GalleryEntry>,
     /// The stack open: its folder and name.
     stack: Option<(String, String)>,
@@ -207,20 +233,22 @@ pub struct Gallery {
     pub kinds: Vec<procraft_core::PluginKind>,
     /// The screen's size, pixels: Screen Size's canvas.
     pub screen_px: (u32, u32),
-    /// Select: on, the artworks picked (by folder), More's list open, the picked artworks shown
-    /// one at a time (and which), and the alert asking before they are deleted.
+    /// Select: on, the artworks and stacks picked (by folder), More's list open, the picked
+    /// artworks shown one at a time (and which), and the alert asking before they are deleted.
     selecting: bool,
     picked: Vec<String>,
     more_open: bool,
     preview: Option<(Vec<GalleryArtwork>, usize, bool, f32)>,
     /// The animation of the artwork shown in Preview, by its folder.
     played: Option<Played>,
+    /// The artwork shown in Preview drawn whole, as large as it shows.
+    sharp: Option<Sharp>,
     /// An artwork two fingers are spreading open into Preview.
     spreading: Option<Spread>,
     alert: crate::alert::Alert,
     /// Share's PDF asks how well it keeps its pictures first (for these artworks).
     pdf_alert: crate::alert::Alert,
-    pdf_for: Option<Vec<GalleryArtwork>>,
+    pdf_for: Option<(Vec<GalleryArtwork>, String)>,
     /// An artwork lifted and dragged out past the window's edge.
     dragged_out: Option<GalleryArtwork>,
     /// The artwork being renamed, its name as typed, and whether its field has had the focus.
@@ -238,12 +266,21 @@ pub struct Gallery {
     dragged: egui::Vec2,
     /// Share's formats, open for these artworks, beside a swiped artwork's Share (or under
     /// Select's, where it last was).
-    sharing: Option<(Vec<GalleryArtwork>, Option<Rect>)>,
+    sharing: Option<(Vec<GalleryArtwork>, Option<Rect>, String)>,
     share_button: Rect,
+    /// The title row as last laid out for the window (what More's list holds), and where More is.
+    header_fit: Option<GalleryHeaderFit>,
+    more_button: Rect,
     /// What a hold lifted (by folder) and where it was taken (window points), and where the way
     /// back out of a stack is, to drop it there.
     lifted: Option<(String, Pos2)>,
     back: Rect,
+    /// What was lifted and where its picture last sat, for when the gallery changes under the
+    /// drag (a stack opened by resting on it, or left by resting on the way back); and what the
+    /// drag rests on.
+    lifted_entry: Option<GalleryEntry>,
+    lifted_picture: Rect,
+    rest: DragRest,
     /// Custom Canvas, open on a new canvas or a preset.
     custom: Option<crate::custom_canvas::CustomCanvas>,
     /// The preset row swiped open, and the one being dragged (and how far it is).
@@ -255,6 +292,8 @@ pub struct Gallery {
     /// Where each artwork's picture (by folder) was last drawn: what the gallery zooms into and
     /// out of as an artwork opens and closes.
     pictures: HashMap<String, Rect>,
+    /// The box each artwork's picture was last fitted in.
+    boxes: HashMap<String, Rect>,
     /// Pictures shrinking under a press, growing as they lift, or going back (by folder).
     lifts: HashMap<String, Lift>,
     /// A stack opening, its artworks flying out of its cell (where it was, since when); or left,
@@ -337,10 +376,15 @@ const DROPPED: (f32, f32) = (1.0, 0.25);
 
 impl Gallery {
     pub fn new() -> Gallery {
-        let store = ArtworkStore::open(crate::files::app_dir().join("artworks").to_string_lossy().into_owned());
+        Gallery::with_store(ArtworkStore::open(crate::files::app_dir().join("artworks").to_string_lossy().into_owned()))
+    }
+
+    /// The gallery of the artworks kept in `store`.
+    fn with_store(store: Arc<ArtworkStore>) -> Gallery {
         let presets = presets_from_json(std::fs::read_to_string(presets_path()).ok());
         let mut gallery = Gallery {
             store,
+            bringing: None,
             entries: Vec::new(),
             stack: None,
             thumbs: HashMap::new(),
@@ -356,6 +400,7 @@ impl Gallery {
             more_open: false,
             preview: None,
             played: None,
+            sharp: None,
             spreading: None,
             alert: crate::alert::Alert::default(),
             pdf_alert: crate::alert::Alert::default(),
@@ -370,14 +415,20 @@ impl Gallery {
             dragged: egui::Vec2::ZERO,
             sharing: None,
             share_button: Rect::NOTHING,
+            header_fit: None,
+            more_button: Rect::NOTHING,
             lifted: None,
             back: Rect::NOTHING,
+            lifted_entry: None,
+            lifted_picture: Rect::NOTHING,
+            rest: DragRest::default(),
             custom: None,
             preset_open: None,
             preset_drag: None,
             about: false,
             mark: None,
             pictures: HashMap::new(),
+            boxes: HashMap::new(),
             lifts: HashMap::new(),
             opening_stack: None,
             leaving_stack: None,
@@ -386,6 +437,40 @@ impl Gallery {
         };
         gallery.refresh();
         gallery
+    }
+
+    /// The gallery shows: what a plugin brings in from its folder comes in, on a thread of its own
+    /// (one at a time). With no plugin bringing anything in, nothing happens.
+    pub fn bring_in(&mut self, plugins: &Arc<procraft_core::Plugins>) {
+        if self.bringing.is_some() {
+            return;
+        }
+        let (plugins, store) = (Arc::clone(plugins), Arc::clone(&self.store));
+        let started =
+            std::thread::Builder::new().name("bringing in".into()).spawn(move || plugins.gallery_opened(store));
+        match started {
+            Ok(thread) => self.bringing = Some(thread),
+            Err(e) => log::error!("bringing artworks in from a folder: {e}"),
+        }
+    }
+
+    /// Whether artworks are being brought in from a plugin's folder (the gallery looks again soon).
+    pub fn bringing_in(&self) -> bool {
+        self.bringing.is_some()
+    }
+
+    /// Once what a plugin brought in from its folder is in: the gallery read again if anything came,
+    /// and what to tell once (a folder out of reach).
+    pub fn brought(&mut self) -> Option<String> {
+        if !self.bringing.as_ref().is_some_and(std::thread::JoinHandle::is_finished) {
+            return None;
+        }
+        let brought = self.bringing.take()?.join().ok()?;
+        if brought.added + brought.updated + brought.copies > 0 {
+            self.thumbs.clear();
+            self.refresh();
+        }
+        brought.notice
     }
 
     /// Reads what is in the gallery (or the stack open) again.
@@ -431,6 +516,29 @@ impl Gallery {
     /// Where the artwork in folder `dir` was last drawn, if it was.
     pub fn picture_of(&self, dir: &str) -> Option<Rect> {
         self.pictures.get(dir).copied()
+    }
+
+    /// The artwork whose cell is under window point `at`, as last drawn (a stack's: none): where
+    /// layers held over the gallery open.
+    pub fn artwork_at(&self, at: egui::Pos2) -> Option<String> {
+        self.drawn_cells.iter().find(|(_, r)| r.contains(at)).and_then(|(e, _)| match e {
+            GalleryEntry::Artwork { artwork } => Some(artwork.dir.clone()),
+            GalleryEntry::Stack { .. } => None,
+        })
+    }
+
+    /// Where the artwork in folder `dir` (its canvas `size` pixels) will be drawn once it shows
+    /// turned `turns` quarter turns clockwise (as its canvas was left), if its cell was drawn.
+    pub fn picture_as(&self, dir: &str, size: (u32, u32), turns: u32) -> Option<Rect> {
+        let shown = GalleryArtwork {
+            dir: dir.to_owned(),
+            name: String::new(),
+            width: size.0,
+            height: size.1,
+            modified_ms: 0,
+            turns,
+        };
+        self.boxes.get(dir).map(|frame| Self::fitted(*frame, &shown)).or_else(|| self.picture_of(dir))
     }
 
     /// The gallery's own page (its header and grid), as the window's background.
@@ -533,7 +641,7 @@ impl Gallery {
             }
         }
         if self.more_open {
-            self.more(ctx, look, screen);
+            asked = self.more(ctx, look, screen).or(asked);
         }
         if self.about {
             self.about(ctx, screen);
@@ -557,7 +665,8 @@ impl Gallery {
                     self.store.delete(dir);
                     self.refresh();
                 } else {
-                    for dir in std::mem::take(&mut self.picked) {
+                    // those picked still shown, a stack with its artworks
+                    for dir in self.pick().dirs {
                         self.store.delete(dir);
                     }
                     self.end_selecting();
@@ -567,10 +676,10 @@ impl Gallery {
             None => {}
         }
         if let Some(answer) = self.pdf_alert.show(ctx, look)
-            && let Some(list) = self.pdf_for.take()
+            && let Some((list, group)) = self.pdf_for.take()
             && let Some(quality) = crate::alert::pdf_jpeg(answer)
         {
-            asked = Some(Asked::SharePdf(list, quality));
+            asked = Some(Asked::SharePdf(list, quality, group));
         }
         if let Some(artwork) = self.dragged_out.take() {
             asked = Some(Asked::DragOut(artwork));
@@ -578,15 +687,19 @@ impl Gallery {
         asked
     }
 
-    /// The artworks picked, in the gallery's order.
-    fn picked_artworks(&self) -> Vec<GalleryArtwork> {
-        self.entries
-            .iter()
-            .filter_map(|e| match e {
-                GalleryEntry::Artwork { artwork } if self.picked.contains(&artwork.dir) => Some(artwork.clone()),
-                _ => None,
-            })
-            .collect()
+    /// What Select's actions act on now (the core's rules): the entries picked in the order
+    /// shown, the artworks they hold, whether they can be stacked, what Delete asks.
+    fn pick(&self) -> GalleryPick {
+        gallery_pick(self.entries.clone(), self.picked.clone(), self.stack.is_some())
+    }
+
+    /// Selecting, a tap on the artwork or stack in `dir` picks it, or lets it go.
+    fn toggle_pick(&mut self, dir: &str) {
+        if let Some(at) = self.picked.iter().position(|d| d == dir) {
+            self.picked.remove(at);
+        } else {
+            self.picked.push(dir.to_owned());
+        }
     }
 
     fn end_selecting(&mut self) {
@@ -599,9 +712,9 @@ impl Gallery {
     /// Whether `action` can act on what is picked now.
     fn can(&self, action: SelectAction) -> bool {
         match action {
-            SelectAction::Stack => self.stack.is_none() && self.picked.len() >= 2,
+            SelectAction::Stack => self.pick().can_stack,
             SelectAction::More => true,
-            _ => !self.picked.is_empty(),
+            _ => !self.pick().dirs.is_empty(),
         }
     }
 
@@ -609,81 +722,110 @@ impl Gallery {
         if !self.can(action) {
             return;
         }
+        let pick = self.pick();
         match action {
+            // the first stack picked takes in the rest; with none, a new stack
             SelectAction::Stack => {
-                let dirs = self.picked_artworks().into_iter().map(|a| a.dir).collect();
-                self.store.stack(dirs);
+                self.store.stack_picked(pick.dirs);
                 self.end_selecting();
             }
             SelectAction::Preview => {
                 self.more_open = false;
-                self.preview = Some((self.picked_artworks(), 0, false, 0.0));
+                self.preview = Some((pick.artworks, 0, false, 0.0));
             }
+            // a stack whole, beside itself
             SelectAction::Duplicate => {
-                self.duplicate(self.picked_artworks().into_iter().map(|a| a.dir).collect());
+                self.duplicate(pick.dirs);
                 self.end_selecting();
             }
             SelectAction::Delete => {
-                let n = self.picked.len();
-                let title = if n == 1 { "Delete 1 artwork?".to_owned() } else { format!("Delete {n} artworks?") };
-                self.alert.open(&title, "This can't be undone.", "Delete", Some(&icons::TRASH));
+                self.alert.open(&pick.delete_title, &pick.delete_message, "Delete", Some(&icons::TRASH));
             }
             SelectAction::More => self.more_open = !self.more_open,
-            SelectAction::Share => self.sharing = Some((self.picked_artworks(), None)),
+            // several go into one PDF, named after the stack they are in (or the one picked alone)
+            SelectAction::Share => {
+                let alone = match pick.dirs.as_slice() {
+                    [one] => self.entries.iter().find_map(|e| match e {
+                        GalleryEntry::Stack { dir, name, .. } if dir == one => Some(name.clone()),
+                        _ => None,
+                    }),
+                    _ => None,
+                };
+                let group = alone.or_else(|| self.stack.as_ref().map(|(_, name)| name.clone()));
+                self.sharing = Some((pick.artworks, None, group.unwrap_or_else(|| GROUP.to_owned())));
+            }
+        }
+    }
+
+    /// The title row laid out for the window (the core's rules): the buttons that fit, the rest
+    /// under More, the title on one line shrunk to fit beside them.
+    fn header_fit(&mut self, ui: &Ui, screen: Rect) -> GalleryHeaderFit {
+        let title = self.stack.as_ref().map_or(crate::APP_NAME, |s| s.1.as_str()).to_owned();
+        let own = ui.painter().layout_no_wrap(title, Weight::Bold.font(36.0), Color32::WHITE).size();
+        // in a stack the name follows the way back; selecting, it stands alone
+        let title_x = if self.stack.is_some() && !self.selecting { 60.0 } else { 32.0 };
+        let fit = gallery_header_fit(
+            screen.width(),
+            title_x,
+            own.x,
+            self.selecting,
+            screen.width() > screen.height(),
+            self.stack.is_some(),
+        );
+        self.header_fit = Some(fit.clone());
+        fit
+    }
+
+    /// A capsule button's face in `button`: its name, or (More alone in the capsule) its glyph.
+    fn capsule_label(ui: &Ui, look: &mut Look, button: Rect, label: &str, alone: bool, ink: Color32) {
+        if alone {
+            look.icon(ui, &icons::MORE, button.center(), 24.0, ink);
+        } else {
+            text(ui.painter(), button.center(), Align2::CENTER_CENTER, label, 16.0, Weight::Regular, ink);
         }
     }
 
     /// Select's title row: the title, then (on a wide window) Stack, Preview, Share, Duplicate and
-    /// Delete, or Share, Delete and More, each dimmed until it can act; then the blue round button
-    /// that ends selecting.
+    /// Delete (in a stack no Stack), or Share, Delete and More, or in a narrow window More alone,
+    /// each dimmed until it can act; then the blue round button that ends selecting.
     fn select_header(&mut self, ui: &Ui, look: &mut Look, screen: Rect) {
-        let painter = ui.painter();
         let top = screen.top();
+        let fit = self.header_fit(ui, screen);
         let title = self.stack.as_ref().map_or(crate::APP_NAME, |s| s.1.as_str()).to_owned();
-        text(
-            painter,
-            pos2(screen.left() + 32.0, top + 11.0),
-            Align2::LEFT_TOP,
-            &title,
-            36.0,
-            Weight::Bold,
-            argb(TITLE),
-        );
-        let wide = screen.width() > screen.height();
-        let actions: &[(SelectAction, &str, f32)] = if wide {
-            &[
-                (SelectAction::Stack, "Stack", 65.0),
-                (SelectAction::Preview, "Preview", 80.0),
-                (SelectAction::Share, "Share", 65.0),
-                (SelectAction::Duplicate, "Duplicate", 91.0),
-                (SelectAction::Delete, "Delete", 70.0),
-            ]
-        } else {
-            &[
-                (SelectAction::Share, "Share", 65.0),
-                (SelectAction::Delete, "Delete", 70.0),
-                (SelectAction::More, "More", 61.0),
-            ]
-        };
+        title_text(ui, pos2(screen.left() + 32.0, top + 11.0), Align2::LEFT_TOP, &title, argb(TITLE), &fit);
+        let painter = ui.painter();
         let done = Rect::from_min_size(pos2(screen.right() - 20.0 - 44.0, top + 10.0), vec2(44.0, 45.0));
-        let width: f32 = actions.iter().map(|a| a.2).sum();
-        let capsule = Rect::from_min_size(pos2(done.left() - 13.0 - width, top + 10.0), vec2(width, 45.0));
+        let capsule =
+            Rect::from_min_size(pos2(screen.left() + fit.capsule_left, top + 10.0), vec2(fit.capsule_width, 45.0));
         painter.rect_filled(capsule, 22.5, argb(CAPSULE));
         painter.rect_stroke(capsule, 22.5, Stroke::new(1.0, argb(CAPSULE_EDGE)), egui::StrokeKind::Inside);
         let mut x = capsule.left();
         let mut chosen = None;
-        for &(action, label, w) in actions {
-            let button = Rect::from_min_size(pos2(x, capsule.top()), vec2(w, 45.0));
+        let alone = fit.buttons.len() == 1;
+        let mut shared = false;
+        for b in &fit.buttons {
+            let action = select_action(b.action);
+            let button = Rect::from_min_size(pos2(x, capsule.top()), vec2(b.width, 45.0));
             let ink = if self.can(action) { argb(TITLE) } else { argb(SIZE) };
-            text(painter, button.center(), Align2::CENTER_CENTER, label, 16.0, Weight::Regular, ink);
-            if action == SelectAction::Share {
-                self.share_button = button;
+            Self::capsule_label(ui, look, button, &b.label, alone, ink);
+            match action {
+                SelectAction::Share => {
+                    self.share_button = button;
+                    shared = true;
+                }
+                SelectAction::More => self.more_button = button,
+                _ => {}
             }
-            if ui.interact(button, ui.scope_id().with(("select", label)), Sense::click()).clicked() {
+            if ui.interact(button, ui.scope_id().with(("select", b.label.as_str())), Sense::click()).clicked() {
                 chosen = Some(action);
             }
-            x += w;
+            x += b.width;
         }
+        // Share in More's list: its formats hang from More
+        if !shared {
+            self.share_button = self.more_button;
+        }
+        let painter = ui.painter();
         painter.rect_filled(done, 22.0, argb(DONE_FILL));
         look.icon(ui, &icons::DONE_TICK, done.center(), 40.0, Color32::WHITE);
         if ui.interact(done, ui.scope_id().with("select done"), Sense::click()).clicked() {
@@ -694,12 +836,22 @@ impl Gallery {
         }
     }
 
-    /// More options for the picked artworks, under More: Preview, Stack (two or more), Duplicate.
-    fn more(&mut self, ctx: &egui::Context, look: &mut Look, screen: Rect) {
+    /// More's list, under More, of what the title row has no room for: selecting, Preview, Stack
+    /// (two or more; none in a stack) and Duplicate, and in a narrow window Share and Delete too;
+    /// else Import and Photo, and in a narrow window Select too. What a tap on one asked for.
+    fn more(&mut self, ctx: &egui::Context, look: &mut Look, screen: Rect) -> Option<Asked> {
+        let rows: Vec<(GalleryAction, &str)> = match &self.header_fit {
+            Some(fit) if !fit.more.is_empty() => fit.more.iter().map(|&a| (a, action_label(a))).collect(),
+            _ => {
+                self.more_open = false;
+                return None;
+            }
+        };
         let width = 250.0;
-        let more_x = screen.right() - 20.0 - 44.0 - 13.0 - 61.0 / 2.0;
+        let more_x = self.more_button.center().x;
         let left = (more_x - width / 2.0).clamp(screen.left() + 4.0, screen.right() - 4.0 - width);
-        let height = panel::ARROW_HEIGHT + 14.0 + 29.0 + 12.0 + 44.0 * 3.0 + 2.0 + 12.0;
+        let n = rows.len() as f32;
+        let height = panel::ARROW_HEIGHT + 14.0 + 29.0 + 12.0 + 44.0 * n + (n - 1.0) + 12.0;
         let rect = Rect::from_min_size(pos2(left, screen.top() + 57.0), vec2(width, height));
         let mut chosen = None;
         let mut close = false;
@@ -728,24 +880,19 @@ impl Gallery {
             );
             let group = Rect::from_min_size(
                 pos2(body.left() + 10.0, body.top() + 14.0 + 29.0 + 12.0),
-                vec2(width - 20.0, 44.0 * 3.0 + 2.0),
+                vec2(width - 20.0, 44.0 * n + (n - 1.0)),
             );
             ui.painter().rect_filled(group, 18.0, argb(ACTIONS_GROUP));
-            for (i, (action, label)) in [
-                (SelectAction::Preview, "Preview"),
-                (SelectAction::Stack, "Stack"),
-                (SelectAction::Duplicate, "Duplicate"),
-            ]
-            .into_iter()
-            .enumerate()
-            {
+            for (i, &(action, label)) in rows.iter().enumerate() {
+                let select = select_action(action);
                 let row =
                     Rect::from_min_size(pos2(group.left(), group.top() + 45.0 * i as f32), vec2(group.width(), 44.0));
                 if i > 0 {
                     let line = Rect::from_min_size(pos2(row.left(), row.top() - 1.0), vec2(row.width(), 1.0));
                     ui.painter().rect_filled(line, 0, argb(ACTIONS_SEPARATOR));
                 }
-                let on = self.can(action);
+                let on = matches!(action, GalleryAction::Select | GalleryAction::Import | GalleryAction::Photo)
+                    || self.can(select);
                 let colour = if on { ink } else { argb(ACTIONS_DISABLED) };
                 text(
                     ui.painter(),
@@ -764,9 +911,20 @@ impl Gallery {
         if close {
             self.more_open = false;
         }
-        if let Some(action) = chosen {
-            self.more_open = false;
-            self.act(action);
+        let action = chosen?;
+        self.more_open = false;
+        match action {
+            GalleryAction::Select => {
+                self.selecting = true;
+                self.new_open = false;
+                None
+            }
+            GalleryAction::Import => Some(Asked::Import(self.folder())),
+            GalleryAction::Photo => Some(Asked::Photo(self.folder())),
+            other => {
+                self.act(select_action(other));
+                None
+            }
         }
     }
 
@@ -797,7 +955,7 @@ impl Gallery {
     /// the field under it.
     fn rename_places(a: &GalleryArtwork, screen: Rect) -> (Rect, Rect) {
         let (fw, fh) = (RENAME_FRAME.0 - RENAME_MARGIN * 2.0, RENAME_FRAME.1 - RENAME_MARGIN * 2.0);
-        let ratio = if a.width > 0 && a.height > 0 { a.width as f32 / a.height as f32 } else { 0.75 };
+        let ratio = shown_ratio(a);
         let (aw, ah) = if ratio > fw / fh { (fw, fw / ratio) } else { (fh * ratio, fh) };
         let top = screen.top() + RENAME_TOP + (RENAME_FRAME.1 - ah) / 2.0;
         let picture = Rect::from_min_size(pos2(screen.center().x - aw / 2.0, top), vec2(aw, ah));
@@ -1025,7 +1183,8 @@ impl Gallery {
             ui.painter().rect_filled(screen, 0, Color32::BLACK);
             self.play(ctx, &a);
             let frame = self.played.as_ref().and_then(Played::frame);
-            if let Some(t) = frame.or_else(|| self.texture(&a)) {
+            let sharp = self.sharp(ctx, &a, screen);
+            if let Some(t) = frame.or(sharp).or_else(|| self.texture(&a)) {
                 let picture = Self::fitted(screen, &a);
                 let picture = picture.translate(vec2(0.0, screen.center().y - picture.center().y));
                 let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
@@ -1070,9 +1229,31 @@ impl Gallery {
         });
         if closed {
             self.played = None;
+            self.sharp = None;
         } else {
             self.preview = Some((list, index, controls, moved));
         }
+    }
+
+    /// Preview's artwork `a` drawn whole for `screen` (points) at a pixel of its own a screen
+    /// pixel, where that shows more than its thumbnail: made on a thread of its own the first
+    /// time (one at a time; again only for a larger window), the thumbnail shown till then.
+    fn sharp(&mut self, ctx: &egui::Context, a: &GalleryArtwork, screen: Rect) -> Option<egui::TextureId> {
+        let ppp = ctx.pixels_per_point();
+        let (bw, bh) = ((screen.width() * ppp).round() as u32, (screen.height() * ppp).round() as u32);
+        let (w, h) = if a.turns % 2 == 1 { (a.height, a.width) } else { (a.width, a.height) };
+        let side = procraft_core::preview_side(w, h, bw, bh);
+        if side <= THUMBNAIL_SIDE {
+            return None;
+        }
+        let again = self
+            .sharp
+            .as_ref()
+            .is_none_or(|s| s.dir != a.dir || s.modified_ms != a.modified_ms || (s.read.is_none() && side > s.side));
+        if again {
+            self.sharp = Some(Sharp::start(a, side));
+        }
+        self.sharp.as_mut()?.texture(ctx)
     }
 
     /// Preview's artwork `a`, if it is animated: its frames read on a thread, then played as its
@@ -1087,12 +1268,13 @@ impl Gallery {
     }
 
     /// The app's name (in a stack, the way back and its name), then Select, Import and Photo in a
-    /// capsule, and +.
+    /// capsule, and +; in a narrow window some or all of them under More, the title shrunk to fit.
     fn header(&mut self, ui: &Ui, look: &mut Look, screen: Rect) -> Option<Asked> {
         if self.selecting {
             self.select_header(ui, look, screen);
             return None;
         }
+        let fit = self.header_fit(ui, screen);
         let painter = ui.painter();
         let top = screen.top();
         if let Some((_, name)) = self.stack.clone() {
@@ -1105,13 +1287,9 @@ impl Gallery {
             let lit = response.is_pointer_button_down_on() || over;
             let ink = if lit { argb(crate::look::pc::ACCENT) } else { argb(TITLE) };
             look.icon(ui, &icons::CHEVRON_LEFT, row.center(), 28.0, ink);
-            text(painter, pos2(row.right(), row.center().y), Align2::LEFT_CENTER, &name, 36.0, Weight::Bold, ink);
+            title_text(ui, pos2(row.right(), row.center().y), Align2::LEFT_CENTER, &name, ink, &fit);
             if response.clicked() {
-                if let Some((dir, name)) = self.stack.take() {
-                    let cells = std::mem::take(&mut self.drawn_cells);
-                    self.leaving_stack = Some(LeavingStack { dir, name, cells, since: Instant::now() });
-                }
-                self.refresh();
+                self.leave_stack();
             }
         } else {
             // a stack just left: its name fades out as the gallery's fades in
@@ -1126,14 +1304,13 @@ impl Gallery {
                 look.icon(ui, &icons::CHEVRON_LEFT, row.center(), 28.0, ink);
                 text(painter, pos2(row.right(), row.center().y), Align2::LEFT_CENTER, name, 36.0, Weight::Bold, ink);
             }
-            let name = text(
-                painter,
+            let name = title_text(
+                ui,
                 pos2(screen.left() + 32.0, top + 11.0),
                 Align2::LEFT_TOP,
                 crate::APP_NAME,
-                36.0,
-                Weight::Bold,
                 argb(TITLE).gamma_multiply(title_in),
+                &fit,
             );
             // the app's name tapped: what it is and its version
             if ui.interact(name, ui.scope_id().with("about"), Sense::click()).clicked() {
@@ -1141,20 +1318,27 @@ impl Gallery {
             }
         }
         let plus = Rect::from_min_size(pos2(screen.right() - 20.0 - 44.0, top + 10.0), vec2(44.0, 45.0));
-        let capsule_width = 69.0 + 71.0 + 66.0;
         let capsule =
-            Rect::from_min_size(pos2(plus.left() - 12.0 - capsule_width, top + 10.0), vec2(capsule_width, 45.0));
+            Rect::from_min_size(pos2(screen.left() + fit.capsule_left, top + 10.0), vec2(fit.capsule_width, 45.0));
         painter.rect_filled(capsule, 22.5, argb(CAPSULE));
         painter.rect_stroke(capsule, 22.5, Stroke::new(1.0, argb(CAPSULE_EDGE)), egui::StrokeKind::Inside);
         let mut x = capsule.left();
         let mut asked = None;
-        for (label, width) in [("Select", 69.0), ("Import", 71.0), ("Photo", 66.0)] {
-            let button = Rect::from_min_size(pos2(x, capsule.top()), vec2(width, 45.0));
-            text(painter, button.center(), Align2::CENTER_CENTER, label, 16.0, Weight::Regular, argb(TEXT));
-            if ui.interact(button, ui.scope_id().with(label), Sense::click()).clicked() {
-                asked = match label {
-                    "Import" => Some(Asked::Import(self.folder())),
-                    "Photo" => Some(Asked::Photo(self.folder())),
+        let alone = fit.buttons.len() == 1;
+        for b in &fit.buttons {
+            let button = Rect::from_min_size(pos2(x, capsule.top()), vec2(b.width, 45.0));
+            Self::capsule_label(ui, look, button, &b.label, alone, argb(TEXT));
+            if b.action == GalleryAction::More {
+                self.more_button = button;
+            }
+            if ui.interact(button, ui.scope_id().with(b.label.as_str()), Sense::click()).clicked() {
+                asked = match b.action {
+                    GalleryAction::Import => Some(Asked::Import(self.folder())),
+                    GalleryAction::Photo => Some(Asked::Photo(self.folder())),
+                    GalleryAction::More => {
+                        self.more_open = !self.more_open;
+                        None
+                    }
                     _ => {
                         self.selecting = true;
                         self.new_open = false;
@@ -1162,8 +1346,9 @@ impl Gallery {
                     }
                 };
             }
-            x += width;
+            x += b.width;
         }
+        let painter = ui.painter();
         let disc = Rect::from_center_size(plus.center(), vec2(42.0, 42.0));
         painter.rect_filled(disc, 21.0, argb(CAPSULE));
         painter.rect_stroke(disc, 21.0, Stroke::new(1.0, argb(CAPSULE_EDGE)), egui::StrokeKind::Inside);
@@ -1174,9 +1359,10 @@ impl Gallery {
         asked
     }
 
-    /// The artworks and stacks, three across (four on a wide window), scrolling.
+    /// The artworks and stacks, three across (four on a wide window, fewer and bigger on a narrow
+    /// one), scrolling.
     fn grid(&mut self, ui: &mut Ui, rect: Rect) -> Option<Asked> {
-        let columns = if rect.width() > rect.height() + HEADER { 4 } else { 3 };
+        let columns = gallery_columns(rect.width(), rect.width() > rect.height() + HEADER).max(1) as usize;
         let pitch = rect.width() / columns as f32;
         let rows = self.entries.len().div_ceil(columns);
         let mut asked = None;
@@ -1228,6 +1414,8 @@ impl Gallery {
                         if held >= HOLD_S {
                             let at = response.interact_pointer_pos().unwrap_or_else(|| cell.center());
                             self.lifted = Some((entry_dir(entry).to_owned(), at));
+                            self.lifted_entry = Some(entry.clone());
+                            self.rest = DragRest::default();
                             self.swiped = None;
                         } else {
                             ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(HOLD_S - held));
@@ -1272,7 +1460,7 @@ impl Gallery {
                             let id = ui.scope_id().with(("swipe open", &artwork.dir));
                             let open = ui.ctx().animate_bool_with_time_and_easing(id, swiped, SWIPE_S, swipe_ease);
                             if open > 0.0 {
-                                self.swipe_actions(ui, cell, artwork, open, swiped);
+                                self.swipe_actions(ui, cell, &Swiped::artwork(artwork), open, swiped);
                             }
                             // selecting, a tap picks it (or lets it go); a tap puts away actions
                             // showing
@@ -1282,21 +1470,38 @@ impl Gallery {
                                 self.renaming = Some((artwork.clone(), artwork.name.clone(), false));
                                 self.renaming_stack = None;
                             } else if tapped && self.selecting {
-                                if let Some(at) = self.picked.iter().position(|d| *d == artwork.dir) {
-                                    self.picked.remove(at);
-                                } else {
-                                    self.picked.push(artwork.dir.clone());
-                                }
+                                self.toggle_pick(&artwork.dir);
                             } else if tapped {
                                 asked = Some(Asked::Open(artwork.dir.clone()));
                             }
                         }
                         GalleryEntry::Stack { dir, name, artworks } => {
-                            self.stack_cell(ui, cell, name, artworks);
+                            self.stack_cell(ui, cell, dir, name, artworks);
                             // on its name, a tap renames it, as an artwork's does
                             let below = cell.top() + 39.0 + Self::thumb_box(cell).height() + 8.0;
                             let on_name = response.interact_pointer_pos().is_some_and(|p| p.y > below);
-                            if tapped
+                            // dragged across, its actions show (left) or go (right), as an artwork's
+                            if response.drag_started() {
+                                self.dragged = egui::Vec2::ZERO;
+                            }
+                            self.dragged += response.drag_delta();
+                            if response.drag_stopped()
+                                && !self.selecting
+                                && self.lifted.is_none()
+                                && self.dragged.x.abs() > self.dragged.y.abs()
+                            {
+                                self.swiped = (self.dragged.x < 0.0).then(|| dir.clone());
+                            }
+                            let swiped = self.swiped.as_ref() == Some(dir);
+                            let id = ui.scope_id().with(("swipe open", dir));
+                            let open = ui.ctx().animate_bool_with_time_and_easing(id, swiped, SWIPE_S, swipe_ease);
+                            if open > 0.0 {
+                                let on = Swiped::stack(dir, name, artworks);
+                                self.swipe_actions(ui, cell, &on, open, swiped);
+                            }
+                            if tapped && self.swiped.is_some() {
+                                self.swiped = None;
+                            } else if tapped
                                 && on_name
                                 && !self.selecting
                                 && let Some(top) = artworks.first()
@@ -1304,7 +1509,10 @@ impl Gallery {
                                 let shown = GalleryArtwork { name: name.clone(), ..top.clone() };
                                 self.renaming = Some((shown, name.clone(), false));
                                 self.renaming_stack = Some(dir.clone());
-                            } else if tapped && !self.selecting {
+                            } else if tapped && self.selecting {
+                                // selecting, a tap picks it (or lets it go), as an artwork's
+                                self.toggle_pick(dir);
+                            } else if tapped {
                                 self.stack = Some((dir.clone(), name.clone()));
                                 self.opening_stack = Some((cell, Instant::now()));
                                 into_stack = true;
@@ -1351,7 +1559,7 @@ impl Gallery {
                     }
                     match entry {
                         GalleryEntry::Artwork { artwork } => _ = self.artwork_cell(&faded, at, artwork, 1.0),
-                        GalleryEntry::Stack { name, artworks, .. } => self.stack_cell(&faded, at, name, artworks),
+                        GalleryEntry::Stack { dir, name, artworks } => self.stack_cell(&faded, at, dir, name, artworks),
                     }
                 }
             });
@@ -1389,12 +1597,25 @@ impl Gallery {
         (last + 1 == entries.len() && past).then_some((None, entries.len()))
     }
 
+    /// Back from the stack open to the gallery, its artworks flying back into its cell.
+    fn leave_stack(&mut self) {
+        if let Some((dir, name)) = self.stack.take() {
+            let cells = std::mem::take(&mut self.drawn_cells);
+            self.leaving_stack = Some(LeavingStack { dir, name, cells, since: Instant::now() });
+        }
+        self.refresh();
+    }
+
     /// A lifted artwork (or stack) follows the pointer, its cell faint behind; let go, it goes where
     /// it was let go: onto another to stack with it, between cells to move there, or (in a stack)
-    /// on the way back, out to the gallery's front.
+    /// on the way back, out to the gallery's front. Resting a moment on a stack opens it, and on
+    /// the way back opens the gallery, the drag going on: so an artwork is put in a stack, or
+    /// taken out of one to wherever in the gallery it is let go.
     fn drag(&mut self, ui: &Ui, entries: &[GalleryEntry], cells: &[(usize, Rect)]) {
         let Some((dir, from)) = self.lifted.clone() else { return };
-        let Some(entry) = entries.iter().find(|e| entry_dir(e) == dir).cloned() else {
+        // shown here, or carried in from where it was lifted (into a stack, or out of one)
+        let here = entries.iter().position(|e| entry_dir(e) == dir);
+        let Some(entry) = here.and_then(|i| entries.get(i).cloned()).or_else(|| self.lifted_entry.clone()) else {
             self.lifted = None;
             return;
         };
@@ -1412,6 +1633,42 @@ impl Gallery {
         }
         let stacking = self.stack.is_none() && matches!(entry, GalleryEntry::Artwork { .. });
         let target = pointer.and_then(|p| Self::drop_at(entries, cells, &dir, p, stacking));
+        let back = self.stack.is_some() && pointer.is_some_and(|p| self.back.contains(p));
+        // what it rests on that opens: the way back, or a stack it would be put in
+        let rests_on = if back {
+            Some(String::new())
+        } else {
+            match &target {
+                Some((Some(onto), _))
+                    if entries.iter().any(|e| matches!(e, GalleryEntry::Stack { dir, .. } if dir == onto)) =>
+                {
+                    Some(onto.clone())
+                }
+                _ => None,
+            }
+        };
+        let now_ms = (ui.input(|i| i.time) * 1000.0) as i64;
+        if down && self.rest.over(rests_on.as_deref(), now_ms) {
+            match rests_on.as_deref() {
+                Some("") => self.leave_stack(),
+                Some(stack) => {
+                    let opened = cells.iter().find_map(|&(i, cell)| match entries.get(i) {
+                        Some(GalleryEntry::Stack { dir, name, .. }) if dir == stack => {
+                            Some((dir.clone(), name.clone(), cell))
+                        }
+                        _ => None,
+                    });
+                    if let Some((dir, name, cell)) = opened {
+                        self.stack = Some((dir, name));
+                        self.opening_stack = Some((cell, Instant::now()));
+                        self.refresh();
+                    }
+                }
+                None => {}
+            }
+        } else if down && let Some(wait) = self.rest.waiting(now_ms) {
+            ui.ctx().request_repaint_after(Duration::from_millis(wait as u64));
+        }
         for &(i, cell) in cells {
             if entries.get(i).is_some_and(|e| entry_dir(e) == dir) {
                 ui.painter().rect_filled(cell, 0, argb(BACKGROUND).gamma_multiply(DRAGGED_FADE));
@@ -1432,12 +1689,18 @@ impl Gallery {
             GalleryEntry::Artwork { artwork } => Some(artwork.clone()),
             GalleryEntry::Stack { artworks, .. } => artworks.first().cloned(),
         };
-        if let (Some(a), Some(p), Some(&(_, cell))) =
-            (shown, pointer, cells.iter().find(|(i, _)| entries.get(*i).is_some_and(|e| entry_dir(e) == dir)))
+        // where its picture sits in its cell (as it last did, the cell gone with the gallery changing)
+        if let (Some(a), Some(&(_, cell))) =
+            (&shown, cells.iter().find(|(i, _)| entries.get(*i).is_some_and(|e| entry_dir(e) == dir)))
+        {
+            self.lifted_picture = Self::fitted(Self::thumb_box(cell), a);
+        }
+        if let (Some(a), Some(p)) = (shown, pointer)
+            && self.lifted_picture.is_positive()
         {
             // grown as it lifts, about where it is held
             let k = self.lifts.get(&dir).map_or(LIFTED.0, Lift::now);
-            let picture = Self::fitted(Self::thumb_box(cell), &a).translate(p - from);
+            let picture = self.lifted_picture.translate(p - from);
             let picture = Rect::from_min_max(p + (picture.min - p) * k, p + (picture.max - p) * k);
             let texture = self.texture(&a);
             let painter = ui.ctx().layer_painter(egui::LayerId::new(Order::Tooltip, Id::unique("lifted artwork")));
@@ -1455,29 +1718,35 @@ impl Gallery {
             return;
         }
         self.lifted = None;
-        if self.stack.is_some() && pointer.is_some_and(|p| self.back.contains(p)) {
+        self.lifted_entry = None;
+        self.rest = DragRest::default();
+        if back {
             self.store.move_entry(dir, 0, Some(self.store.root()));
         } else {
-            match target {
-                Some((Some(onto), _)) => self.store.put_onto(dir, onto),
-                Some((None, slot)) => {
-                    let at = entries.iter().position(|e| entry_dir(e) == dir).unwrap_or(slot);
+            match (target, here) {
+                (Some((Some(onto), _)), _) => self.store.put_onto(dir, onto),
+                (Some((None, slot)), Some(at)) => {
                     let to = if slot > at { slot - 1 } else { slot };
                     if to != at {
                         self.store.move_entry(dir, to as i64, None);
                     }
                 }
-                None => {}
+                // carried into a stack, or out of one into the gallery: there, at that place
+                (Some((None, slot)), None) => {
+                    let into = self.folder().unwrap_or_else(|| self.store.root());
+                    self.store.move_entry(dir, slot as i64, Some(into));
+                }
+                (None, _) => {}
             }
         }
         self.refresh();
     }
 
-    /// A swiped artwork's actions: Share, Duplicate and Delete as pills across the middle of its
-    /// thumbnail's box, the cell faded back under them.
-    /// A swiped artwork's actions, `open` of the way in (they grow from a fifth of their size
-    /// about their right end, fading in, as the artwork fades back); tappable once `shown`.
-    fn swipe_actions(&mut self, ui: &Ui, cell: Rect, a: &GalleryArtwork, open: f32, shown: bool) {
+    /// A swiped artwork's (or stack's) actions: Share, Duplicate and Delete as pills across the
+    /// middle of its thumbnail's box, the cell faded back under them, `open` of the way in (they
+    /// grow from a fifth of their size about their right end, fading in, as the cell fades back);
+    /// tappable once `shown`. A stack's act on all its artworks.
+    fn swipe_actions(&mut self, ui: &Ui, cell: Rect, on: &Swiped, open: f32, shown: bool) {
         let alpha = open.clamp(0.0, 1.0);
         ui.painter().rect_filled(cell, 0, argb(BACKGROUND).gamma_multiply(SWIPED_FADE * alpha));
         let frame = Self::thumb_box(cell);
@@ -1510,17 +1779,22 @@ impl Gallery {
                 match label {
                     "Duplicate" => {
                         self.swiped = None;
-                        self.duplicate(vec![a.dir.clone()]);
+                        self.duplicate(vec![on.dir.clone()]);
                     }
                     "Delete" => {
                         self.swiped = None;
-                        self.deleting = Some(a.dir.clone());
-                        let title = format!("Delete \u{201c}{}\u{201d}?", a.name);
-                        self.alert.open(&title, "This can't be undone.", "Delete", Some(&icons::TRASH));
+                        self.deleting = Some(on.dir.clone());
+                        let title = format!("Delete \u{201c}{}\u{201d}?", on.name);
+                        let message = if on.stack {
+                            format!("Its {} artworks go with it. This can't be undone.", on.artworks.len())
+                        } else {
+                            "This can't be undone.".to_owned()
+                        };
+                        self.alert.open(&title, &message, "Delete", Some(&icons::TRASH));
                     }
                     _ => {
                         self.swiped = None;
-                        self.sharing = Some((vec![a.clone()], Some(pill)));
+                        self.sharing = Some((on.artworks.clone(), Some(pill), on.name.clone()));
                     }
                 }
             }
@@ -1531,7 +1805,7 @@ impl Gallery {
     /// room (the other if that one is too narrow), kept 2 inside the window; or under Select's
     /// Share, centred on it, kept 4 inside. A tap on one shares in it, a tap off closes.
     fn formats(&mut self, ctx: &egui::Context, look: &mut Look, screen: Rect) -> Option<Asked> {
-        let (list, from) = self.sharing.clone()?;
+        let (list, from, group) = self.sharing.clone()?;
         let (width, n) = (FORMATS_WIDTH, SHARE_ROWS.len() as f32);
         let height = 55.0 + 40.0 * n + (n - 1.0) + 10.0;
         let (rect, arrow) = match from {
@@ -1615,7 +1889,7 @@ impl Gallery {
         match chosen? {
             // how well a PDF keeps its pictures, asked first
             ShareRow::Still(crate::files::Format::Pdf) => {
-                self.pdf_for = Some(list);
+                self.pdf_for = Some((list, group));
                 self.pdf_alert.ask(crate::alert::pdf_quality());
                 None
             }
@@ -1637,7 +1911,7 @@ impl Gallery {
 
     /// The artwork's picture as large as fits in `frame`, at its bottom middle.
     fn fitted(frame: Rect, a: &GalleryArtwork) -> Rect {
-        let ratio = if a.width > 0 && a.height > 0 { a.width as f32 / a.height as f32 } else { 0.75 };
+        let ratio = shown_ratio(a);
         let size = if ratio <= frame.width() / frame.height() {
             vec2(frame.height() * ratio, frame.height())
         } else {
@@ -1768,6 +2042,7 @@ impl Gallery {
         let frame = Self::thumb_box(cell);
         let picture = Self::fitted(frame, a);
         self.pictures.insert(a.dir.clone(), picture);
+        self.boxes.insert(a.dir.clone(), frame);
         // shrunk or grown about its middle as it is pressed or lifted; spread open, it is drawn
         // where the fingers have it instead
         let picture = Rect::from_center_size(picture.center(), picture.size() * scale);
@@ -1775,26 +2050,7 @@ impl Gallery {
             self.thumbnail(ui, picture, a, 0.0);
         }
         let chosen = self.picked.contains(&a.dir);
-        // the marks fade in as Select starts, and out as it ends
-        let marks = ui.ctx().animate_bool_with_time_and_easing(
-            Id::unique("select marks"),
-            self.selecting,
-            SELECT_FADE_S,
-            |t| crate::look::cubic_bezier(0.42, 0.0, 0.58, 1.0, t),
-        );
-        if marks > 0.0 {
-            // a circle at its top right: filled blue with a tick when picked, else a thin light ring
-            let mark = pos2(picture.right() - 12.0 - 7.0, picture.top() + 12.0 + 7.0);
-            if chosen {
-                ui.painter().circle_filled(mark, 7.0, argb(PICKED).gamma_multiply(marks));
-            } else {
-                let ring = Stroke::new(1.0, argb(UNPICKED_RING).gamma_multiply(marks));
-                ui.painter().circle_stroke(mark, 6.5, ring);
-            }
-        }
-        if chosen {
-            tick(ui.painter(), pos2(picture.right() - 19.0, picture.top() + 19.0));
-        }
+        self.select_mark(ui, picture, chosen);
         let ink = if self.selecting && chosen { Color32::WHITE } else { argb(TEXT) };
         let name = one_line(ui, &a.name, 13.0, Weight::SemiBold, ink, frame.width());
         let at = pos2(cell.center().x - name.size().x / 2.0, frame.bottom() + 12.0);
@@ -1812,7 +2068,31 @@ impl Gallery {
         Rect::from_min_size(at, name.size())
     }
 
-    fn stack_cell(&mut self, ui: &Ui, cell: Rect, name: &str, artworks: &[GalleryArtwork]) {
+    /// Selecting, the mark at the top right of a `picture` (an artwork's, or a stack's top card):
+    /// filled blue with a tick when `chosen`, else a thin light ring; the marks fade in as Select
+    /// starts, and out as it ends.
+    fn select_mark(&self, ui: &Ui, picture: Rect, chosen: bool) {
+        let marks = ui.ctx().animate_bool_with_time_and_easing(
+            Id::unique("select marks"),
+            self.selecting,
+            SELECT_FADE_S,
+            |t| crate::look::cubic_bezier(0.42, 0.0, 0.58, 1.0, t),
+        );
+        if marks > 0.0 {
+            let mark = pos2(picture.right() - 12.0 - 7.0, picture.top() + 12.0 + 7.0);
+            if chosen {
+                ui.painter().circle_filled(mark, 7.0, argb(PICKED).gamma_multiply(marks));
+            } else {
+                let ring = Stroke::new(1.0, argb(UNPICKED_RING).gamma_multiply(marks));
+                ui.painter().circle_stroke(mark, 6.5, ring);
+            }
+        }
+        if chosen {
+            tick(ui.painter(), pos2(picture.right() - 19.0, picture.top() + 19.0));
+        }
+    }
+
+    fn stack_cell(&mut self, ui: &Ui, cell: Rect, dir: &str, name: &str, artworks: &[GalleryArtwork]) {
         let Some(top) = artworks.first() else { return };
         let frame = Self::thumb_box(cell);
         let picture = Self::fitted(frame, top);
@@ -1823,8 +2103,10 @@ impl Gallery {
             }
         }
         self.thumbnail(ui, picture, top, 0.0);
-        // selecting, a stack can't be picked: its name dims
-        let ink = if self.selecting { argb(SIZE) } else { argb(TEXT) };
+        // selecting, it is picked as an artwork is: the mark on its top card, its name white
+        let chosen = self.picked.iter().any(|d| d == dir);
+        self.select_mark(ui, picture, chosen);
+        let ink = if self.selecting && chosen { Color32::WHITE } else { argb(TEXT) };
         let label = one_line(ui, name, 13.0, Weight::SemiBold, ink, frame.width());
         let at = pos2(cell.center().x - label.size().x / 2.0, frame.bottom() + 12.0);
         ui.painter().galley(at, label.clone(), Color32::WHITE);
@@ -2038,6 +2320,53 @@ fn presets_path() -> std::path::PathBuf {
 /// The most memory (bytes) an animation's frames take in Preview: past it they are smaller.
 const PLAYED_MOST: f64 = 256e6;
 
+/// The gallery thumbnail's longest side (the core's project.rs): an artwork Preview shows no
+/// larger has its thumbnail to show.
+const THUMBNAIL_SIDE: u32 = 512;
+
+/// The artwork shown in Preview drawn whole at `side` pixels on its longest side (as large as it
+/// shows), as its thumbnail is made: on a thread of its own, the thumbnail shown till then. None
+/// is made for one that plays (its frames show) or whose opening ended the app before.
+struct Sharp {
+    dir: String,
+    modified_ms: i64,
+    side: u32,
+    read: Option<std::sync::mpsc::Receiver<Option<egui::ColorImage>>>,
+    texture: Option<TextureHandle>,
+}
+
+impl Sharp {
+    fn start(a: &GalleryArtwork, side: u32) -> Sharp {
+        let (done, read) = std::sync::mpsc::channel();
+        let dir = a.dir.clone();
+        let _ = std::thread::Builder::new().name("preview".into()).spawn(move || {
+            let left = procraft_core::artwork_plays(dir.clone()) || procraft_core::opening_ended_app(dir.clone());
+            let made = if left { None } else { procraft_core::artwork_preview_png(dir, side) };
+            let image = made
+                .and_then(|png| crate::files::png_rgba(&png))
+                .filter(|(w, h, rgba)| rgba.len() == *w as usize * *h as usize * 4)
+                .map(|(w, h, rgba)| egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba));
+            let _ = done.send(image);
+        });
+        Sharp { dir: a.dir.clone(), modified_ms: a.modified_ms, side, read: Some(read), texture: None }
+    }
+
+    /// The picture once made (looked for again soon until then).
+    fn texture(&mut self, ctx: &egui::Context) -> Option<egui::TextureId> {
+        if let Some(read) = &self.read {
+            match read.try_recv() {
+                Ok(image) => {
+                    self.read = None;
+                    self.texture = image.map(|i| ctx.load_texture("preview", i, egui::TextureOptions::LINEAR));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint_after(Duration::from_millis(50)),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.read = None,
+            }
+        }
+        self.texture.as_ref().map(TextureHandle::id)
+    }
+}
+
 /// An artwork's frames as read for Preview, and how they play.
 struct PlayedFrames {
     pictures: Vec<procraft_core::ThumbnailImage>,
@@ -2153,7 +2482,12 @@ fn read_frames(dir: String, side: u32) -> Option<PlayedFrames> {
     let count = session.animation_frame_count();
     let fit = (PLAYED_MOST / 4.0 / f64::from(count.max(1))).sqrt() as u32;
     let pictures: Vec<_> = (0..count).filter_map(|i| session.animation_frame(i, false, side.min(fit))).collect();
-    Some(PlayedFrames { pictures, order: session.animation_sequence(), fps: settings.fps, playback: settings.playback })
+    Some(PlayedFrames {
+        pictures,
+        order: session.animation_play_order(),
+        fps: settings.fps,
+        playback: settings.playback,
+    })
 }
 
 /// A thread reading the gallery's thumbnails one after another: an artwork's folder, when it was
@@ -2187,11 +2521,368 @@ impl ThumbnailReader {
     }
 }
 
+/// Select's action for a button of the title row.
+fn select_action(action: GalleryAction) -> SelectAction {
+    match action {
+        GalleryAction::Stack => SelectAction::Stack,
+        GalleryAction::Preview => SelectAction::Preview,
+        GalleryAction::Share => SelectAction::Share,
+        GalleryAction::Duplicate => SelectAction::Duplicate,
+        GalleryAction::Delete => SelectAction::Delete,
+        GalleryAction::Select | GalleryAction::Import | GalleryAction::Photo | GalleryAction::More => {
+            SelectAction::More
+        }
+    }
+}
+
+/// A title-row button's name, as More's list shows it.
+fn action_label(action: GalleryAction) -> &'static str {
+    match action {
+        GalleryAction::Select => "Select",
+        GalleryAction::Import => "Import",
+        GalleryAction::Photo => "Photo",
+        GalleryAction::Stack => "Stack",
+        GalleryAction::Preview => "Preview",
+        GalleryAction::Share => "Share",
+        GalleryAction::Duplicate => "Duplicate",
+        GalleryAction::Delete => "Delete",
+        GalleryAction::More => "More",
+    }
+}
+
+/// The title row's `name` placed at `at` by `align` as at its own size (36, bold): at that size
+/// as it always was where it fits; else shrunk as `fit` says, about the same middle, on one line
+/// cut short past the room it gets. Where it is.
+fn title_text(ui: &Ui, at: Pos2, align: Align2, name: &str, ink: Color32, fit: &GalleryHeaderFit) -> Rect {
+    let own = ui.painter().layout_no_wrap(name.to_owned(), Weight::Bold.font(36.0), ink).size();
+    if fit.title_scale >= 1.0 && own.x <= fit.title_room + 0.5 {
+        return text(ui.painter(), at, align, name, 36.0, Weight::Bold, ink);
+    }
+    let middle = match align.y() {
+        egui::Align::Min => at.y + own.y / 2.0,
+        egui::Align::Center => at.y,
+        egui::Align::Max => at.y - own.y / 2.0,
+    };
+    let galley = one_line(ui, name, 36.0 * fit.title_scale, Weight::Bold, ink, fit.title_room.max(1.0));
+    let rect = Align2::LEFT_CENTER.anchor_size(pos2(at.x, middle), galley.size());
+    ui.painter().galley(rect.min, galley, ink);
+    rect
+}
+
+/// An artwork's width over its height as the gallery shows it (on its side, the other way).
+fn shown_ratio(a: &GalleryArtwork) -> f32 {
+    let upright = if a.width > 0 && a.height > 0 { a.width as f32 / a.height as f32 } else { 0.75 };
+    if a.turns % 2 == 1 { 1.0 / upright } else { upright }
+}
+
 #[cfg(test)]
 mod tests {
-    use egui::{Rect, pos2, vec2};
+    use egui::{Event, PointerButton, Pos2, RawInput, Rect, pos2, vec2};
 
-    use super::formats_beside;
+    use super::*;
+
+    /// The gallery's grid (and Share's formats once open) shown a frame at a time.
+    struct Shown {
+        ctx: egui::Context,
+        look: Look,
+        gallery: Gallery,
+        time: f64,
+        /// The window's size.
+        size: egui::Vec2,
+    }
+
+    impl Shown {
+        fn frame(&mut self, events: Vec<Event>) -> Option<Asked> {
+            self.time += 1.0 / 60.0;
+            let raw = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, self.size)),
+                time: Some(self.time),
+                events,
+                ..RawInput::default()
+            };
+            let Shown { ctx, look, gallery, .. } = self;
+            let mut asked = None;
+            let mut output = ctx.clone().run_ui(raw, |ui| {
+                let screen = ui.ctx().content_rect();
+                asked = gallery.grid(ui, Rect::from_min_max(pos2(0.0, HEADER), screen.max));
+                if gallery.sharing.is_some() {
+                    asked = gallery.formats(ui.ctx(), look, screen).or(asked.take());
+                }
+            });
+            output.textures_delta.clear();
+            asked
+        }
+
+        /// A frame of the whole page, its header too.
+        fn page(&mut self, events: Vec<Event>) {
+            self.time += 1.0 / 60.0;
+            let raw = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, self.size)),
+                time: Some(self.time),
+                events,
+                ..RawInput::default()
+            };
+            let Shown { ctx, look, gallery, .. } = self;
+            let mut output = ctx.clone().run_ui(raw, |ui| {
+                gallery.page(ui.ctx(), look, Order::Background, 1.0, false);
+            });
+            output.textures_delta.clear();
+        }
+
+        /// Pages shown for `secs` with the pointer at `at` (held down or not).
+        fn wait_at(&mut self, at: Pos2, secs: f64) {
+            for _ in 0..(secs * 60.0).ceil() as usize {
+                self.page(vec![Event::PointerMoved(at)]);
+            }
+        }
+
+        fn button(at: Pos2, pressed: bool) -> Event {
+            Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE }
+        }
+
+        fn click(&mut self, at: Pos2) {
+            self.frame(vec![Event::PointerMoved(at), Shown::button(at, true)]);
+            self.frame(vec![Shown::button(at, false)]);
+        }
+
+        /// A quick drag `by` from `from`.
+        fn drag(&mut self, from: Pos2, by: egui::Vec2) {
+            self.frame(vec![Event::PointerMoved(from), Shown::button(from, true)]);
+            for k in 1..=6 {
+                self.frame(vec![Event::PointerMoved(from + by * (k as f32 / 6.0))]);
+            }
+            self.frame(vec![Shown::button(from + by, false)]);
+        }
+
+        fn settle(&mut self) {
+            for _ in 0..40 {
+                self.frame(Vec::new());
+            }
+        }
+    }
+
+    /// A gallery of its own holding a stack, "Pair", of two artworks; the stack's folder.
+    fn with_a_stack(name: &str) -> (Shown, String, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("procraft-desk-gallery-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = ArtworkStore::open(root.to_string_lossy().into_owned());
+        let artwork = |name: &str| {
+            let dir = store.new_folder(None);
+            let json = format!(r#"{{"name":"{name}","document":{{"width":64,"height":32}}}}"#);
+            std::fs::write(std::path::Path::new(&dir).join("artwork.json"), json).unwrap();
+            dir
+        };
+        let (a, b) = (artwork("A"), artwork("B"));
+        // in a known order (made in the same moment, they may share a time)
+        store.move_entry(a.clone(), 0, None);
+        store.move_entry(b.clone(), 1, None);
+        let stack = store.stack(vec![a, b]);
+        store.rename_stack(stack.clone(), "Pair".into());
+        let shown = Shown {
+            ctx: egui::Context::default(),
+            look: Look::default(),
+            gallery: Gallery::with_store(store),
+            time: 0.0,
+            size: vec2(1200.0, 900.0),
+        };
+        (shown, stack, root)
+    }
+
+    #[test]
+    fn a_stack_swiped_left_shares_all_its_artworks_named_after_it() {
+        let (mut shown, stack, root) = with_a_stack("share");
+        shown.frame(Vec::new());
+        let cell = shown.gallery.drawn_cells.iter().find(|(e, _)| entry_dir(e) == stack).map(|(_, c)| *c).unwrap();
+        // dragged left: its actions open
+        shown.drag(cell.center(), vec2(-120.0, 0.0));
+        assert_eq!(shown.gallery.swiped.as_deref(), Some(stack.as_str()));
+        shown.settle();
+        // Share, the first pill across the thumbnail's middle
+        let frame = Gallery::thumb_box(cell);
+        let left = cell.center().x - (SWIPE_PILL.0 * 3.0 + 6.0) / 2.0;
+        shown.click(pos2(left + SWIPE_PILL.0 / 2.0, frame.center().y));
+        let (list, from, group) = shown.gallery.sharing.clone().expect("Share's formats open");
+        let names: Vec<&str> = list.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["A", "B"]);
+        assert!(from.is_some());
+        assert_eq!(group, "Pair");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stack_swiped_left_is_deleted_whole_after_asking() {
+        let (mut shown, stack, root) = with_a_stack("delete");
+        shown.frame(Vec::new());
+        let cell = shown.gallery.drawn_cells.iter().find(|(e, _)| entry_dir(e) == stack).map(|(_, c)| *c).unwrap();
+        shown.drag(cell.center(), vec2(-120.0, 0.0));
+        shown.settle();
+        let frame = Gallery::thumb_box(cell);
+        let left = cell.center().x - (SWIPE_PILL.0 * 3.0 + 6.0) / 2.0;
+        // Delete, the third
+        shown.click(pos2(left + (SWIPE_PILL.0 + 3.0) * 2.0 + SWIPE_PILL.0 / 2.0, frame.center().y));
+        assert_eq!(shown.gallery.deleting.as_deref(), Some(stack.as_str()));
+        assert!(shown.gallery.alert.is_open());
+        assert!(std::path::Path::new(&stack).exists(), "nothing goes before the answer");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn selecting_picks_a_stack_with_artworks_and_stacks_them_all_in_it() {
+        let (mut shown, stack, root) = with_a_stack("pick");
+        // a loose artwork after the stack
+        let store = Arc::clone(&shown.gallery.store);
+        let c = store.new_folder(None);
+        std::fs::write(
+            std::path::Path::new(&c).join("artwork.json"),
+            r#"{"name":"C","document":{"width":64,"height":32}}"#,
+        )
+        .unwrap();
+        store.move_entry(c.clone(), 1, None);
+        shown.gallery.refresh();
+        shown.gallery.selecting = true;
+        shown.frame(Vec::new());
+        let cell_of = |shown: &Shown, dir: &str| {
+            shown.gallery.drawn_cells.iter().find(|(e, _)| entry_dir(e) == dir).map(|(_, c)| *c).unwrap()
+        };
+        // a tap on the stack picks it, as a tap on an artwork does
+        shown.click(cell_of(&shown, &stack).center());
+        shown.click(cell_of(&shown, &c).center());
+        assert_eq!(shown.gallery.picked, [stack.clone(), c.clone()]);
+        assert!(shown.gallery.can(SelectAction::Stack));
+        assert!(shown.gallery.can(SelectAction::Delete));
+        // Preview and Share take the stack's artworks with the loose one
+        let names: Vec<String> = shown.gallery.pick().artworks.into_iter().map(|a| a.name).collect();
+        assert_eq!(names, ["A", "B", "C"]);
+        // Stack: the stack takes the artwork in, keeping its name
+        shown.gallery.act(SelectAction::Stack);
+        let shown_now: Vec<String> = store
+            .list(None)
+            .iter()
+            .map(|e| match e {
+                GalleryEntry::Artwork { artwork } => artwork.name.clone(),
+                GalleryEntry::Stack { name, artworks, .. } => format!("{name}{}", artworks.len()),
+            })
+            .collect();
+        assert_eq!(shown_now, ["Pair3"]);
+        assert!(!shown.gallery.selecting);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_artwork_rested_on_the_way_back_is_carried_out_of_its_stack_into_the_gallery() {
+        let (mut shown, stack, root) = with_a_stack("out");
+        // a third artwork, loose in the gallery after the stack
+        let store = Arc::clone(&shown.gallery.store);
+        let c = store.new_folder(None);
+        std::fs::write(
+            std::path::Path::new(&c).join("artwork.json"),
+            r#"{"name":"C","document":{"width":64,"height":32}}"#,
+        )
+        .unwrap();
+        store.move_entry(c.clone(), 1, None);
+        shown.gallery.refresh();
+        // into the stack
+        shown.gallery.stack = Some((stack.clone(), "Pair".into()));
+        shown.gallery.refresh();
+        // a new area shows from its second frame
+        shown.page(Vec::new());
+        shown.page(Vec::new());
+        let (b, cell) = shown
+            .gallery
+            .drawn_cells
+            .iter()
+            .find_map(|(e, c)| match e {
+                GalleryEntry::Artwork { artwork } if artwork.name == "B" => Some((artwork.dir.clone(), *c)),
+                _ => None,
+            })
+            .unwrap();
+        // held still, it lifts
+        let at = cell.center();
+        shown.page(vec![Event::PointerMoved(at), Shown::button(at, true)]);
+        shown.wait_at(at, HOLD_S + 0.1);
+        assert_eq!(shown.gallery.lifted.as_ref().map(|l| l.0.as_str()), Some(b.as_str()));
+        // onto the way back (the stack's title): lit, and still in the stack until it has rested
+        let way_back = pos2(120.0, 32.0);
+        shown.wait_at(way_back, 0.3);
+        assert!(shown.gallery.stack.is_some());
+        assert_eq!(shown.gallery.rest.resting_on(), Some(""));
+        // rested long enough: the gallery, the artwork still held
+        shown.wait_at(way_back, 0.4);
+        assert!(shown.gallery.stack.is_none(), "the gallery opens");
+        assert!(shown.gallery.lifted.is_some(), "the drag goes on");
+        // let go after C (the gallery's last cell, on its right half): out of the stack, there
+        shown.wait_at(way_back, 0.5);
+        let last = shown
+            .gallery
+            .drawn_cells
+            .iter()
+            .find_map(|(e, c)| matches!(e, GalleryEntry::Artwork { artwork } if artwork.name == "C").then_some(*c))
+            .unwrap();
+        let drop = pos2(last.right() - 10.0, last.bottom() - 10.0);
+        shown.wait_at(drop, 0.2);
+        shown.page(vec![Shown::button(drop, false)]);
+        let names: Vec<String> = store
+            .list(None)
+            .iter()
+            .map(|e| match e {
+                GalleryEntry::Artwork { artwork } => artwork.name.clone(),
+                GalleryEntry::Stack { name, artworks, .. } => format!("{name}{}", artworks.len()),
+            })
+            .collect();
+        assert_eq!(names, ["Pair1", "C", "B"]);
+        assert!(!std::path::Path::new(&b).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_artwork_let_go_on_the_way_back_goes_to_the_front_of_the_gallery() {
+        let (mut shown, stack, root) = with_a_stack("back");
+        shown.gallery.stack = Some((stack.clone(), "Pair".into()));
+        shown.gallery.refresh();
+        // a new area shows from its second frame
+        shown.page(Vec::new());
+        shown.page(Vec::new());
+        let cell = shown.gallery.drawn_cells.last().map(|(_, c)| *c).unwrap();
+        let at = cell.center();
+        shown.page(vec![Event::PointerMoved(at), Shown::button(at, true)]);
+        shown.wait_at(at, HOLD_S + 0.1);
+        assert!(shown.gallery.lifted.is_some());
+        // let go at once on the way back
+        let way_back = pos2(120.0, 32.0);
+        shown.wait_at(way_back, 0.1);
+        shown.page(vec![Shown::button(way_back, false)]);
+        let store = Arc::clone(&shown.gallery.store);
+        let first = store.list(None).into_iter().next();
+        assert!(matches!(first, Some(GalleryEntry::Artwork { artwork }) if artwork.name == "B"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_narrow_window_puts_the_buttons_under_more_beside_a_whole_title() {
+        let (mut shown, _stack, root) = with_a_stack("narrow");
+        // as wide as a phone upright
+        shown.size = vec2(400.0, 800.0);
+        shown.page(Vec::new());
+        shown.page(Vec::new());
+        let fit = shown.gallery.header_fit.clone().unwrap();
+        assert_eq!(fit.buttons.iter().map(|b| b.action).collect::<Vec<_>>(), [GalleryAction::More]);
+        assert_eq!(fit.more, [GalleryAction::Select, GalleryAction::Import, GalleryAction::Photo]);
+        assert_eq!(fit.title_scale, 1.0, "the name fits whole beside More and +");
+        // More opens its list, inside the window
+        let more = shown.gallery.more_button;
+        assert!(more.left() > 0.0 && more.right() < 400.0 - 20.0 - 44.0);
+        shown.page(vec![Event::PointerMoved(more.center()), Shown::button(more.center(), true)]);
+        shown.page(vec![Shown::button(more.center(), false)]);
+        assert!(shown.gallery.more_open);
+        // as wide as a tablet: Select, Import and Photo, as always
+        shown.gallery.more_open = false;
+        shown.size = vec2(1200.0, 900.0);
+        shown.page(Vec::new());
+        let fit = shown.gallery.header_fit.clone().unwrap();
+        assert_eq!(fit.buttons.len(), 3);
+        assert!(fit.more.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn share_formats_go_where_there_is_room_and_point_at_the_pill() {

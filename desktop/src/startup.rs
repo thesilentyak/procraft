@@ -23,8 +23,21 @@
 //! A crash (or a panic on the window's thread) while a backend starts, or as a canvas first draws
 //! on it, starts the app again at once on the next backend, until each has been tried; then, or
 //! where it can't start again, it says why it stopped (see [`stopped`]).
+//!
+//! A tablet's driver can take the app down too, in its WinTab (Windows): a record of it says
+//! "trying" while the app starts it, "made" once it has, "crashed" after a crash in its file, then
+//! the app's version. A start after "trying" or "crashed" leaves WinTab off, the pen coming through
+//! Windows Ink alone, until another version tries it again (see [`wintab_trying`]).
+//!
+//! A crash in native code is written into the log as it happens, with the frames that led to it:
+//! on Windows by the app's exception filter (`native`), on Linux and a Mac by its signal handler
+//! (`signals`), the system's own crash report following. Each run's part of the log begins with
+//! its process, so a start tells in its own log how the runs in the run before's ended (its "last
+//! runs", as the tablet tells what the system kept of them), and the question about an artwork
+//! whose opening closed the app can say whether that run crashed (see `procraft_core::run_ends`).
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
@@ -42,6 +55,9 @@ const GPU_START: &str = "gpu-start.txt";
 /// There while Direct3D 12 is being asked which GPUs there are: a driver that crashes as it is
 /// asked mustn't do so at every start.
 const GPU_ASKING: &str = "gpu-asking.txt";
+/// How far the app last got with a tablet driver's WinTab, and the version that got there.
+#[cfg_attr(not(windows), allow(dead_code))]
+const WINTAB: &str = "wintab.txt";
 
 /// This run's part in the record.
 static RUN: Mutex<Run> = Mutex::new(Run::NEW);
@@ -63,30 +79,41 @@ const START_WATCH_MOST: Duration = Duration::from_secs(10 * 60);
 /// When the app was started.
 static LAUNCHED: OnceLock<Instant> = OnceLock::new();
 
+/// The log of the run before this one (the one a crash ended, after one), else this run's: what to
+/// send on when asked for it.
+pub fn last_run_log() -> PathBuf {
+    let dir = files::app_dir();
+    let before = dir.join(PREVIOUS_LOG);
+    if before.is_file() { before } else { dir.join(LOG) }
+}
+
+/// The log of run (process) `run`, if a log in the app's folder has its part, else the run
+/// before's (see [`last_run_log`]): what to send on about an artwork whose opening closed it.
+pub fn log_of_run(run: Option<u32>) -> PathBuf {
+    run.and_then(|run| procraft_core::log_of_run(&files::app_dir(), run)).unwrap_or_else(last_run_log)
+}
+
+/// What the question about an artwork whose opening closed the app says, by how run `run` (the
+/// one it closed) ended, as the logs in the app's folder tell: a crash, or not known.
+pub fn opening_ended_said(run: Option<u32>) -> String {
+    opening_ended_said_in(&files::app_dir(), run)
+}
+
+/// [`opening_ended_said`] with the logs in `dir`.
+fn opening_ended_said_in(dir: &Path, run: Option<u32>) -> String {
+    let end = run.map_or(procraft_core::RunEnd::Unknown, |run| procraft_core::run_end_in_folder(dir, run));
+    procraft_core::opening_ended_app_said_after(end)
+}
+
 /// The log to the terminal and to the app folder's log file, and a crash's message into it. A
 /// start the app made itself on another graphics backend goes on in the same log, so it holds
 /// every backend's try (the run before them all stays the previous log).
 pub fn init() {
     LAUNCHED.get_or_init(Instant::now);
     let dir = files::app_dir();
-    let _ = std::fs::create_dir_all(&dir);
     let tried = gpu_tried();
-    let file = if tried > 0 {
-        std::fs::OpenOptions::new().create(true).append(true).open(dir.join(LOG))
-    } else {
-        let _ = std::fs::rename(dir.join(LOG), dir.join(PREVIOUS_LOG));
-        std::fs::File::create(dir.join(LOG))
-    };
-    *LOG_FILE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = file.ok();
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        // a system font it can't read is left out; one line for each says nothing to act on
-        .filter_module("fontdb", log::LevelFilter::Error)
-        // each line with the time since the app started: where a slow start spent it shows
-        .format(|out, record| {
-            writeln!(out, "[{:>7} ms {:<5} {}] {}", since_launch(), record.level(), record.target(), record.args())
-        })
-        .target(env_logger::Target::Pipe(Box::new(Both)))
-        .init();
+    open_log(&dir, tried > 0);
+    start_logger();
     let before = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         log::error!("panicked: {info}\n{}", std::backtrace::Backtrace::force_capture());
@@ -94,8 +121,72 @@ pub fn init() {
     }));
     let again = if tried > 0 { format!(", started again with {tried} graphics backends tried") } else { String::new() };
     log::info!("ProCraft {} on {} {}{again}", env!("PROCRAFT_VERSION"), std::env::consts::OS, std::env::consts::ARCH);
+    watch_crashes();
+    // (a start the app made itself has the run before it above, in the same log)
+    if tried == 0 {
+        tell_last_runs(dir);
+    }
+}
+
+/// The log's file in `dir`, kept for the log's lines (see [`begin_log`]).
+fn open_log(dir: &Path, again: bool) {
+    let _ = std::fs::create_dir_all(dir);
+    *LOG_FILE.lock().unwrap_or_else(PoisonError::into_inner) = begin_log(dir, again).ok();
+}
+
+/// The log's file in `dir`: a new one, the one before kept as the run before's, or, for a start
+/// the app made itself (`again`), the same one gone on with. It says first which run (process)
+/// the lines after it are of.
+fn begin_log(dir: &Path, again: bool) -> std::io::Result<std::fs::File> {
+    let mut file = if again {
+        std::fs::OpenOptions::new().create(true).append(true).open(dir.join(LOG))?
+    } else {
+        let _ = std::fs::rename(dir.join(LOG), dir.join(PREVIOUS_LOG));
+        std::fs::File::create(dir.join(LOG))?
+    };
+    let _ = file.write_all(procraft_core::process_line(std::process::id()).as_bytes());
+    Ok(file)
+}
+
+/// The log, to the terminal and the log's file.
+fn start_logger() {
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        // a system font it can't read is left out; one line for each says nothing to act on
+        .filter_module("fontdb", log::LevelFilter::Error)
+        // each line with the time since the app started: where a slow start spent it shows
+        .format(|out, record| {
+            writeln!(out, "[{:>7} ms {:<5} {}] {}", since_launch(), record.level(), record.target(), record.args())
+        })
+        .target(env_logger::Target::Pipe(Box::new(Both)))
+        .try_init();
+}
+
+/// A crash in native code logged as it happens, into the log's file (see `native` on Windows,
+/// `signals` on Linux and a Mac).
+fn watch_crashes() {
     #[cfg(windows)]
     native::watch();
+    #[cfg(unix)]
+    {
+        // (the file's lock let go first: watching logs)
+        let file = LOG_FILE.lock().unwrap_or_else(PoisonError::into_inner).as_ref().and_then(|f| f.try_clone().ok());
+        if let Some(file) = file {
+            signals::watch(file);
+        }
+    }
+}
+
+/// How the runs in the run before's log ended, told in this run's log ("last runs"), on a thread of
+/// its own: the start doesn't wait for the log to be read.
+fn tell_last_runs(dir: PathBuf) {
+    let told = std::thread::Builder::new().name("procraft-last-runs".to_owned()).spawn(move || {
+        for said in procraft_core::last_runs_in_folder(&dir) {
+            log::info!(target: "last runs", "{said}");
+        }
+    });
+    if let Err(e) = told {
+        log::warn!("how the last runs ended: {e}");
+    }
 }
 
 /// Writes to the terminal and, while it is kept, the log file (each line as it comes, so a crash
@@ -132,7 +223,7 @@ pub fn start_again(tried: Option<usize>) -> bool {
 /// started. The log is let go only if no other thread holds it (a crash may have stopped one that
 /// did).
 fn spawn_again(tried: Option<usize>, with_files: bool) -> bool {
-    log::info!("starting again");
+    log::info!("{}", procraft_core::RUN_STARTING_AGAIN);
     if let Ok(mut file) = LOG_FILE.try_lock() {
         file.take();
     }
@@ -202,29 +293,11 @@ pub fn backend_order() -> &'static [usize] {
         if keeps_backend(&saved, backends.len(), ENDS_TOLD) {
             return listed;
         }
-        let asking = files::app_dir().join(GPU_ASKING);
-        if recorded() {
-            if asking.exists() {
-                log::warn!("the last start stopped as Direct3D 12 listed the GPUs: the backends in their order");
-                return listed;
-            }
-            if let Err(e) = files::write_whole(&asking, b"asking") {
-                log::warn!("keeping that the GPUs are being listed: {e}");
-            }
-        }
-        // as Direct3D 12 sees them: Vulkan's driver is what may crash, so it isn't asked
-        let started = Instant::now();
-        let seen = std::panic::catch_unwind(|| Gpu::adapters(wgpu::Backends::DX12)).unwrap_or_else(|panic| {
-            log::warn!("the GPUs couldn't be listed: {}", procraft_gpu::panic_message(panic.as_ref()));
-            Vec::new()
-        });
-        if recorded() {
-            let _ = std::fs::remove_file(&asking);
-        }
-        let gpus: Vec<(u32, wgpu::DeviceType)> = seen.iter().map(|a| (a.vendor, a.device_type)).collect();
-        let picked = drawn_with(&gpus).and_then(|i| seen.get(i));
-        let order = order_for(&backends, picked.map(|a| (a.vendor, a.device_type)));
-        let took = started.elapsed().as_millis();
+        let Some((picked, took)) = d3d12_choice() else {
+            log::warn!("the last start stopped as Direct3D 12 listed the GPUs: the backends in their order");
+            return listed;
+        };
+        let order = order_for(&backends, picked.as_ref().map(|a| (a.vendor, a.device_type)));
         match picked {
             Some(gpu) if order != listed => log::info!(
                 "the GPU to draw with is {} ({:?}, vendor {:#06x}; listed by Direct3D 12 in {took} ms): {} first",
@@ -243,6 +316,72 @@ pub fn backend_order() -> &'static [usize] {
         }
         order
     })
+}
+
+/// The GPU Direct3D 12 would draw with (see [`drawn_with`]), as it lists them, once a run, and how
+/// long that took (ms); none where they can't be listed: the last start stopped as they were (a
+/// driver that crashes as it is asked mustn't do so at every start).
+fn d3d12_choice() -> Option<&'static (Option<wgpu::AdapterInfo>, u128)> {
+    static CHOICE: OnceLock<Option<(Option<wgpu::AdapterInfo>, u128)>> = OnceLock::new();
+    CHOICE
+        .get_or_init(|| {
+            let asking = files::app_dir().join(GPU_ASKING);
+            if recorded() {
+                if asking.exists() {
+                    return None;
+                }
+                if let Err(e) = files::write_whole(&asking, b"asking") {
+                    log::warn!("keeping that the GPUs are being listed: {e}");
+                }
+            }
+            // as Direct3D 12 sees them: Vulkan's driver is what may crash, so it isn't asked
+            let started = Instant::now();
+            let seen = std::panic::catch_unwind(|| Gpu::adapters(wgpu::Backends::DX12)).unwrap_or_else(|panic| {
+                log::warn!("the GPUs couldn't be listed: {}", procraft_gpu::panic_message(panic.as_ref()));
+                Vec::new()
+            });
+            if recorded() {
+                let _ = std::fs::remove_file(&asking);
+            }
+            let gpus: Vec<(u32, wgpu::DeviceType)> = seen.iter().map(|a| (a.vendor, a.device_type)).collect();
+            let picked = drawn_with(&gpus).and_then(|i| seen.get(i)).cloned();
+            Some((picked, started.elapsed().as_millis()))
+        })
+        .as_ref()
+}
+
+/// The window's device is made on `gpu`: on OpenGL under Windows, which GPU that is is logged
+/// beside the one Direct3D 12 would draw with, and a mismatch warned of. OpenGL draws on the GPU
+/// the drivers give the app, not the one wgpu picks: on a laptop of two GPUs it was the integrated
+/// one, its frames slow, before the app asked the drivers for the faster (see `main.rs`).
+pub fn gpu_drawing(gpu: &wgpu::AdapterInfo) {
+    if !cfg!(windows) || gpu.backend != wgpu::Backend::Gl {
+        return;
+    }
+    match d3d12_choice() {
+        None => log::info!("OpenGL draws on {} (Direct3D 12 isn't asked which GPU it would draw with)", gpu.name),
+        Some((None, _)) => log::info!("OpenGL draws on {} (Direct3D 12 lists no GPU)", gpu.name),
+        Some((Some(d3d12), _)) if same_gpu(gpu, d3d12) => {
+            log::info!("OpenGL draws on {}, the GPU Direct3D 12 would draw with", gpu.name);
+        }
+        Some((Some(d3d12), _)) => log::warn!(
+            "OpenGL draws on {} (vendor {:#06x}), not on {} (vendor {:#06x}) as Direct3D 12 would: the GPU the              drivers give the app",
+            gpu.name,
+            gpu.vendor,
+            d3d12.name,
+            d3d12.vendor
+        ),
+    }
+}
+
+/// Whether OpenGL's `gl` is the GPU `other` (another backend's): by vendor where OpenGL's says
+/// which (it goes by the driver's name), else by name (OpenGL's may add to it, as "/PCIe/SSE2").
+fn same_gpu(gl: &wgpu::AdapterInfo, other: &wgpu::AdapterInfo) -> bool {
+    if gl.vendor != 0 && other.vendor != 0 {
+        return gl.vendor == other.vendor;
+    }
+    let (gl, other) = (gl.name.to_lowercase(), other.name.to_lowercase());
+    !other.is_empty() && (gl.starts_with(&other) || other.starts_with(&gl))
 }
 
 /// Whether the record `saved` keeps its backend for the next start, of `count`.
@@ -327,6 +466,8 @@ pub fn gpu_made(index: usize) {
     // the drivers are loaded now, and one may have put its own filter in place of the app's
     #[cfg(windows)]
     native::watch_again();
+    #[cfg(unix)]
+    signals::watch_again();
 }
 
 /// The graphics device was lost. While a backend starts, or as a canvas first draws on it, that
@@ -412,6 +553,8 @@ pub fn gpu_prepared(fine: bool) {
     keep(&mut run);
     #[cfg(windows)]
     native::watch_again();
+    #[cfg(unix)]
+    signals::watch_again();
 }
 
 /// A canvas is opening in the window: until its first frame shows (see [`canvas_shown`]), a crash
@@ -440,11 +583,93 @@ pub fn canvas_shown(drawn: Option<bool>) {
 }
 
 /// This run is ending as it should: its backend is kept for the next, unless the canvases'
-/// pipelines failed on it.
+/// pipelines failed on it; and the log says so, for the next start to tell (see [`init`]).
 pub fn gpu_ended() {
+    log::info!("{}", procraft_core::RUN_ENDING);
     let mut run = run_now();
     run.end();
     keep(&mut run);
+}
+
+/// Whether this run starts a tablet driver's WinTab, decided as it first would, from the record
+/// the run before left.
+#[cfg(windows)]
+static WINTAB_ON: OnceLock<bool> = OnceLock::new();
+/// WinTab is being started now: a crash anywhere meanwhile is taken for its driver's.
+#[cfg(windows)]
+static WINTAB_STARTING: AtomicBool = AtomicBool::new(false);
+
+/// A tablet driver's WinTab is about to be started: whether it is to be. Not if the run before
+/// died in it with this version (the record saying "trying" or "crashed"): it stays off then, with
+/// a line in the log, and the record is left for the runs after. Else the record says "trying"
+/// until [`wintab_made`].
+#[cfg(windows)]
+pub fn wintab_trying() -> bool {
+    let on = *WINTAB_ON.get_or_init(|| {
+        let path = files::app_dir().join(WINTAB);
+        // (the unit tests leave the app's own record alone)
+        let saved = if cfg!(test) { String::new() } else { std::fs::read_to_string(&path).unwrap_or_default() };
+        let off = wintab_off(&saved, env!("PROCRAFT_VERSION"));
+        if off {
+            log::warn!(
+                "WinTab off: the tablet's driver crashed as this version last started it, so the pen comes through Windows Ink alone (deleting {} tries WinTab again)",
+                path.display()
+            );
+        }
+        !off
+    });
+    if on {
+        WINTAB_STARTING.store(true, Ordering::SeqCst);
+        keep_wintab("trying");
+    }
+    on
+}
+
+/// WinTab is started (or there is none to start): the record says "made".
+#[cfg(windows)]
+pub fn wintab_made() {
+    WINTAB_STARTING.store(false, Ordering::SeqCst);
+    keep_wintab("made");
+}
+
+/// A crash in `file`: true if it was the tablet driver's (in its file while this run uses WinTab,
+/// or anywhere as WinTab starts), the record then saying "crashed".
+#[cfg(windows)]
+fn wintab_crashed(file: &str) -> bool {
+    let theirs = WINTAB_STARTING.load(Ordering::SeqCst)
+        || (file.eq_ignore_ascii_case("wintab32.dll") && WINTAB_ON.get() == Some(&true));
+    if theirs {
+        keep_wintab("crashed");
+    }
+    theirs
+}
+
+/// Writes the WinTab record as at `stage` with this version, whole or not at all: not for a
+/// test's window (see [`kept`]), nor in the unit tests.
+#[cfg(windows)]
+fn keep_wintab(stage: &str) {
+    if cfg!(test) || !kept() {
+        return;
+    }
+    let record = wintab_record(stage, env!("PROCRAFT_VERSION"));
+    if let Err(e) = files::write_whole(&files::app_dir().join(WINTAB), record.as_bytes()) {
+        log::warn!("keeping how far WinTab got: {e}");
+    }
+}
+
+/// The WinTab record for `stage` and `version`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn wintab_record(stage: &str, version: &str) -> String {
+    format!("{stage} {version}")
+}
+
+/// Whether WinTab stays off after the record `saved`, for `version`: the run before died in it
+/// ("trying" or "crashed") with the same version. Another version tries it again; no record, or
+/// one that can't be read, leaves it on.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn wintab_off(saved: &str, version: &str) -> bool {
+    let mut words = saved.split_whitespace();
+    matches!(words.next(), Some("trying" | "crashed")) && words.next() == Some(version) && words.next().is_none()
 }
 
 /// This run's part in the record, held.
@@ -735,18 +960,30 @@ enum Stop {
     SayAllTried,
     /// Says why it stopped.
     Say,
+    /// Says why it stopped: the tablet's driver crashed, and the next start leaves its WinTab off.
+    Tablet,
 }
 
 /// The app stopped on `what` (a crash, a panic's message on the window's thread), and is to end:
 /// started again on the next backend, if it can be (see [`Run::stop`]), else said, with where its
 /// log is (only logged for a test's window). The backend record stays as it is now.
 pub fn stopped(what: &str) {
-    log::error!("stopped: {what}");
+    stop_with(what, false);
+}
+
+/// [`stopped`], on a crash in the tablet's driver (`tablet`): said, the next start leaving its
+/// WinTab off, rather than the app started again on another graphics backend.
+fn stop_with(what: &str, tablet: bool) {
+    log::error!("{}{what}", procraft_core::RUN_STOPPED);
     STOPPED.store(true, Ordering::SeqCst);
     if !kept() {
         return;
     }
-    let stop = run_if_free().map_or(Stop::Say, |run| run.stop(Gpu::backend_count(), ENDS_TOLD));
+    let stop = if tablet {
+        Stop::Tablet
+    } else {
+        run_if_free().map_or(Stop::Say, |run| run.stop(Gpu::backend_count(), ENDS_TOLD))
+    };
     let stop = match stop {
         // without the files it was opened with: they may have been taken in already
         Stop::Again(tried) if apart("procraft-again", move || start_on_next(tried)) == Some(true) => {
@@ -796,6 +1033,9 @@ fn stopped_text(what: &str, stop: Stop) -> String {
     let after = match stop {
         Stop::SayAnother | Stop::Again(_) => "\n\nStart it again to try another graphics backend.",
         Stop::SayAllTried => "\n\nEach graphics backend has been tried. Updating the graphics driver may help.",
+        Stop::Tablet => {
+            "\n\nIt was the tablet's driver. Next time ProCraft starts without the driver's WinTab: the pen's pressure comes through Windows Ink, if the tablet's settings have it on."
+        }
         Stop::Say => "",
     };
     format!("ProCraft stopped: {what}.{after}\n\nIts log is {}", files::app_dir().join(LOG).display())
@@ -809,17 +1049,18 @@ pub fn no_gpu_text(why: &str) -> String {
     )
 }
 
-/// A crash in the system's or a driver's own code (Windows): logged with the file it happened in,
-/// then the app started again on the next backend or the crash said (see [`stopped`]), rather
-/// than the app vanishing.
+/// A crash in the system's or a driver's own code (Windows): logged with the file it happened in
+/// and the frames that led there, then the app started again on the next backend or the crash
+/// said (see [`stopped`]), rather than the app vanishing.
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod native {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+    use procraft_core::{CRASH_TARGET, CrashLine, RUN_CRASHED};
     use windows::Win32::Foundation::HMODULE;
     use windows::Win32::System::Diagnostics::Debug::{
-        AddVectoredExceptionHandler, EXCEPTION_POINTERS, SetUnhandledExceptionFilter,
+        AddVectoredExceptionHandler, EXCEPTION_POINTERS, RtlCaptureStackBackTrace, SetUnhandledExceptionFilter,
     };
     use windows::Win32::System::LibraryLoader::{
         GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleFileNameW,
@@ -845,6 +1086,9 @@ mod native {
     static SEEN: AtomicU32 = AtomicU32::new(0);
     /// `EXCEPTION_CONTINUE_SEARCH`, as a vectored handler returns it.
     const GO_ON: i32 = 0;
+    /// How many frames of the crashed thread are read, with the filter's own and the system's
+    /// that called it.
+    const FRAMES: usize = 80;
 
     pub fn watch() {
         // SAFETY: both are handlers as the system calls them, for the whole process
@@ -873,15 +1117,15 @@ mod native {
         let Some(record) = record else { return GO_ON };
         let code = record.ExceptionCode.0.cast_unsigned();
         if FATAL.contains(&code) && code != STACK_OVERFLOW && SEEN.fetch_add(1, Ordering::Relaxed) < MOST_SEEN {
-            let file = module_of(record.ExceptionAddress).unwrap_or_else(|| "the app's code".to_owned());
+            let file = module_of(record.ExceptionAddress as usize).map_or_else(|| "the app's code".to_owned(), |m| m.0);
             log::warn!("an exception {code:#010X} in {file} (it ends the app if nothing handles it)");
         }
         GO_ON
     }
 
-    /// A crash no code handled: its exception's code and the file of the code it happened in,
-    /// logged; the app started again or the crash said (see [`super::stopped`]); then the app
-    /// ends.
+    /// A crash no code handled: its exception's code, the file of the code it happened in and the
+    /// frames that led there, logged; the app started again or the crash said (see
+    /// [`super::stopped`]); then the app ends.
     unsafe extern "system" fn crashed(info: *const EXCEPTION_POINTERS) -> i32 {
         if CRASHED.swap(true, Ordering::SeqCst) {
             return EXCEPTION_CONTINUE_SEARCH;
@@ -890,38 +1134,306 @@ mod native {
         let record = unsafe { info.as_ref().and_then(|i| i.ExceptionRecord.as_ref()) };
         let (code, address) =
             record.map_or((0, 0), |r| (r.ExceptionCode.0.cast_unsigned(), r.ExceptionAddress as usize));
+        // the frames read on this thread, as no other can: not after a stack overflow, with next
+        // to no stack left to read them with
+        let mut frames = [0usize; FRAMES];
+        let count = if code == STACK_OVERFLOW { 0 } else { frames_here(&mut frames) };
         // on a stack of its own: after a stack overflow this one has next to none left, and a
         // second crash here would end the app with no word
-        if super::apart("procraft-crash", move || said(code, address)).is_none() {
-            said(code, address);
+        if super::apart("procraft-crash", move || said(code, address, frames.get(..count).unwrap_or_default()))
+            .is_none()
+        {
+            said(code, address, frames.get(..count).unwrap_or_default());
         }
         EXCEPTION_EXECUTE_HANDLER
     }
 
-    /// The crash logged, and the app started again or the crash said.
-    fn said(code: u32, address: usize) {
-        let file = module_of(address as *mut core::ffi::c_void).unwrap_or_else(|| "the app's code".to_owned());
-        log::error!("crashed in {file} (exception {code:#010X} at {address:#x})");
-        super::stopped(&format!("it crashed in {file} (exception {code:#010X})"));
+    /// This thread's frames, innermost first, into `out`; how many.
+    fn frames_here(out: &mut [usize; FRAMES]) -> usize {
+        let mut captured = [std::ptr::null_mut::<core::ffi::c_void>(); FRAMES];
+        // SAFETY: fills at most `captured`'s length of it with this thread's return addresses
+        let count = usize::from(unsafe { RtlCaptureStackBackTrace(0, &mut captured, None) });
+        for (to, from) in out.iter_mut().zip(captured.iter().take(count)) {
+            *to = *from as usize;
+        }
+        count.min(FRAMES)
     }
 
-    /// The name of the file (a DLL, the app) whose code is at `address`.
-    fn module_of(address: *mut core::ffi::c_void) -> Option<String> {
+    /// The crash logged, with `frames` (the crashed thread's, read in the filter), and the app
+    /// started again or the crash said: the tablet driver's (see [`super::wintab_crashed`]) said as
+    /// such, its WinTab left off from the next start.
+    fn said(code: u32, address: usize, frames: &[usize]) {
+        let file = module_of(address).map_or_else(|| "the app's code".to_owned(), |m| m.0);
+        let what = meaning(code);
+        log::error!(target: CRASH_TARGET, "{RUN_CRASHED}exception {code:#010X} ({what}) in {file} at {address:#x}");
+        log::error!(target: CRASH_TARGET, "backtrace, the innermost frame first:");
+        // from the frame it happened in (the filter's own frames and the system's that called it
+        // left out), or with that frame first where the frames don't reach it
+        let (shown, first) = match frames.iter().position(|&f| f == address) {
+            Some(at) => (frames.get(at..).unwrap_or_default(), 0),
+            None => {
+                log::error!(target: CRASH_TARGET, "{}", frame_line(&mut CrashLine::new(), 0, address));
+                (frames, 1)
+            }
+        };
+        let mut line = CrashLine::new();
+        for (index, &pc) in shown.iter().enumerate() {
+            log::error!(target: CRASH_TARGET, "{}", frame_line(&mut line, first + index, pc));
+        }
+        let tablet = super::wintab_crashed(&file);
+        super::stop_with(&format!("it crashed in {file} (exception {code:#010X})"), tablet);
+    }
+
+    /// A frame's line: its place, its address, and the file whose code that is.
+    fn frame_line(line: &mut CrashLine, index: usize, pc: usize) -> &str {
+        line.clear().frame(index, pc as u64);
+        match module_of(pc) {
+            Some((name, base)) => line.module(name.as_bytes(), pc.saturating_sub(base) as u64),
+            None => line.text(" (in no file's code)"),
+        };
+        line.as_str()
+    }
+
+    /// What an exception that ends the app is.
+    fn meaning(code: u32) -> &'static str {
+        match code {
+            0xC000_0005 => "an access violation",
+            0xC000_0006 => "a page that couldn't be read in",
+            0xC000_001D => "an illegal instruction",
+            0xC000_0096 => "a privileged instruction",
+            STACK_OVERFLOW => "a stack overflow",
+            0xC000_0374 => "a corrupted heap",
+            0xC000_0409 => "a fast fail",
+            _ => "an exception",
+        }
+    }
+
+    /// The name of the file (a DLL, the app) whose code is at `address`, and where it is loaded.
+    fn module_of(address: usize) -> Option<(String, usize)> {
         let mut module = HMODULE::default();
         let flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
         // SAFETY: with FROM_ADDRESS the name is read as an address in a module, not as text
-        unsafe { GetModuleHandleExW(flags, PCWSTR(address.cast()), &mut module) }.ok()?;
+        unsafe { GetModuleHandleExW(flags, PCWSTR(std::ptr::without_provenance(address)), &mut module) }.ok()?;
         let mut name = [0u16; 512];
         // SAFETY: `name` is a buffer to fill, its length given
         let len = unsafe { GetModuleFileNameW(Some(module), &mut name) } as usize;
         let path = String::from_utf16_lossy(name.get(..len)?);
-        path.rsplit(['\\', '/']).next().map(str::to_owned).filter(|n| !n.is_empty())
+        let file = path.rsplit(['\\', '/']).next().map(str::to_owned).filter(|n| !n.is_empty())?;
+        Some((file, module.0 as usize))
+    }
+}
+
+/// A crash in native code on Linux or a Mac, logged by a signal handler as the process goes.
+#[cfg(unix)]
+mod signals;
+
+/// A crash on purpose, in a process of its own (this test binary run again), leaves its record in
+/// its log, and the next start tells it; the question about an artwork whose opening closed the
+/// app follows what the log recorded.
+#[cfg(test)]
+mod crash_tests {
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, ExitStatus, Stdio};
+
+    use procraft_core::RunEnd;
+
+    /// How the child crashes ("bad access" or "overflow"), and the folder its log is begun in.
+    const HOW: &str = "PROCRAFT_CRASH_CHILD";
+    const DIR: &str = "PROCRAFT_CRASH_DIR";
+
+    /// What the crash tests start as a child process: its log begun and crashes watched as the
+    /// app does it, then a crash. Nothing without the child's variables.
+    #[test]
+    #[ignore = "started by the crash tests in a process of its own, to crash"]
+    fn crashing_child() {
+        let (Some(how), Some(dir)) = (std::env::var_os(HOW), std::env::var_os(DIR)) else { return };
+        #[cfg(unix)]
+        no_core_dump();
+        super::LAUNCHED.get_or_init(std::time::Instant::now);
+        super::open_log(Path::new(&dir), false);
+        super::start_logger();
+        super::watch_crashes();
+        log::info!("about to crash: {}", how.to_string_lossy());
+        if how == "overflow" {
+            let _ = std::hint::black_box(overflow(0));
+        } else {
+            bad_access();
+        }
+    }
+
+    /// No core dump of the child's crash: its record is all the test reads.
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    fn no_core_dump() {
+        let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: only lowers this process's own limit
+        unsafe { libc::setrlimit(libc::RLIMIT_CORE, &none) };
+    }
+
+    /// A write where nothing is mapped.
+    #[allow(unsafe_code)]
+    #[inline(never)]
+    fn bad_access() {
+        // SAFETY: none: it crashes, on purpose
+        unsafe { std::ptr::write_volatile(std::ptr::without_provenance_mut::<u8>(0x10), 1) };
+    }
+
+    /// Calls itself until the stack runs out, a page of it a call.
+    #[inline(never)]
+    fn overflow(depth: u64) -> u64 {
+        let mut room = [0u8; 4096];
+        room[0] = depth as u8;
+        std::hint::black_box(&mut room);
+        if std::hint::black_box(depth) == u64::MAX {
+            return 0;
+        }
+        overflow(depth + 1).wrapping_add(u64::from(room[1]))
+    }
+
+    /// The child run, crashing `how`, with its log in a folder of its own named after `name`: the
+    /// folder, the child's process and how it ended.
+    fn crash(how: &str, name: &str) -> (PathBuf, u32, ExitStatus) {
+        let dir = std::env::temp_dir().join(format!("procraft-crash-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "startup::crash_tests::crashing_child", "--ignored", "--nocapture", "--test-threads=1"])
+            .env(HOW, how)
+            .env(DIR, &dir)
+            // a test's window: nothing said in a message that waits for a click
+            .env("PROCRAFT_BACKGROUND", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let process = child.id();
+        let status = child.wait().unwrap();
+        (dir, process, status)
+    }
+
+    /// The log the child left.
+    fn left(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join(super::LOG)).unwrap()
+    }
+
+    /// The next start in the child's folder: its log begun (the child's kept as the run before's),
+    /// and what it tells of the last runs, as one text.
+    fn next_start(dir: &Path) -> String {
+        drop(super::begin_log(dir, false).unwrap());
+        procraft_core::last_runs_in_folder(dir).join("\n")
+    }
+
+    /// This test binary's file name, as the crash's frames name the file of its code.
+    fn this_file() -> String {
+        std::env::current_exe().unwrap().file_name().unwrap().to_string_lossy().into_owned()
+    }
+
+    /// What the child's log and the next start must say of any crash: the record's first line
+    /// with `said` in it, its frames with this binary's file among them, the next start's line on
+    /// its process, and the question asked as after a crash.
+    fn told(dir: &Path, process: u32, said: &str) {
+        let log = left(dir);
+        assert!(log.starts_with(&format!("process {process}\n")), "{log}");
+        let crashed = format!(" ERROR crash] {}{said}", procraft_core::RUN_CRASHED);
+        assert!(log.contains(&crashed), "{crashed:?} not in\n{log}");
+        assert!(log.contains(" ERROR crash] backtrace, the innermost frame first:\n"), "{log}");
+        assert!(log.contains(" ERROR crash]   #00 0x"), "{log}");
+        assert!(log.contains(&format!(" {}+0x", this_file())), "{log}");
+        let last = next_start(dir);
+        assert!(last.contains(&format!("process {process}: it crashed: {said}")), "{last}");
+        assert!(last.contains("\n    backtrace, the innermost frame first:\n      #00 0x"), "{last}");
+        let after_crash = procraft_core::opening_ended_app_said_after(RunEnd::Crashed);
+        assert_eq!(super::opening_ended_said_in(dir, Some(process)), after_crash);
+        assert_eq!(procraft_core::log_of_run(dir, process), Some(dir.join(super::PREVIOUS_LOG)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_bad_access_leaves_its_signal_and_frames_in_the_log_and_the_next_start_tells_it() {
+        use std::os::unix::process::ExitStatusExt;
+        let (dir, process, status) = crash("bad access", "bad-access");
+        // the system's own handling went on after: the process ended by the signal
+        assert!(matches!(status.signal(), Some(libc::SIGSEGV | libc::SIGBUS)), "{status:?}");
+        let log = left(&dir);
+        assert!(log.contains(" at address 0x10, code "), "{log}");
+        assert!(log.contains(", on thread \""), "{log}");
+        told(&dir, process, "signal ");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stack_overflow_is_caught_on_a_stack_of_its_own() {
+        use std::os::unix::process::ExitStatusExt;
+        let (dir, process, status) = crash("overflow", "overflow");
+        assert!(matches!(status.signal(), Some(libc::SIGSEGV | libc::SIGBUS)), "{status:?}");
+        let log = left(&dir);
+        assert!(log.contains("next to the stack's end: a stack overflow"), "{log}");
+        // the overflow is deeper than the frames written
+        assert!(log.contains(" ERROR crash]   #63 0x"), "{log}");
+        told(&dir, process, "signal ");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_access_violation_leaves_its_exception_and_frames_in_the_log_and_the_next_start_tells_it() {
+        let (dir, process, status) = crash("bad access", "bad-access");
+        assert_eq!(status.code().map(i32::cast_unsigned), Some(0xC000_0005), "{status:?}");
+        // from the frame it happened in: the filter's own frames, and the system's that called it,
+        // left out
+        let log = left(&dir);
+        assert!(!log.to_lowercase().contains(" kernelbase.dll+"), "{log}");
+        told(&dir, process, &format!("exception 0xC0000005 (an access violation) in {} at 0x", this_file()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_stack_overflow_is_logged_with_where_it_overflowed() {
+        let (dir, process, status) = crash("overflow", "overflow");
+        assert_eq!(status.code().map(i32::cast_unsigned), Some(0xC000_00FD), "{status:?}");
+        told(&dir, process, "exception 0xC00000FD (a stack overflow) in ");
+    }
+
+    /// The question says "crashed" when the run's part of a log has the crash's record or the app
+    /// stopping itself, in this run's log, the run before's or the one kept for a run that closed
+    /// opening an artwork; else (it ended as it should, or no log has it) not known.
+    #[test]
+    fn the_question_after_an_opening_closed_the_app_says_what_the_log_recorded() {
+        use procraft_core::{RUN_CRASHED, RUN_ENDING, RUN_STOPPED};
+        let dir = std::env::temp_dir().join(format!("procraft-crash-said-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = |level: &str, target: &str, message: &str| format!("[{:>7} ms {level:<5} {target}] {message}\n", 3);
+        let before = [
+            "process 41\n".to_owned(),
+            line("ERROR", "crash", &format!("{RUN_CRASHED}signal 11 (SIGSEGV, a bad memory access) at address 0x0")),
+            "process 42\n".to_owned(),
+            line("INFO", "procraft::startup", RUN_ENDING),
+        ]
+        .concat();
+        std::fs::write(dir.join(super::PREVIOUS_LOG), before).unwrap();
+        let kept = format!("process 40\n{}", line("ERROR", "procraft::startup", &format!("{RUN_STOPPED}a panic")));
+        std::fs::write(dir.join("procraft-crashed.log"), kept).unwrap();
+        std::fs::write(dir.join(super::LOG), "process 43\n").unwrap();
+        let (crashed, unknown) = (
+            procraft_core::opening_ended_app_said_after(RunEnd::Crashed),
+            procraft_core::opening_ended_app_said_after(RunEnd::Unknown),
+        );
+        assert_ne!(crashed, unknown);
+        let said = |run| super::opening_ended_said_in(&dir, run);
+        assert_eq!(said(Some(41)), crashed);
+        assert_eq!(said(Some(40)), crashed);
+        assert_eq!(said(Some(42)), unknown);
+        assert_eq!(said(Some(43)), unknown);
+        assert_eq!(said(Some(44)), unknown);
+        assert_eq!(said(None), unknown);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Record, Run, Stage, next_start};
+    use super::{Record, Run, Stage, next_start, stopped_text, wintab_off, wintab_record};
 
     /// The record a run leaves if it stops now with nothing more written (a crash, a log-out, the
     /// app killed): the record is written each time what it says changes.
@@ -982,6 +1494,25 @@ mod tests {
     /// The order for a machine whose GPUs (vendor, type) are `gpus`, as Direct3D 12 lists them.
     fn order_with(backends: &[Backends], gpus: &[(u32, procraft_gpu::wgpu::DeviceType)]) -> Vec<usize> {
         order_for(backends, drawn_with(gpus).and_then(|i| gpus.get(i).copied()))
+    }
+
+    #[test]
+    fn opengl_s_gpu_is_told_apart_from_direct3d_12_s_by_vendor_or_name() {
+        use super::same_gpu;
+        use procraft_gpu::wgpu;
+        let gpu = |name: &str, vendor: u32, backend| wgpu::AdapterInfo {
+            name: name.to_owned(),
+            vendor,
+            ..wgpu::AdapterInfo::new(wgpu::DeviceType::Other, backend)
+        };
+        let rtx = gpu("NVIDIA GeForce RTX 2050", 0x10de, wgpu::Backend::Dx12);
+        // a laptop's OpenGL on the integrated GPU, Direct3D 12 on the discrete one
+        assert!(!same_gpu(&gpu("Intel(R) Iris(R) Xe Graphics", 0x8086, wgpu::Backend::Gl), &rtx));
+        assert!(same_gpu(&gpu("NVIDIA GeForce RTX 2050/PCIe/SSE2", 0x10de, wgpu::Backend::Gl), &rtx));
+        // a driver OpenGL can't name the vendor of: by name
+        let radeon = gpu("AMD Radeon RX 6600", 0x1002, wgpu::Backend::Dx12);
+        assert!(same_gpu(&gpu("AMD Radeon RX 6600", 0, wgpu::Backend::Gl), &radeon));
+        assert!(!same_gpu(&gpu("Radeon Graphics", 0, wgpu::Backend::Gl), &radeon));
     }
 
     #[test]
@@ -1401,5 +1932,31 @@ mod tests {
         let mut run = trying(2, 0);
         run.end();
         assert_eq!(run.awaited(), None);
+    }
+
+    #[test]
+    fn a_run_that_died_in_the_tablet_drivers_wintab_leaves_it_off_until_another_version() {
+        let version = "0.0.7-beta";
+        // the run before died as WinTab started, or in the driver's file: off
+        assert!(wintab_off(&wintab_record("trying", version), version));
+        assert!(wintab_off(&wintab_record("crashed", version), version));
+        assert!(wintab_off("crashed 0.0.7-beta\r\n", version), "as another editor saves it");
+        // started, and the run went on: on
+        assert!(!wintab_off(&wintab_record("made", version), version));
+        // a later version tries it again
+        assert!(!wintab_off("crashed 0.0.7-beta", "0.0.8-beta"));
+        assert!(!wintab_off("trying 0.0.7-beta", "0.0.7"));
+        // no record, or one that can't be read: on
+        for saved in ["", "crashed", "trying 0.0.7-beta drew", "off 0.0.7-beta", "0 trying"] {
+            assert!(!wintab_off(saved, version), "{saved:?}");
+        }
+    }
+
+    #[test]
+    fn a_crash_in_the_tablets_driver_says_so_and_what_the_next_start_does() {
+        let text = stopped_text("it crashed in wintab32.dll (exception 0xC0000005)", Stop::Tablet);
+        assert!(text.starts_with("ProCraft stopped: it crashed in wintab32.dll (exception 0xC0000005).\n\n"), "{text}");
+        assert!(text.contains("tablet's driver") && text.contains("Windows Ink"), "{text}");
+        assert!(!text.contains("graphics backend"), "{text}");
     }
 }

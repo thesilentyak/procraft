@@ -43,6 +43,9 @@ const LEAST_REACH: f32 = 50.0;
 /// The most movers at once: the oldest go first.
 const MOST_MOVERS: usize = 2048;
 
+/// How far a twirl turns in a second of work, radians: the shader's `TURN`.
+const TWIRL_TURN: f32 = 4.0;
+
 /// The radius of a brush at `size` (0..1).
 pub(crate) fn radius(size: f32) -> f32 {
     4.0 + 1596.0 * size.clamp(0.0, 1.0).powf(2.2)
@@ -168,6 +171,15 @@ impl LiquifyRun {
         self.moved = false;
     }
 
+    /// Everything going by itself stops, and the brush is as if lifted.
+    pub(crate) fn halt(&mut self) {
+        self.movers.clear();
+        self.last = None;
+        self.force = None;
+        self.velocity = Vec2::new(0.0, 0.0);
+        self.moved = false;
+    }
+
     /// Whether anything is still going by itself.
     pub(crate) fn going(&self) -> bool {
         !self.movers.is_empty()
@@ -215,6 +227,15 @@ impl LiquifyRun {
             self.clock += seconds;
             self.lay((at, force), (at, force), seconds, brush, &mut steps);
         }
+        steps.done()
+    }
+
+    /// The pen's barrel rolled `turn` radians with a twirl at `at`: it turns as far. That is none
+    /// of the time a move has worked, which `held` takes off: a barrel rolls while the pen moves.
+    pub(crate) fn rolled(&mut self, at: Vec2, turn: f32, brush: LiquifyBrush) -> Vec<Vec<LiquifyStamp>> {
+        let mut steps = Steps::new(radius(brush.size));
+        let force = self.force.unwrap_or(1.0);
+        self.lay((at, force), (at, force), turn / TWIRL_TURN, brush, &mut steps);
         steps.done()
     }
 
@@ -679,6 +700,27 @@ mod tests {
         assert_eq!(s.adjustment_shown().liquify, vec![0.3, 1.0, 0.0, 0.0], "the size is shared, the distortion isn't");
         s.adjustment_liquify_kind(LiquifyKind::TwirlRight);
         assert_eq!(s.adjustment_shown().liquify[2], 0.59);
+    }
+
+    #[test]
+    fn a_roll_turns_as_far_as_the_barrel_while_the_pen_moves_as_well() {
+        let twirl = brush(LiquifyKind::TwirlRight, 0.0);
+        let mut still = LiquifyRun::default();
+        let alone = total(&still.rolled(Vec2::new(0.0, 100.0), 0.8, twirl));
+        // the amount is seconds of work, at full pressure
+        assert!((alone - 0.8 / TWIRL_TURN).abs() < 1e-5, "{alone}");
+        let mut moving = LiquifyRun::default();
+        moving.along(&[at(0.0), at(1.0), at(2.0), at(3.0)], false, twirl);
+        let rolled = total(&moving.rolled(Vec2::new(3.0, 100.0), 0.8, twirl));
+        assert!((rolled - alone).abs() < 1e-5, "{rolled} against {alone}");
+        // and a roll leaves what a hold has to take off as it was
+        assert!(moving.worked > 0.0);
+    }
+
+    #[test]
+    fn the_twirl_s_rate_is_the_shader_s() {
+        let shader = include_str!("../../gpu/src/shaders/liquify.wgsl");
+        assert!(shader.contains(&format!("const TURN: f32 = {TWIRL_TURN:.1};")));
     }
 
     #[test]

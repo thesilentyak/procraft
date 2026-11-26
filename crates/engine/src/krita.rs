@@ -20,7 +20,10 @@ use crate::zip::ZipReader;
 pub struct KritaBrush {
     pub name: String,
     pub tip: KritaTip,
-    /// Space between stamps as a share of the size, if the preset sets it (not automatic).
+    /// Space between stamps as a share of the size: the preset's own, or its automatic spacing at
+    /// the size it keeps (see [`auto_spacing`]); scaled by its Spacing option if that follows the
+    /// pen, as many stamps as that lays over a pen's middling pressures. None if it can't be
+    /// told.
     pub spacing: Option<f32>,
     /// The tip's own angle, radians.
     pub angle: f32,
@@ -29,6 +32,10 @@ pub struct KritaBrush {
     /// Each stamp turns at random: a round tip drawn with holes or noise in it, which Krita makes
     /// afresh for each stamp.
     pub turns_at_random: bool,
+    /// Its tip is drawn with holes or noise in it (an auto tip of less density, or of some
+    /// randomness), which Krita makes afresh at each stamp's own pixels; ours are drawn once, and
+    /// blur where a stamp is small.
+    pub speckled: bool,
     /// Each stamp turned at random as far as this share of a half turn either way (0 none).
     pub rotation_random: f32,
     /// Each stroke turned at random as it starts.
@@ -260,6 +267,9 @@ const MOST_BUNDLE_TEXT: usize = 1 << 30;
 const DRAWN_SIDE: usize = crate::textures::TEXTURE_SIZE;
 /// The most points an auto brush's tip is drawn with.
 const MOST_SPIKES: u32 = 32;
+/// The pressures a pen mostly paints at, between which a setting that follows the pen and has to
+/// be one number is taken.
+const MIDDLING_PRESSURES: (f32, f32) = (0.25, 0.75);
 const PNG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 const JPEG: [u8; 3] = [0xFF, 0xD8, 0xFF];
 
@@ -335,6 +345,9 @@ fn brush_of<'p>(
     let (tip, turns_at_random) = brush
         .and_then(|b| tip(b, find, &mut missing))
         .unwrap_or((KritaTip::Round { hardness: 1.0, roundness: 1.0 }, false));
+    let speckled = matches!(tip, KritaTip::Image(_))
+        && brush.is_some_and(|b| b.attribute("type") == Some("auto_brush"))
+        && (number(brush, "density").is_some_and(|d| d < 1.0) || number(brush, "randomness").is_some_and(|r| r > 0.0));
     let flag = |name: &str| param(name).is_some_and(|v| v == "true");
     let value = |name: &str| param(name).and_then(real);
     // an option switched on with its pen settings, and driven by a sensor
@@ -343,11 +356,13 @@ fn brush_of<'p>(
     let turned = value("RotationValue").unwrap_or(1.0).clamp(0.0, 1.0);
     let amount = |option: &str| value(&format!("{option}Value")).unwrap_or(1.0).clamp(0.0, 1.0);
     // the hue turned, the saturation, the value (lighter or darker) and Darken (darker), each
-    // as far as its amount where `id` drives it
+    // as far as its amount where `id` drives it: the first three either way from the middle of
+    // their curves, only as far as the curve goes from it
     let colours = |id: &str| {
         let by = |option: &str| if driven(option, id) { amount(option) } else { 0.0 };
-        let value = by("v");
-        [by("h"), by("s"), value, value.max(by("Darken"))]
+        let turned = |option: &str| by(option) * swing(&sensor_curve(param, option, id));
+        let value = turned("v");
+        [turned("h"), turned("s"), value, value.max(by("Darken"))]
     };
     // the texture's picture: in the preset as the base64 of its base64 (older ones); else one it
     // names, by its file's name, its own and its sum
@@ -397,14 +412,28 @@ fn brush_of<'p>(
                 value("Texture/Pattern/CutoffRight").unwrap_or(255.0) / 255.0,
             ),
         });
+    // its spacing: automatic (by the stamp's size) or its own, then as its Spacing option scales
+    // it by the pressure (none of our brushes follows the pen there: taken as the one that lays
+    // as many stamps as it does over a pen's middling pressures, their harmonic mean)
+    let own_spacing = match brush {
+        Some(b) if automatic => auto_spacing(b, &tip),
+        _ => number(brush, "spacing").filter(|s| *s > 0.0),
+    };
+    let spacing_scale = pressure_curve(param, "Spacing", true).map_or(1.0, |points| {
+        let curve = crate::curve::Curve::new(&points);
+        let (low, high) = MIDDLING_PRESSURES;
+        let stamps: f32 = (0..=10).map(|i| 1.0 / curve.eval(low + (high - low) * i as f32 / 10.0).max(0.01)).sum();
+        11.0 / stamps * value("SpacingValue").unwrap_or(1.0).clamp(0.0, 5.0)
+    });
     KritaBrush {
         name: called.to_owned(),
         tip,
-        spacing: if automatic { None } else { number(brush, "spacing").filter(|s| *s > 0.0) },
+        spacing: own_spacing.map(|s| s * spacing_scale),
         angle: number(brush, "angle").unwrap_or(0.0),
         // the tip's rotation by the Drawing Angle sensor, alone or among others
         follows: flag("PressureRotation") && param("RotationSensor").is_some_and(|s| s.contains("drawingangle")),
         turns_at_random,
+        speckled,
         rotation_random: if driven("Rotation", "fuzzy") { turned } else { 0.0 },
         rotation_per_stroke: driven("Rotation", "fuzzystroke") && turned > 0.0,
         follows_tilt: driven("Rotation", "ascension"),
@@ -459,17 +488,39 @@ fn pressure_curve<'p>(param: &dyn Fn(&str) -> Option<&'p str>, option: &str, che
         Some(r) => vec![r],
         None => Vec::new(),
     };
-    let pressure = sensors.iter().find(|s| s.attribute("id") == Some("pressure"));
-    if pressure.is_none() && !sensors.is_empty() {
+    if !sensors.is_empty() && !sensors.iter().any(|s| s.attribute("id") == Some("pressure")) {
         return None;
     }
+    Some(sensor_curve(param, option, "pressure"))
+}
+
+/// The curve the setting `option` of those `param` gives follows for its sensor `id`: the one its
+/// sensors share, as they do unless told not to (its own key, else the sensor read last, else the
+/// older keys), or, not shared, that sensor's own; else a straight line.
+fn sensor_curve<'p>(param: &dyn Fn(&str) -> Option<&'p str>, option: &str, id: &str) -> Vec<Vec2> {
+    let key = |what: &str| param(&format!("{option}{what}"));
+    let definition = key("Sensor").unwrap_or_default();
+    let root = xml::parse(definition);
+    let sensors: Vec<&Element> = match &root {
+        Some(r) if r.attribute("id") == Some("sensorslist") => r.all("ChildSensor").into_iter().collect(),
+        Some(r) => vec![r],
+        None => Vec::new(),
+    };
     let older = (param(&format!("Custom{option}")) == Some("true")).then(|| param(&format!("Curve{option}"))).flatten();
     let last = sensors.last().and_then(|s| s.child("curve")).map(|c| c.text.as_str());
     let read = if definition.contains("curve") { last } else { older };
-    let own = pressure.and_then(|s| s.child("curve")).map(|c| c.text.as_str());
+    let own =
+        sensors.iter().find(|s| s.attribute("id") == Some(id)).and_then(|s| s.child("curve")).map(|c| c.text.as_str());
     let text = if key("UseSameCurve") != Some("false") { key("commonCurve").or(read) } else { own };
     let points = text.map(curve_points).unwrap_or_default();
-    Some(if points.len() >= 2 { points } else { vec![Vec2::new(0.0, 0.0), Vec2::new(1.0, 1.0)] })
+    if points.len() >= 2 { points } else { vec![Vec2::new(0.0, 0.0), Vec2::new(1.0, 1.0)] }
+}
+
+/// How far a setting Krita turns either way from the middle of its curve (hue, saturation, value)
+/// goes along `curve`, as a share of all the way: the furthest the curve goes from a half, twice
+/// over. A straight line goes all the way; one kept near the middle hardly turns it.
+fn swing(curve: &[Vec2]) -> f32 {
+    curve.iter().map(|p| (2.0 * p.y.clamp(0.0, 1.0) - 1.0).abs()).fold(0.0, f32::max)
 }
 
 /// The sensors that drive `option` of those `param` gives, by their names (pressure, where it
@@ -623,16 +674,63 @@ fn tip(
         name: brush.attribute("name").unwrap_or_default(),
         md5: brush.attribute("md5sum").unwrap_or_default(),
     };
-    let tip = find(&wanted).and_then(|bytes| picture_tip(bytes, file, brush.attribute("name")));
+    let masked = alpha_mask(brush);
+    let tip = find(&wanted).and_then(|bytes| picture_tip(bytes, file, brush.attribute("name"), masked));
     if tip.is_none() {
         missing.push(file.to_owned());
     }
     tip.map(|t| (t, false))
 }
 
+/// Whether a picture tip in colour is laid as a mask (Krita's alpha mask: its dark and opaque
+/// parts paint), not by its alpha as the picture is (its colours, which we can't lay): as its
+/// application says, else as the older keys say (colour as a mask, unless it keeps its
+/// lightness). Neither said, a colour picture keeps its colours.
+fn alpha_mask(brush: &Element) -> bool {
+    let said = |key: &str| brush.attribute(key).map(str::trim);
+    match said("brushApplication") {
+        Some(application) => application == "0",
+        None => said("preserveLightness") != Some("1") && matches!(said("ColorAsMask"), Some("1" | "true")),
+    }
+}
+
+/// Krita's automatic spacing as a share of the stamp's size: its coefficient times the square root
+/// of the stamp's side in pixels (times the side itself under a pixel), at the size the preset
+/// keeps; none if that can't be told.
+fn auto_spacing(brush: &Element, tip: &KritaTip) -> Option<f32> {
+    let coefficient = brush.attribute("autoSpacingCoeff").and_then(real).filter(|c| *c > 0.0).unwrap_or(1.0);
+    let side = stamp_side(brush, tip)?;
+    let gap = coefficient * if side < 1.0 { side } else { side.sqrt() };
+    Some(gap / side)
+}
+
+/// The longer side in pixels of the stamps a `Brush` element lays at its own size: an auto brush's
+/// diameter, else its picture's side times its scale.
+fn stamp_side(brush: &Element, tip: &KritaTip) -> Option<f32> {
+    let side = if brush.attribute("type") == Some("auto_brush") {
+        brush.find("MaskGenerator")?.attribute("diameter").and_then(real)?
+    } else {
+        let (w, h) = match tip {
+            KritaTip::Image(t) => (t.width, t.height),
+            KritaTip::Png(png) => png_size(png)?,
+            KritaTip::Round { .. } => return None,
+        };
+        let scale = brush.attribute("scale").and_then(real).filter(|s| *s > 0.0).unwrap_or(1.0);
+        w.max(h) as f32 * scale
+    };
+    (side.is_finite() && side > 0.0).then_some(side)
+}
+
+/// A PNG's width and height, from its header.
+fn png_size(png: &[u8]) -> Option<(u32, u32)> {
+    let word = |at: usize| png.get(at..at + 4).and_then(|b| b.try_into().ok()).map(u32::from_be_bytes);
+    (png.starts_with(&PNG) && png.get(12..16) == Some(b"IHDR")).then(|| Some((word(16)?, word(20)?))).flatten()
+}
+
 /// A tip from its picture's file (named `file`): a PNG, an ABR file's tip called `name` (else its
-/// first), a GIMP brush or a pipe's first.
-fn picture_tip(bytes: Vec<u8>, file: &str, name: Option<&str>) -> Option<KritaTip> {
+/// first), a GIMP brush or a pipe's first; a GIMP brush in colour laid as a mask if `masked` (see
+/// [`alpha_mask`]).
+fn picture_tip(bytes: Vec<u8>, file: &str, name: Option<&str>, masked: bool) -> Option<KritaTip> {
     if bytes.starts_with(&PNG) {
         return Some(KritaTip::Png(bytes));
     }
@@ -641,8 +739,11 @@ fn picture_tip(bytes: Vec<u8>, file: &str, name: Option<&str>) -> Option<KritaTi
         let at = tips.iter().position(|t| Some(t.name.as_str()) == name).unwrap_or(0);
         tips.into_iter().nth(at)
     };
-    let tip =
-        if file.to_ascii_lowercase().ends_with(".abr") { abr() } else { crate::gbr::read_first(&bytes).or_else(abr) };
+    let tip = if file.to_ascii_lowercase().ends_with(".abr") {
+        abr()
+    } else {
+        crate::gbr::read_first(&bytes, masked).or_else(abr)
+    };
     tip.map(KritaTip::Image)
 }
 
@@ -854,7 +955,7 @@ fn faded_half(fade: f32) -> f32 {
 }
 
 /// The error function, to within about 1e-7 (Abramowitz and Stegun's 7.1.26).
-fn erf(x: f32) -> f32 {
+pub(crate) fn erf(x: f32) -> f32 {
     let t = 1.0 / (1.0 + 0.327_591_1 * x.abs());
     let poly = t * (0.254_829_6 + t * (-0.284_496_7 + t * (1.421_413_8 + t * (-1.453_152 + t * 1.061_405_4))));
     let e = 1.0 - poly * (-x * x).exp();
@@ -1194,6 +1295,37 @@ mod tests {
     }
 
     #[test]
+    fn a_colour_turned_at_random_goes_only_as_far_as_its_curve_goes_from_the_middle() {
+        let round = r#"<Brush type="auto_brush"><MaskGenerator type="circle"/></Brush>"#;
+        let read = |params: &[(&str, &str)]| {
+            let extra: String = params.iter().map(|(k, v)| param(k, v)).collect();
+            let xml = preset("Spray", round, false).replace("</Preset>", &format!("{extra}</Preset>"));
+            read_preset(&kpp(&xml), &|_| None).unwrap()
+        };
+        let fuzzy = r#"<!DOCTYPE params> <params id="fuzzy"/> "#;
+        let hue = |curve: &str| {
+            read(&[
+                ("Pressureh", "true"),
+                ("hSensor", fuzzy),
+                ("hValue", "1"),
+                ("hUseSameCurve", "true"),
+                ("hcommonCurve", curve),
+            ])
+            .color_random[0]
+        };
+        // a straight line turns it all the way, either way; one kept within 0.486 and 0.514, as an
+        // impasto set keeps its hue, about 5 degrees of the half turn's 180
+        assert_eq!(hue("0,0;1,1;"), 1.0);
+        let near = hue("0,0.486111;1,0.513889;");
+        assert!((near - 0.0278).abs() < 1e-3, "{near}");
+        // and the value alike, each stroke, its own curve where its sensors keep their own
+        let own = r#"<!DOCTYPE params> <params id="fuzzystroke"> <curve>0,0.25;1,0.75;</curve> </params> "#;
+        let value = read(&[("Pressurev", "true"), ("vSensor", own), ("vValue", "0.8"), ("vUseSameCurve", "false")])
+            .color_per_stroke;
+        assert!((value[2] - 0.4).abs() < 1e-6, "{value:?}");
+    }
+
+    #[test]
     fn a_texture_s_mask_is_made_as_krita_makes_it() {
         let near = |a: f32, b: f32| (a - b).abs() < 1e-4;
         let plain = KritaTexture {
@@ -1294,6 +1426,97 @@ mod tests {
         crate::damaged::survives("Krita bundle", &bundle, |b| {
             let _ = read_bundle(b);
         });
+    }
+
+    #[test]
+    fn a_preset_spaces_its_stamps_automatically_and_by_its_spacing_option() {
+        let near = |a: Option<f32>, b: f32| a.is_some_and(|a| (a - b).abs() < 1e-4);
+        // automatic: its coefficient times the square root of the stamp's side in pixels, as a
+        // share of that side (an auto tip's diameter)
+        let auto = r#"<Brush type="auto_brush" spacing="0.1" useAutoSpacing="1" autoSpacingCoeff="0.5"><MaskGenerator type="circle" diameter="100"/></Brush>"#;
+        let b = read_preset(&kpp(&preset("Auto", auto, false)), &|_| None).unwrap();
+        assert!(near(b.spacing, 0.5 * 10.0 / 100.0), "{:?}", b.spacing);
+        // a picture's side times its scale: 64 at a quarter, 16 pixels
+        let picture = r#"<Brush type="gbr_brush" filename="tip.gbr" scale="0.25" spacing="0.1" useAutoSpacing="1" autoSpacingCoeff="1"/>"#;
+        let b = read_preset(&kpp(&preset("Picture", picture, false)), &|_| Some(gbr(&[255; 64]))).unwrap();
+        assert!(near(b.spacing, 4.0 / 16.0), "{:?}", b.spacing);
+        // its own spacing, scaled by the Spacing option: as many stamps as it lays over a pen's
+        // middling pressures (a quarter to three quarters), their harmonic mean
+        let harmonic = |f: fn(f32) -> f32| 11.0 / (0..=10).map(|i| 1.0 / f(0.25 + 0.05 * i as f32)).sum::<f32>();
+        let close = |a: Option<f32>, b: f32| a.is_some_and(|a| (a - b).abs() < 2e-3);
+        let own = r#"<Brush type="auto_brush" spacing="0.3" useAutoSpacing="0"><MaskGenerator type="circle" diameter="40"/></Brush>"#;
+        let spaced = |on: &str, curve: &str| {
+            let option = [
+                param("PressureSpacing", on),
+                param(
+                    "SpacingSensor",
+                    &format!(r#"<!DOCTYPE params><params id="pressure"><curve>{curve}</curve></params>"#),
+                ),
+                param("SpacingValue", "1"),
+            ]
+            .concat();
+            let xml = preset("Spaced", own, true).replace("</Preset>", &format!("{option}</Preset>"));
+            read_preset(&kpp(&xml), &|_| None).unwrap().spacing
+        };
+        let rising = spaced("true", "0,0;1,1;");
+        assert!(close(rising, 0.3 * harmonic(|p| p)), "{rising:?}");
+        // closer the harder the pen presses
+        let falling = spaced("true", "0,1;1,0.2;");
+        assert!(close(falling, 0.3 * harmonic(|p| 1.0 - 0.8 * p)), "{falling:?}");
+        // switched off: its own
+        assert!(near(spaced("false", "0,0;1,1;"), 0.3));
+        // automatic and scaled both
+        let both = preset("Both", auto, true).replace(
+            "</Preset>",
+            &format!(
+                "{}{}</Preset>",
+                param("PressureSpacing", "true"),
+                param("SpacingSensor", r#"<params id="pressure"/>"#)
+            ),
+        );
+        assert!(close(read_preset(&kpp(&both), &|_| None).unwrap().spacing, 0.05 * harmonic(|p| p)));
+    }
+
+    #[test]
+    fn an_auto_tip_with_holes_or_noise_is_speckled() {
+        let speckled = |attributes: &str, generator: &str| {
+            let brush = format!(
+                r#"<Brush type="auto_brush" spacing="0.1" {attributes}><MaskGenerator {generator} diameter="40"/></Brush>"#
+            );
+            read_preset(&kpp(&preset("Speckled", &brush, true)), &|_| None).unwrap().speckled
+        };
+        assert!(speckled(r#"density="0.5""#, r#"type="rect" ratio="0.5""#));
+        assert!(speckled(r#"randomness="0.3""#, r#"type="circle""#));
+        // whole, or our round tip: not
+        assert!(!speckled(r#"density="1" randomness="0""#, r#"type="rect" ratio="0.5""#));
+        assert!(!speckled("", r#"type="circle""#));
+    }
+
+    #[test]
+    fn a_colour_tip_laid_as_an_alpha_mask_paints_where_it_is_dark() {
+        // a GIMP brush in colour, 2 x 1: white and black, both opaque
+        let mut tip = Vec::new();
+        for v in [28u32 + 1, 2, 2, 1, 4] {
+            tip.extend_from_slice(&v.to_be_bytes());
+        }
+        tip.extend_from_slice(b"GIMP");
+        tip.extend_from_slice(&10u32.to_be_bytes());
+        tip.push(0);
+        tip.extend_from_slice(&[255, 255, 255, 255, 0, 0, 0, 255]);
+        let pixels = |attributes: &str| {
+            let brush = format!(r#"<Brush type="gbr_brush" filename="colour.gbr" spacing="0.1" {attributes}/>"#);
+            let b = read_preset(&kpp(&preset("Colour", &brush, true)), &|_| Some(tip.clone())).unwrap();
+            let KritaTip::Image(t) = b.tip else { panic!("{:?}", b.tip) };
+            t.pixels
+        };
+        // as a mask (its application, or the older key): the dark part paints
+        assert_eq!(pixels(r#"brushApplication="0" ColorAsMask="1""#), [0, 255]);
+        assert_eq!(pixels(r#"ColorAsMask="1""#), [0, 255]);
+        // its colours as they are (which we can't lay), or its lightness kept: by its alpha
+        assert_eq!(pixels(r#"brushApplication="1" ColorAsMask="0""#), [255, 255]);
+        assert_eq!(pixels(r#"brushApplication="2""#), [255, 255]);
+        assert_eq!(pixels(r#"ColorAsMask="1" preserveLightness="1""#), [255, 255]);
+        assert_eq!(pixels(""), [255, 255]);
     }
 
     #[test]

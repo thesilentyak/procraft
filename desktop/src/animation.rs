@@ -65,10 +65,12 @@ struct Track {
     focus: Option<usize>,
 }
 
-/// Playing: the frames in playing order, the place in it, the way it goes, and when the next
-/// frame is due (none once a single pass has ended, its last frame still showing).
+/// Playing: the timeline's places that play, in order (a background or foreground frame's left
+/// out: they show with each), each one's frame, the place in them, the way it goes, and when the
+/// next frame is due (none once a single pass has ended, its last frame still showing).
 struct Playing {
-    order: Vec<u32>,
+    slots: Vec<u32>,
+    frames: Vec<u32>,
     at: u32,
     step: i32,
     due: Option<Instant>,
@@ -132,7 +134,7 @@ impl AnimationBar {
     /// The frame showing while playing.
     fn playing_frame(&self) -> Option<usize> {
         let p = self.playing.as_ref()?;
-        p.order.get(p.at as usize).map(|f| *f as usize)
+        p.frames.get(p.at as usize).map(|f| *f as usize)
     }
 
     /// Shows the bar while Animation or Page Assist is on.
@@ -250,7 +252,7 @@ impl AnimationBar {
             ctx.request_repaint_after(due - now);
             return;
         }
-        let len = u32::try_from(p.order.len()).unwrap_or(0);
+        let len = u32::try_from(p.slots.len()).unwrap_or(0);
         match animation_next_step(settings.playback, len, p.at, p.step) {
             Some(next) => {
                 p.at = next.at;
@@ -268,12 +270,18 @@ impl AnimationBar {
 
     fn play(&mut self, ctx: &egui::Context, session: &CanvasSession) {
         let Some(settings) = session.animation_settings() else { return };
-        let order = session.animation_sequence();
-        let Some(&first) = order.first() else { return };
+        let sequence = session.animation_sequence();
+        let (slots, frames): (Vec<u32>, Vec<u32>) = session
+            .animation_played_places()
+            .into_iter()
+            .filter_map(|slot| Some((slot, *sequence.get(slot as usize)?)))
+            .unzip();
+        let Some(&first) = frames.first() else { return };
         self.settings_open = false;
         self.options_open = false;
         self.colours = None;
-        self.playing = Some(Playing { order, at: 0, step: 1, due: Some(Instant::now() + frame_time(&settings)) });
+        let due = Some(Instant::now() + frame_time(&settings));
+        self.playing = Some(Playing { slots, frames, at: 0, step: 1, due });
         session.set_play_frame(Some(first));
         ctx.request_repaint_after(frame_time(&settings));
     }
@@ -321,7 +329,8 @@ impl AnimationBar {
     ) {
         let last = slots.len().saturating_sub(1) as f32;
         let slot = current.and_then(|c| slot_of(slots, c, self.held));
-        let focus = self.playing.as_ref().map(|p| p.at as usize).or(slot).unwrap_or(0);
+        let playing = self.playing.as_ref().and_then(|p| p.slots.get(p.at as usize)).map(|s| *s as usize);
+        let focus = playing.or(slot).unwrap_or(0);
         let info = session.info();
         let aspect = if info.width > 0 && info.height > 0 {
             (info.width as f32 / info.height as f32).clamp(0.25, 2.0)

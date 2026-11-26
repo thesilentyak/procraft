@@ -7,29 +7,20 @@
 
 /// Each by its folder's name under `plugins/`, and the file packed from it.
 pub(crate) const BUNDLED: &[(&str, &[u8])] = &[
-    ("brush-sounds", include_bytes!("../bundled-plugins/brush-sounds.procraft-plugin")),
-    ("colour-triangle", include_bytes!("../bundled-plugins/colour-triangle.procraft-plugin")),
-    ("extract-lines", include_bytes!("../bundled-plugins/extract-lines.procraft-plugin")),
-    ("eyedropper-layer", include_bytes!("../bundled-plugins/eyedropper-layer.procraft-plugin")),
-    ("fill-all-layers", include_bytes!("../bundled-plugins/fill-all-layers.procraft-plugin")),
-    ("gap-closing", include_bytes!("../bundled-plugins/gap-closing.procraft-plugin")),
-    ("grid-layer", include_bytes!("../bundled-plugins/grid-layer.procraft-plugin")),
-    ("hide-undo-notice", include_bytes!("../bundled-plugins/hide-undo-notice.procraft-plugin")),
-    ("interface-colour", include_bytes!("../bundled-plugins/interface-colour.procraft-plugin")),
-    ("interface-size", include_bytes!("../bundled-plugins/interface-size.procraft-plugin")),
+    ("brush-extras", include_bytes!("../bundled-plugins/brush-extras.procraft-plugin")),
+    ("colour-tools", include_bytes!("../bundled-plugins/colour-tools.procraft-plugin")),
+    ("edit-layout", include_bytes!("../bundled-plugins/edit-layout.procraft-plugin")),
+    ("infinite-plugins", include_bytes!("../bundled-plugins/infinite-plugins.procraft-plugin")),
+    ("interface-look", include_bytes!("../bundled-plugins/interface-look.procraft-plugin")),
     ("keyboard-shortcuts", include_bytes!("../bundled-plugins/keyboard-shortcuts.procraft-plugin")),
-    ("opacity-together", include_bytes!("../bundled-plugins/opacity-together.procraft-plugin")),
-    ("outline", include_bytes!("../bundled-plugins/outline.procraft-plugin")),
-    ("paper-texture", include_bytes!("../bundled-plugins/paper-texture.procraft-plugin")),
-    ("paste-into-masks", include_bytes!("../bundled-plugins/paste-into-masks.procraft-plugin")),
-    ("pin-panels", include_bytes!("../bundled-plugins/pin-panels.procraft-plugin")),
-    ("posterise", include_bytes!("../bundled-plugins/posterise.procraft-plugin")),
-    ("quickshape-curves", include_bytes!("../bundled-plugins/quickshape-curves.procraft-plugin")),
+    ("krita-brushes", include_bytes!("../bundled-plugins/krita-brushes.procraft-plugin")),
+    ("layer-toolbox", include_bytes!("../bundled-plugins/layer-toolbox.procraft-plugin")),
+    ("pop-up-palette", include_bytes!("../bundled-plugins/pop-up-palette.procraft-plugin")),
     ("radial-segments", include_bytes!("../bundled-plugins/radial-segments.procraft-plugin")),
-    ("randomise-brush", include_bytes!("../bundled-plugins/randomise-brush.procraft-plugin")),
-    ("touch-offset", include_bytes!("../bundled-plugins/touch-offset.procraft-plugin")),
+    ("storage-folder", include_bytes!("../bundled-plugins/storage-folder.procraft-plugin")),
     ("tweening", include_bytes!("../bundled-plugins/tweening.procraft-plugin")),
     ("vector-layers", include_bytes!("../bundled-plugins/vector-layers.procraft-plugin")),
+    ("view-tools", include_bytes!("../bundled-plugins/view-tools.procraft-plugin")),
 ];
 
 #[cfg(test)]
@@ -108,13 +99,16 @@ mod tests {
             let mut packed: Value = serde_json::from_slice(package.manifest_text()).unwrap();
             packed.as_object_mut().unwrap().remove("files");
             assert_eq!(packed, wanted, "{name}'s manifest has changed: {REPACK}");
-            // and so is a filter's code
+            // and so is a filter's code: its one, or each it lists
             let filter = folder.join("filter.wgsl");
+            let listed: Vec<&str> = package.manifest.shape.filters.iter().map(|f| f.code.as_str()).collect();
             if package.manifest.holds.contains(&PluginPart::Filter) {
-                let wanted = std::fs::read(filter).unwrap();
-                assert_eq!(package.file("filter.wgsl"), Some(wanted.as_slice()), "{name}'s filter: {REPACK}");
+                for path in if listed.is_empty() { vec!["filter.wgsl"] } else { listed } {
+                    let wanted = std::fs::read(folder.join(path)).unwrap();
+                    assert_eq!(package.file(path), Some(wanted.as_slice()), "{name}'s {path}: {REPACK}");
+                }
             } else {
-                assert!(!filter.exists(), "{name}");
+                assert!(!filter.exists() && !folder.join("filters").exists(), "{name}");
             }
             let code = package.file(crate::plugin_run::MODULE).is_some();
             assert_eq!(code, package.manifest.holds.contains(&PluginPart::Hooks), "{name}");

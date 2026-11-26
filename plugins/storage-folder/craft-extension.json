@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "id": "io.github.artcraftandroid.storage-folder",
+  "name": "Storage folder",
+  "version": "1.0.0",
+  "holds": ["hooks"],
+  "publisher": {"name": "ProCraft"},
+  "description": "Keeps your artworks and time-lapse videos in a folder you pick, such as one a sync app keeps the same on your other devices, and brings in what changed there.",
+  "compat": {"procraft": {"interface": 22}},
+  "permissions": [],
+  "hooks": ["artwork_saved", "video_exported", "gallery_opened"],
+  "controls": [
+    {"key": "folder", "type": "folder", "label": "Folder"},
+    {"key": "keep_artworks", "type": "feature", "label": "Keep artworks in a folder", "description": "After each save, the artwork is written to the folder as one file, as Share makes it, named after it and kept up to date. A file there the app didn't write is never written over.", "hooks": ["artwork_saved"]},
+    {"key": "keep_videos", "type": "feature", "label": "Save time-lapse videos there", "description": "A time-lapse video you export also goes into the folder.", "hooks": ["video_exported"]},
+    {"key": "bring_in", "type": "feature", "label": "Bring in changes from the folder", "description": "Careful: as the gallery opens, a newer file there replaces the gallery's copy, and new files come in. Changed in both places, both are kept. Nothing in the folder is deleted.", "hooks": ["gallery_opened"]}
+  ]
+}

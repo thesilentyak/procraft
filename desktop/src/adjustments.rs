@@ -110,7 +110,7 @@ pub fn menu(
     actions: &[PluginAction],
     showing_filters: bool,
 ) -> (Rect, Option<MenuRow>) {
-    let screen = ctx.content_rect();
+    let screen = panel::screen(ctx);
     let (left, arrow_x) = panel::place(ctx, MENU_WIDTH, button.center().x);
     let top = screen.top() + pc::BAR_HEIGHT;
     let groups = menu_groups(filters, actions, showing_filters);
@@ -119,11 +119,12 @@ pub fn menu(
     let content = panel::ARROW_HEIGHT + 52.0 + 8.0 + rows + 10.0;
     let height = content.min(screen.bottom() - MENU_BOTTOM_MARGIN - top);
     let rect = Rect::from_min_size(pos2(left, top), vec2(MENU_WIDTH, height));
+    let rect = panel::hung_rect(ctx, rect, content, MENU_BOTTOM_MARGIN);
     let mut tapped = None;
-    egui::Area::new(Id::unique("adjustments menu")).fixed_pos(rect.min).order(Order::Foreground).show(ctx, |ui| {
+    panel::area(ctx, Id::unique("adjustments menu"), rect).show(ctx, |ui| {
         ui.allocate_rect(rect, Sense::click());
         panel::frame(ui, look, "adjustments frame", rect, arrow_x, backdrops);
-        let body = panel::body(rect);
+        let body = panel::body_in(ui.ctx(), rect);
         // a 52 header, the title's capitals from 28.5 below the panel's top; the groups 8 into the
         // list under it
         if showing_filters {
@@ -510,7 +511,10 @@ fn hsb_panel(ctx: &egui::Context, session: &CanvasSession, shown: &AdjustShown) 
     let screen = ctx.content_rect();
     let wide = screen.width() > screen.height();
     let size = if wide { vec2(961.0, 95.0) } else { vec2(532.0, 220.0) };
-    let rect = Rect::from_min_size(pos2(screen.center().x - size.x / 2.0, screen.bottom() - PANEL_RISE - size.y), size);
+    let rect = crate::panel::bottom_rect(
+        ctx,
+        Rect::from_min_size(pos2(screen.center().x - size.x / 2.0, screen.bottom() - PANEL_RISE - size.y), size),
+    );
     let [h, s, b] = [0, 1, 2].map(|i| shown.hsb.get(i).copied().unwrap_or(0.5));
     egui::Area::new(Id::unique("hsb panel")).fixed_pos(rect.min).order(Order::Foreground).show(ctx, |ui| {
         ui.allocate_rect(rect, Sense::click());
@@ -616,6 +620,8 @@ mod tests {
             kinds: Vec::new(),
             layer_kinds: Vec::new(),
             permissions: Vec::new(),
+            features: Vec::new(),
+            top: Vec::new(),
         }
     }
 

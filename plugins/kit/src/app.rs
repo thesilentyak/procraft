@@ -31,12 +31,18 @@ mod raw {
         pub fn set_layer_name(layer: i64, at: i32, len: i32) -> i32;
         pub fn set_layer_opacity(layer: i64, opacity: f32) -> i32;
         pub fn set_layer_visible(layer: i64, on: i32) -> i32;
+        pub fn layer_mark(layer: i64) -> i64;
+        pub fn set_layer_mark(layer: i64, mark: i64) -> i32;
         pub fn brush_colour() -> i32;
         pub fn set_brush_colour(rgb: i32);
         pub fn brush_size() -> f32;
         pub fn set_brush_size(size: f32);
         pub fn brush_opacity() -> f32;
         pub fn set_brush_opacity(opacity: f32);
+        pub fn recent_colour(at: i32) -> i32;
+        pub fn recent_brush(at: i32) -> i64;
+        pub fn current_brush() -> i64;
+        pub fn choose_brush(key: i64) -> i32;
         pub fn notice(at: i32, len: i32);
         pub fn show_panel(at: i32, len: i32) -> i32;
         pub fn close_panel();
@@ -78,6 +84,12 @@ mod raw {
     pub unsafe fn set_layer_visible(_: i64, _: i32) -> i32 {
         0
     }
+    pub unsafe fn layer_mark(_: i64) -> i64 {
+        0
+    }
+    pub unsafe fn set_layer_mark(_: i64, _: i64) -> i32 {
+        0
+    }
     pub unsafe fn brush_colour() -> i32 {
         0
     }
@@ -90,6 +102,18 @@ mod raw {
         0.0
     }
     pub unsafe fn set_brush_opacity(_: f32) {}
+    pub unsafe fn recent_colour(_: i32) -> i32 {
+        -1
+    }
+    pub unsafe fn recent_brush(_: i32) -> i64 {
+        0
+    }
+    pub unsafe fn current_brush() -> i64 {
+        0
+    }
+    pub unsafe fn choose_brush(_: i64) -> i32 {
+        0
+    }
     pub unsafe fn notice(_: i32, _: i32) {}
     pub unsafe fn show_panel(_: i32, _: i32) -> i32 {
         0
@@ -155,6 +179,17 @@ pub fn show_layer(layer: Layer, on: bool) -> bool {
     unsafe { raw::set_layer_visible(layer.0, i32::from(on)) != 0 }
 }
 
+/// The number the plugin keeps with `layer` (`artwork.read`, interface 10): 0 for none.
+pub fn layer_mark(layer: Layer) -> i64 {
+    unsafe { raw::layer_mark(layer.0) }
+}
+
+/// `mark` kept with `layer` for the plugin, saved with the artwork (`artwork.write`, interface 10):
+/// 0 takes it off. The `layer_label` hook is told it.
+pub fn set_layer_mark(layer: Layer, mark: i64) -> bool {
+    unsafe { raw::set_layer_mark(layer.0, mark) != 0 }
+}
+
 /// The brush's colour, 0xRRGGBB.
 pub fn brush_colour() -> u32 {
     unsafe { raw::brush_colour() as u32 }
@@ -183,6 +218,39 @@ pub fn set_brush_opacity(opacity: f32) {
     unsafe { raw::set_brush_opacity(opacity) }
 }
 
+/// A brush, by the key the app gives it (interface 11): where it is in the library, so it holds while
+/// the library stays as it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Brush(pub i64);
+
+/// The colour at `at` of the colour history (`brush`, interface 11), 0 the latest painted with,
+/// 0xRRGGBB; none past its end.
+pub fn recent_colour(at: usize) -> Option<u32> {
+    let at = i32::try_from(at).ok()?;
+    let rgb = unsafe { raw::recent_colour(at) };
+    u32::try_from(rgb).ok()
+}
+
+/// The brush at `at` of the Recent set (`brush`, interface 11): its pinned brushes first, then the
+/// latest painted with; none past its end.
+pub fn recent_brush(at: usize) -> Option<Brush> {
+    let at = i32::try_from(at).ok()?;
+    let key = unsafe { raw::recent_brush(at) };
+    (key != 0).then_some(Brush(key))
+}
+
+/// The brush the current tool uses (`brush`, interface 11).
+pub fn current_brush() -> Option<Brush> {
+    let key = unsafe { raw::current_brush() };
+    (key != 0).then_some(Brush(key))
+}
+
+/// `brush` chosen for the current tool, as a tap in the library chooses it (`brush`, interface 11):
+/// false if it isn't there any more.
+pub fn choose_brush(brush: Brush) -> bool {
+    unsafe { raw::choose_brush(brush.0) != 0 }
+}
+
 /// `words` shown for a moment, as the app's own short messages are.
 pub fn say(words: &str) {
     unsafe { raw::notice(at(words.as_bytes()), words.len() as i32) }
@@ -202,6 +270,7 @@ pub struct Panel {
     title: String,
     rows: Vec<String>,
     key_press: bool,
+    ring: bool,
 }
 
 /// `text` as a JSON string.
@@ -223,7 +292,7 @@ fn quoted(text: &str) -> String {
 
 impl Panel {
     pub fn new(title: &str) -> Panel {
-        Panel { title: title.to_owned(), rows: Vec::new(), key_press: false }
+        Panel { title: title.to_owned(), rows: Vec::new(), key_press: false, ring: false }
     }
 
     /// Words, a line or a few (`\n` between them).
@@ -258,6 +327,41 @@ impl Panel {
         self
     }
 
+    /// A row of `colours` (0xRRGGBB, one to eight) to tap, the one at `chosen` ringed (interface
+    /// 10): a tap is told as the colour's place.
+    pub fn colours(mut self, label: &str, colours: &[u32], chosen: Option<usize>) -> Panel {
+        let colours: Vec<String> = colours.iter().map(|c| (c & 0xFF_FFFF).to_string()).collect();
+        let chosen = chosen.map(|at| format!(r#","chosen":{at}"#)).unwrap_or_default();
+        self.rows.push(format!(
+            r#"{{"type":"colours","label":{},"colours":[{}]{chosen}}}"#,
+            quoted(label),
+            colours.join(",")
+        ));
+        self
+    }
+
+    /// A row of `brushes` (one to eight, twelve on a ring) to tap, each shown by its sample stroke,
+    /// the one at `chosen` ringed (interface 11): a tap is told as the brush's place.
+    pub fn brushes(mut self, label: &str, brushes: &[Brush], chosen: Option<usize>) -> Panel {
+        let brushes: Vec<String> = brushes.iter().map(|b| b.0.to_string()).collect();
+        let chosen = chosen.map(|at| format!(r#","chosen":{at}"#)).unwrap_or_default();
+        self.rows.push(format!(
+            r#"{{"type":"brushes","label":{},"brushes":[{}]{chosen}}}"#,
+            quoted(label),
+            brushes.join(",")
+        ));
+        self
+    }
+
+    /// It shows as a ring round the point its action came from (interface 11): the pen whose
+    /// button ran it, or the window's middle. Its rows, colours and brushes alone (one to three),
+    /// are each a ring about it, the first innermost; it has no title or Done, and a tap off it
+    /// closes it.
+    pub fn ring(mut self) -> Panel {
+        self.ring = true;
+        self
+    }
+
     /// A row that is tapped, its words in the accent colour.
     pub fn button(mut self, label: &str) -> Panel {
         self.rows.push(format!(r#"{{"type":"button","label":{}}}"#, quoted(label)));
@@ -282,7 +386,8 @@ impl Panel {
     /// The panel as the app reads it.
     pub fn json(&self) -> String {
         let asks = if self.key_press { r#","key_press":true"# } else { "" };
-        format!(r#"{{"title":{},"rows":[{}]{asks}}}"#, quoted(&self.title), self.rows.join(","))
+        let ring = if self.ring { r#","ring":true"# } else { "" };
+        format!(r#"{{"title":{},"rows":[{}]{asks}{ring}}}"#, quoted(&self.title), self.rows.join(","))
     }
 
     /// Shows it (or shows it again, changed); false if the app found it doesn't hold up (no rows, too
@@ -380,5 +485,16 @@ mod tests {
             asking.json(),
             r#"{"title":"Undo","rows":[{"type":"keys","label":"Now","keys":["command+z"]},{"type":"keys","label":"Default","keys":[]}],"key_press":true}"#
         );
+        let ring = Panel::new("Palette")
+            .colours("Colours", &[0xFF0000], None)
+            .brushes("Brushes", &[Brush(1 << 32), Brush(7)], Some(1))
+            .ring();
+        assert_eq!(
+            ring.json(),
+            r#"{"title":"Palette","rows":[{"type":"colours","label":"Colours","colours":[16711680]},{"type":"brushes","label":"Brushes","brushes":[4294967296,7],"chosen":1}],"ring":true}"#
+        );
+        // off the app, nothing is recent and no brush is in use
+        assert_eq!((recent_colour(0), recent_brush(0), current_brush()), (None, None, None));
+        assert!(!choose_brush(Brush(1 << 32)));
     }
 }

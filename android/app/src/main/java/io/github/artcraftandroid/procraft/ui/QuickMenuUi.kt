@@ -201,6 +201,7 @@ fun BoxScope.QuickMenu(vm: CanvasViewModel) {
                     vm.chooseQuickMenu(it)
                     marked = it
                 },
+                onRename = { i, name -> vm.renameQuickMenu(i, name) },
                 onDelete = { i ->
                     vm.deleteQuickMenu(i)
                     fresh.remove(i)
@@ -247,6 +248,7 @@ private fun MenusPopover(
     marked: Int?,
     onAdd: () -> Unit,
     onChoose: (Int) -> Unit,
+    onRename: (Int, String) -> Unit,
     onDelete: (Int) -> Unit,
 ) {
     val cx = (left + right) / 2
@@ -298,6 +300,8 @@ private fun MenusPopover(
         val order = fresh.filter { it in menus.indices } + menus.indices.filter { it !in fresh }
         // the row swiped and how far (px)
         var swipe by remember { mutableStateOf<Pair<Int, Float>?>(null) }
+        // the menu being renamed: its row, the active one, tapped again
+        var renaming by remember { mutableStateOf<Int?>(null) }
         val density = LocalDensity.current
         val openPx = with(density) { SwipeOpen.toPx() }
         androidx.compose.foundation.lazy.LazyColumn(
@@ -336,8 +340,14 @@ private fun MenusPopover(
                             }
                         }
                         .pointerInput(i) {
-                            // a tap closes a row left open, else chooses the menu
-                            detectTapGestures { if (swipe != null) swipe = null else onChoose(i) }
+                            // a tap closes a row left open, renames the active menu, else chooses the menu
+                            detectTapGestures {
+                                when {
+                                    swipe != null -> swipe = null
+                                    marked == i -> renaming = i
+                                    else -> onChoose(i)
+                                }
+                            }
                         },
                 ) {
                     val rowPx = with(density) { maxWidth.toPx() }
@@ -366,10 +376,17 @@ private fun MenusPopover(
                             .clip(CircleShape).background(if (on) Pc.Accent else PickerRowFill).padding(horizontal = 16.dp),
                         contentAlignment = Alignment.CenterStart,
                     ) {
-                        Text(
-                            name, color = if (on) Color.White else PickerRowInk, fontSize = RowText, letterSpacing = RowTracking,
-                            fontWeight = if (on) FontWeight.SemiBold else FontWeight.Normal, maxLines = 1, modifier = Modifier.offset(y = RowTextDrop),
-                        )
+                        if (renaming == i) {
+                            InlineName(name, Color.White, RowText, Modifier.offset(y = RowTextDrop), FontWeight.SemiBold) {
+                                onRename(i, it)
+                                renaming = null
+                            }
+                        } else {
+                            Text(
+                                name, color = if (on) Color.White else PickerRowInk, fontSize = RowText, letterSpacing = RowTracking,
+                                fontWeight = if (on) FontWeight.SemiBold else FontWeight.Normal, maxLines = 1, modifier = Modifier.offset(y = RowTextDrop),
+                            )
+                        }
                     }
                 }
             }

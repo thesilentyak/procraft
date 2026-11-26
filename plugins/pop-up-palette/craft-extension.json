@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "id": "io.github.artcraftandroid.pop-up-palette",
+  "name": "Pop-up palette",
+  "version": "1.0.0",
+  "holds": ["hooks"],
+  "publisher": { "name": "ProCraft" },
+  "description": "A ring of your recent colours and brushes that opens where the pen is: set a pen button to Pop-up palette in Prefs, Pen buttons, then tap a colour or a brush to take it.",
+  "compat": { "procraft": { "interface": 11 } },
+  "permissions": ["brush", "panel"],
+  "hooks": [],
+  "controls": [
+    {
+      "key": "colours", "type": "slider", "label": "Recent colours", "least": 0, "most": 10, "step": 1, "starts": 8,
+      "at_least": "None"
+    },
+    {
+      "key": "brushes", "type": "slider", "label": "Recent brushes", "least": 0, "most": 12, "step": 1, "starts": 8,
+      "at_least": "None"
+    },
+    { "key": "close", "type": "switch", "label": "Close once one is picked", "starts": true }
+  ],
+  "actions": [
+    { "key": "open", "label": "Pop-up palette", "place": "pen" }
+  ]
+}

@@ -15,6 +15,16 @@ fn main() {
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| std::env::var("CARGO_PKG_VERSION").unwrap_or_default());
     println!("cargo:rustc-env=PROCRAFT_VERSION={version}");
+    // the values that ask a laptop's drivers for its discrete GPU for OpenGL (see `main.rs`), which
+    // they look for among the .exe's exports (an .exe exports nothing by itself); the tests' .exe
+    // too, so that one can look
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+    {
+        for name in ["NvOptimusEnablement", "AmdPowerXpressRequestHighPerformance"] {
+            println!("cargo:rustc-link-arg=/EXPORT:{name},DATA");
+        }
+    }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         // the numbers Windows compares (1.2.3 of 1.2.3-beta), each in 16 bits
         let numbers = version.split(['-', '+']).next().unwrap_or_default();

@@ -20,7 +20,7 @@
   <img alt="Rust engine" src="https://img.shields.io/badge/engine-Rust-lightblue?style=flat&logo=rust&logoColor=white">
   <img alt="GPU renderer: wgpu" src="https://img.shields.io/badge/renderer-wgpu-lightblue?style=flat">
   <img alt="Kotlin and Jetpack Compose" src="https://img.shields.io/badge/UI-Kotlin%20%C2%B7%20Jetpack%20Compose-blue?style=flat">
-  <img alt="Minimum: Android 10 (API 29)" src="https://img.shields.io/badge/min-Android%2010%20%28API%2029%29-blue?style=flat">
+  <img alt="Minimum: Android 8 (API 26)" src="https://img.shields.io/badge/min-Android%208%20%28API%2026%29-blue?style=flat">
   <img alt="Target: Android 16 (API 36)" src="https://img.shields.io/badge/target-Android%2016%20%28API%2036%29-blue?style=flat">
   <img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue?style=flat">
   <img alt="Desktop: Windows and Linux" src="https://img.shields.io/badge/desktop-Windows%20%C2%B7%20Linux-blue?style=flat">
@@ -28,7 +28,7 @@
 </p>
 
 <p align="center">
-  <sub>From <a href="https://github.com/artcraft-android/procraft/releases">Releases</a>: Android tablets take the <code>arm64.apk</code> (the <code>legacy-arm32.apk</code> is only for older 32-bit tablets), or Obtainium, for updates; Windows the <code>.msi</code> installer or the portable <code>.zip</code>; Linux the <code>.AppImage</code>, the <code>.deb</code> or the <code>.tar.gz</code> (videos and PDFs there use the system's <code>ffmpeg</code> and <code>poppler-utils</code>).</sub>
+  <sub>From <a href="https://github.com/artcraft-android/procraft/releases">Releases</a>: Android tablets take the <code>arm64.apk</code> (the <code>legacy-armeabi-v7a.apk</code> is only for older 32-bit tablets), or Obtainium, for updates; Windows the <code>windows-x64</code> <code>.msi</code> installer or portable <code>.zip</code> (the <code>windows-arm64</code> ones are only for ARM laptops, such as Snapdragon ones: any other PC says "This app can't run on your PC"); Linux the <code>.AppImage</code>, the <code>.deb</code> or the <code>.tar.gz</code> (videos and PDFs there use the system's <code>ffmpeg</code> and <code>poppler-utils</code>); iPads the <code>ipados-unsigned.ipa</code>, with a sideloading tool (<a href="#installing-on-an-ipad">how</a>).</sub>
 </p>
 
 <p align="center">
@@ -69,6 +69,22 @@
 
 <br>
 
+## Brush files
+
+Brushes come in from a file manager (open with ProCraft) or from the brush library's **+ › Add from File**.
+
+| File Type | Parsing Method | Plugin Engine Support |
+|---|---|---|
+| `.brush`, `.brushset`, `.brushlibrary` | read as they are, every setting kept; edited in the Brush Studio | not needed |
+| `.abr` (Photoshop) | tips, textures and dynamics made into ProCraft brushes | not yet |
+| `.gbr`, `.gih`, `.vbr` (GIMP) | tips (each image of a pipe, the shape of a generated brush) made into ProCraft brushes | not yet |
+| `.kpp`, `.bundle` (Krita) | made into ProCraft brushes | **Krita brushes** plugin: drawn as Krita draws them, with a Krita brush studio of its own |
+| `.sut`, `.sutg` (Clip Studio Paint) | made into ProCraft brushes; textures it keeps encrypted come in as their previews | not yet |
+
+<sub>A brush made from another app's file keeps its look as closely as ProCraft's engine allows; a plugin engine draws it the way that app does. Plugins are off until you turn them on in Prefs › Plugins.</sub>
+
+<br>
+
 ## Layers and colour
 
 <table>
@@ -103,7 +119,7 @@
 
 ## Planned features
 
-ProCraft is in beta, on Android tablets and on the desktop (Windows and Linux).
+ProCraft is in beta, on Android tablets, on the desktop (Windows and Linux) and on the iPad.
 
 | Area | Status |
 |---|---|
@@ -118,11 +134,25 @@ ProCraft is in beta, on Android tablets and on the desktop (Windows and Linux).
 | Gallery: stacks, new-canvas presets, import and share (PNG, JPEG, PSD, PDF, TIFF, GIF, MP4), time-lapse | 🚧 nearly done |
 | 3D painting: OBJ and USDZ models, texture sets, painting on the mesh, lights and environments | 🚧 |
 | Desktop: Windows and Linux, the same interface with a mouse, a pen tablet and keyboard shortcuts; an installer, an AppImage and a .deb | 🚧 beta |
-| Plugins: `.procraft-plugin` files you import in Prefs › Plugins, each off until you turn it on and gone without a trace when you turn it off. Filters (a few lines of WGSL, under Adjustments) and sandboxed WebAssembly that changes how the app behaves, such as Interface size, Touch offset and ColorDrop gap closing. How to write one: [docs/plugins.md](docs/plugins.md) | ✅ |
+| iPad: the same app in SwiftUI over the shared engine, with the Apple Pencil's hover, squeeze and barrel roll; an unsigned .ipa to sideload | 🚧 beta |
+| Plugins: `.procraft-plugin` files you import in Prefs › Plugins, each off until you turn it on and gone without a trace when you turn it off. Filters (a few lines of WGSL, under Adjustments) and sandboxed WebAssembly that changes how the app behaves, such as Interface, Touch offset and ColorDrop tools. How to write one: [docs/plugins.md](docs/plugins.md) | ✅ |
 | More for plugins: buttons that change the artwork (asking permission first), panels of their own, the colour picker drawn their way, kinds of artwork and of layer of their own, such as Vector layers | ✅ |
+| Brush engines in plugins: brush files another app's engine draws, drawn by a plugin as that app draws them, with a brush studio of its own, such as Krita brushes (Krita's pixel brush) | 🚧 |
 | Phones: their own app, ProCraft Pocket (this one is for tablets) | ⬜ |
 
 <sub>✅ works today · 🚧 in progress · ⬜ not started · 🚫 not planned</sub>
+
+<br>
+
+## Installing on an iPad
+
+Apps don't install on an iPad straight from the web, so the iPad app (`procraft-<version>-ipados-unsigned.ipa` from [Releases](https://github.com/artcraft-android/procraft/releases)) goes on with a sideloading tool, which signs it with your own Apple ID:
+
+* **AltStore** (with a Windows PC or a Mac): install AltServer on the computer and, through it, AltStore on the iPad, then in AltStore's My Apps tap **+** and pick the .ipa.
+* **SideStore** (no computer once it is set up): install it as its own guide says, then in its My Apps tap **+** and pick the .ipa.
+* **Sideloadly** (Windows or Mac): plug the iPad in, drop the .ipa on Sideloadly, enter your Apple ID and press Start.
+
+The first time, iPadOS asks you to trust your Apple ID (Settings › General › VPN & Device Management) and, from iPadOS 16, to turn on Developer Mode (Settings › Privacy & Security). With a free Apple ID an app signed this way runs for 7 days before it must be refreshed (AltStore and SideStore do that by themselves while the computer or the app is reachable), and only 3 such apps can be installed at once.
 
 <br>
 
@@ -133,6 +163,7 @@ ProCraft is in beta, on Android tablets and on the desktop (Windows and Linux).
 * Make sure you have at least 6 GB of free disk space
 * enter `android` and run `./gradlew assembleRelease -Pprocraft.abis=arm64-v8a`, or open that folder in Android Studio and press Run.
 * the desktop app: `cargo run --release -p procraft-desktop` from the repository's root; its installer and packages with `packaging/windows/package.ps1` (WiX v5) and `packaging/linux/package.sh` (nfpm, appimagetool).
+* the iPad app, on a Mac with Xcode and XcodeGen: `ios/build-ipa.sh` makes the unsigned .ipa.
 
 Build time dependencies:
 
@@ -156,6 +187,7 @@ Build time dependencies:
 | `crates/core` | what both apps share above the renderer: the canvas session, every touch and gesture, the tools' state (adjustments, transform, selection, crop, Recolor) and which of them a button ends, the gallery, presets, gradients, time-lapse, the brush library's files, the layer menu, exports and their file names, and keyboard shortcuts; with the Android app's UniFFI bindings |
 | `android` | the Android app (Gradle) |
 | `desktop` | the desktop app (egui) for Windows and Linux |
+| `ios` | the iPad app (SwiftUI over `crates/core`) |
 | `packaging` | the desktop app's Windows installer and Linux packages, as the release workflow builds them |
 
 *Builds are only tested on Windows 11.*

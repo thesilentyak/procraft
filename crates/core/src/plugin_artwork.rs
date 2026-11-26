@@ -226,7 +226,7 @@ impl CanvasSession {
         let text = canvas.ok_or_else(|| reason("not an artwork a plugin draws"))?.svg();
         let text = text.ok_or_else(|| reason("the plugin couldn't draw it"))?;
         crate::project::write_atomically(std::path::Path::new(&path), |p| {
-            std::fs::write(p, text.as_bytes()).map_err(|e| reason(&format!("writing the picture: {e}")))
+            crate::storage::write(p, text.as_bytes()).map_err(|e| reason(&format!("writing the picture: {e}")))
         })
     }
 

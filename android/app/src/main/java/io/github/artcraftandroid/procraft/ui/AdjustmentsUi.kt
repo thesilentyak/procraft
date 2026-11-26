@@ -262,10 +262,16 @@ private fun Adjustment.icon() = when (this) {
     Adjustment.PLUGIN -> PcIcons.Adjustments
 }
 
-/** The window's width, which the adjustment toolbars and the animation bar lay themselves out by (not its shape). */
+/**
+ * The window's width, which the adjustment toolbars and the animation bar lay themselves out by (not
+ * its shape), less what the interface keeps clear of across it.
+ */
 @Composable
-internal fun windowWidth(): Dp =
-    with(androidx.compose.ui.platform.LocalDensity.current) { androidx.compose.ui.platform.LocalWindowInfo.current.containerSize.width.toDp() }
+internal fun windowWidth(): Dp {
+    val clear = LocalClearance.current
+    val width = androidx.compose.ui.platform.LocalWindowInfo.current.containerSize.width - clear.left - clear.right
+    return with(androidx.compose.ui.platform.LocalDensity.current) { width.toDp() }
+}
 
 /**
  * Where each toolbar lays its sliders side by side (as measured in landscape; upright, stacked): the
@@ -525,7 +531,8 @@ fun CurvesPanel(vm: CanvasViewModel, modifier: Modifier = Modifier) {
             }
         }
         Column(Modifier.width(111.dp).fillMaxHeight().clip(RoundedCornerShape(13.dp)), verticalArrangement = Arrangement.spacedBy(1.dp)) {
-            listOf("Gamma", "Red", "Green", "Blue").forEachIndexed { i, name ->
+            // a filter layer's curves have alpha too
+            listOf("Gamma", "Red", "Green", "Blue", "Alpha").take(vm.curveChannels.coerceIn(1, 5)).forEachIndexed { i, name ->
                 val chosen = vm.curveChannel == i
                 Box(Modifier.fillMaxWidth().weight(1f).background(if (chosen) Pc.Accent else PanelButton).tap { vm.chooseCurveChannel(i) }, contentAlignment = Alignment.Center) {
                     Text(name, color = if (chosen) Color.White else PanelButtonText, fontSize = 16.sp, maxLines = 1)
@@ -854,7 +861,7 @@ private fun LiquifyPanelAndMenus(vm: CanvasViewModel, screenWidth: Dp, screenHei
                 Spacer(Modifier.height(4.dp))
                 Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(13.dp)).background(MenuGroup).padding(vertical = 8.dp)) {
                     val amount = if (vm.liquifyAmount >= 1f) "Max" else "${(vm.liquifyAmount * 100).roundToInt()}%"
-                    SliderRow("Amount", vm.liquifyAmount, amount) { vm.changeLiquifyAmount(it) }
+                    SliderRow("Amount", vm.liquifyAmount, amount, onEnd = vm::letGoLiquifyAmount) { vm.changeLiquifyAmount(it) }
                 }
             }
         }
@@ -1365,8 +1372,9 @@ fun BloomPanel(vm: CanvasViewModel, modifier: Modifier = Modifier) {
 @Composable
 fun PluginFilterPanel(vm: CanvasViewModel, modifier: Modifier = Modifier) {
     val controls = vm.pluginFilter?.controls ?: return
-    androidx.compose.runtime.LaunchedEffect(Unit) {
-        while (true) {
+    // (not while the app is away: nothing changes there)
+    androidx.compose.runtime.LaunchedEffect(vm.inFront) {
+        while (vm.inFront) {
             kotlinx.coroutines.delay(150)
             vm.checkPluginFilter()
         }
@@ -1386,7 +1394,7 @@ fun PluginFilterPanel(vm: CanvasViewModel, modifier: Modifier = Modifier) {
                         Box(Modifier.tap { vm.setPluginFilterSwitch(control.control.key, !control.control.on) }) { Switch(control.control.on, enabled = true) }
                     }
                     // (a filter has none)
-                    is PluginControl.File -> {}
+                    is PluginControl.File, is PluginControl.Texture, is PluginControl.Folder -> {}
                 }
             }
         }

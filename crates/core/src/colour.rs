@@ -122,7 +122,7 @@ pub fn import_profile(bytes: Vec<u8>) -> Option<String> {
         // one of the same name is replaced only once this is written whole
         let file = folder.join(format!("{}.icc", safe.trim()));
         if let Err(e) = crate::project::write_atomically(&file, |f| {
-            std::fs::write(f, &bytes).map_err(|e| crate::project::file_error("keeping a profile", e))
+            crate::storage::write(f, &bytes).map_err(|e| crate::project::file_error("keeping a profile", e))
         }) {
             log::error!("keeping an imported profile: {e}");
         }

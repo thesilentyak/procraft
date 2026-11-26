@@ -3,6 +3,8 @@
 //! - `artwork.json`: the format, the title and the document (layers and their settings).
 //! - `layers/<id>.png`: each layer's pixels, premultiplied RGBA8 stored losslessly in a PNG (an
 //!   internal store, not for other apps).
+//! - `layers/<id>.store`: what a brush keeps with the layer between strokes, if it keeps anything
+//!   (see `layer_store.rs`).
 //! - `thumbnail.png`: the picture at up to [`THUMBNAIL_SIDE`] pixels, for the gallery.
 //! - `generation/`: image generation's kept results (see generation.rs). Private to the app: no
 //!   export reads it, and an app built without the `generation` feature leaves it alone.
@@ -17,8 +19,6 @@ use std::sync::Arc;
 
 use procraft_engine::document::{BlendMode, Document, LayerId, LayerKind};
 use procraft_engine::formats::{self, PsdKind, PsdLayer};
-use procraft_engine::geom::Vec2;
-use procraft_engine::view::View;
 
 use crate::{CanvasSession, MobileError};
 
@@ -26,11 +26,37 @@ use crate::{CanvasSession, MobileError};
 pub const THUMBNAIL_SIDE: u32 = 512;
 /// [`CanvasSession::edits_saved`] before any save.
 pub(crate) const NOT_SAVED: u64 = u64::MAX;
-/// How often an open artwork kept saved looks for changes to save.
+/// How many saves leaving an artwork makes at most while it is painted on as it saves.
+const LEAVE_SAVES: usize = 3;
+
+/// What leaving an artwork came to (see [`CanvasSession::save_to_leave`]).
+#[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
+pub enum Leaving {
+    /// Saved whole: the canvas may go.
+    Left,
+    /// It couldn't be saved: it stays open, with what to ask (a title and what it says): stay (the
+    /// default), or leave without saving, which loses what wasn't saved.
+    Stays { title: String, message: String },
+}
+/// How long after a change an open artwork kept saved looks for what to save (it waits for a
+/// change first: nothing changing, it never looks).
 const AUTOSAVE_EVERY: std::time::Duration = std::time::Duration::from_millis(if cfg!(test) { 50 } else { 3000 });
 /// How soon it looks again when something under way kept it from saving: fast painting leaves
 /// only short gaps between strokes, and what isn't saved is gone if the GPU's device goes.
 const AUTOSAVE_AGAIN: std::time::Duration = std::time::Duration::from_millis(if cfg!(test) { 5 } else { 250 });
+/// After a save, the autosave waits this many times as long as it took before it looks again (or
+/// its usual time, if that is longer): each save reads the changed layers back from the GPU and
+/// makes PNGs of them on the CPU, which on a slow device can take a second or more, so saving
+/// takes at most a fifth of the time while painting goes on. Never longer apart than
+/// [`AUTOSAVE_LONGEST`], so little is ever left unsaved.
+const AUTOSAVE_SPACING: u32 = 4;
+const AUTOSAVE_LONGEST: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long the autosave waits, looking `every` so long, after a save that took `took` (see
+/// [`AUTOSAVE_SPACING`]).
+fn autosave_wait(every: std::time::Duration, took: std::time::Duration) -> std::time::Duration {
+    took.saturating_mul(AUTOSAVE_SPACING).min(AUTOSAVE_LONGEST).max(every)
+}
 /// A package's preview's longest side, pixels.
 const PACKAGE_PREVIEW_SIDE: u32 = 1024;
 const FORMAT: &str = "procraft-artwork";
@@ -44,6 +70,60 @@ pub fn artwork_plays(dir: String) -> bool {
     file.is_some_and(|f| f.document.animation.is_some() || f.model.is_some())
 }
 
+/// The longest side Preview's picture of an artwork is ever made at, pixels: past a screen's, it
+/// would show nothing more.
+pub const PREVIEW_SIDE_MOST: u32 = 4096;
+
+/// The longest side to make Preview's picture of an artwork shown `width` × `height` (as the
+/// gallery shows it, turned) at, for a `box_width` × `box_height` screen (pixels): as large as it
+/// shows fitted there, so each of the screen's pixels has one of its own; never larger than the
+/// artwork, nor than [`PREVIEW_SIDE_MOST`].
+#[uniffi::export]
+pub fn preview_side(width: u32, height: u32, box_width: u32, box_height: u32) -> u32 {
+    let (w, h) = (f64::from(width.max(1)), f64::from(height.max(1)));
+    let fit = (f64::from(box_width.max(1)) / w).min(f64::from(box_height.max(1)) / h);
+    let side = (w.max(h) * fit).ceil().min(f64::from(u32::MAX)) as u32;
+    side.clamp(1, width.max(height).clamp(1, PREVIEW_SIDE_MOST))
+}
+
+/// The artwork in `dir` as Preview shows it: the whole picture fitted to `max_side` pixels (see
+/// [`preview_side`]), as its gallery thumbnail is made (its private layers left out, turned and in
+/// its colours as the gallery shows it, its profile carried), as a PNG; none if it can't be opened
+/// or drawn. Slow: the artwork is opened and drawn whole (on the GPU), then let go at once.
+#[uniffi::export]
+pub fn artwork_preview_png(dir: String, max_side: u32) -> Option<Vec<u8>> {
+    let session = CanvasSession::open(dir).ok()?;
+    let made = session.preview_png(max_side);
+    session.release_canvas();
+    made
+}
+
+impl CanvasSession {
+    /// The picture [`artwork_preview_png`] makes, of this artwork opened for it.
+    fn preview_png(&self, max_side: u32) -> Option<Vec<u8>> {
+        // on the app's own device (made now if the app has none yet), not one of its own
+        crate::device::warm_gpu();
+        if !self.prepare_offscreen() {
+            return None;
+        }
+        let (pending, icc, proof, turns) = {
+            let mut guard = self.shared.lock();
+            let st = &mut *guard;
+            let private = st.doc.private_layers();
+            let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else { return None };
+            canvas.render_finished(gpu, &mut st.doc);
+            let pending = canvas.start_composite_thumbnail_without(gpu, &mut st.doc, max_side.max(1), &private);
+            (pending, st.doc.picture_icc(), proof_table(&st.doc), st.turns)
+        };
+        let t = pending.pixels().ok()?;
+        let (w, h, mut rgba) = turned(t.width, t.height, straight_alpha(&t.rgba), turns);
+        if let Some(table) = proof {
+            table.apply_rgba(&mut rgba, false);
+        }
+        png_bytes(w, h, &rgba, &icc).ok()
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ArtworkFile {
     format: String,
@@ -53,13 +133,18 @@ struct ArtworkFile {
     /// Read as kept, or its default if it can't be (as are the document's own settings).
     #[serde(default, deserialize_with = "procraft_engine::document::or_default")]
     info: ArtworkInfo,
-    /// How it was last shown, if it was.
+    /// How the gallery shows it: turned this many quarter turns clockwise (1 to 3), as its canvas
+    /// was left; none, upright. Its thumbnail is kept turned so.
     #[serde(
         default,
         deserialize_with = "procraft_engine::document::or_default",
         skip_serializing_if = "Option::is_none"
     )]
-    view: Option<SavedView>,
+    turns: Option<u8>,
+    /// The view it was left with, as versions before `turns` kept it instead: read only for the
+    /// quarter turn it gives a file without `turns`, never written.
+    #[serde(default, deserialize_with = "procraft_engine::document::or_default", skip_serializing)]
+    view: Option<LeftView>,
     /// The model painted on, if it is one (its current texture set is `document`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model: Option<crate::scene3d::SavedModel>,
@@ -70,6 +155,14 @@ struct ArtworkFile {
         skip_serializing_if = "Option::is_none"
     )]
     reference: Option<procraft_engine::reference_window::ReferenceWindow>,
+    /// The Reference windows opened besides its own, as they were left (each picture beside the
+    /// layers, `reference-2.png` and on).
+    #[serde(
+        default,
+        deserialize_with = "procraft_engine::document::or_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    references: Vec<procraft_engine::reference_window::ReferenceWindow>,
     /// The kind of artwork it is, if a plugin makes it (`<id>.<key>`): the plugin's data is beside
     /// it in `plugin-data.bin`, and the layers are what it drew.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -77,49 +170,40 @@ struct ArtworkFile {
     /// The layer a plugin's artwork's picture is in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     plugin_layer: Option<u64>,
+    /// The values of plugins' controls kept with the artwork (`artwork` in their manifests), by
+    /// their keys (`<id>.<key>`), a switch 1 or 0.
+    #[serde(
+        default,
+        deserialize_with = "procraft_engine::document::or_default",
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    plugin_values: std::collections::BTreeMap<String, f32>,
 }
 
 /// A plugin's artwork's data in its folder.
 pub(crate) const PLUGIN_DATA: &str = "plugin-data.bin";
 
-/// A view kept with an artwork: the canvas point in the middle of the window, the zoom and the
-/// rotation (radians).
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct SavedView {
-    centre: [f32; 2],
-    zoom: f32,
+/// The view an artwork was left with, as earlier versions kept it: of it only its turn counts now
+/// (`rotation`, radians clockwise on screen), less what of that was the view turning with the
+/// device (`followed`); where on the canvas it was and its zoom are not kept.
+#[derive(Clone, Copy, Debug, Default, serde::Deserialize)]
+struct LeftView {
+    #[serde(default)]
     rotation: f32,
+    #[serde(default)]
+    followed: f32,
 }
 
-impl SavedView {
-    /// The view `view` makes in a window `window` pixels.
-    pub(crate) fn of(view: &View, window: (u32, u32)) -> Option<SavedView> {
-        let middle = Vec2::new(window.0 as f32 / 2.0, window.1 as f32 / 2.0);
-        let centre = view.screen_to_canvas(middle)?;
-        Some(SavedView { centre: [centre.x, centre.y], zoom: view.zoom(), rotation: view.to_screen().rotation() })
+impl ArtworkFile {
+    /// The quarter turns clockwise it is kept at: as kept, or, kept by a version before that, the
+    /// turn nearest the view it was left with; upright if neither.
+    fn kept_turns(&self) -> u8 {
+        let left = self.view.and_then(|v| {
+            let followed = if v.followed.is_finite() { v.followed } else { 0.0 };
+            crate::nearest_quarter_turns(v.rotation - followed)
+        });
+        self.turns.or(left).unwrap_or(0) % 4
     }
-
-    /// It again, in a window `window` pixels.
-    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
-    pub(crate) fn view(&self, window: (u32, u32)) -> Option<View> {
-        View::centred(Vec2::new(self.centre[0], self.centre[1]), self.zoom, self.rotation, window)
-    }
-}
-
-/// Whether `view` shows enough of a `canvas`-sized canvas in a `window`-sized window to work on:
-/// its box on screen covers a tenth of the window, or half of it is in the window. A kept view
-/// that doesn't (the canvas pushed off the page) is not used again.
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
-pub(crate) fn shows_canvas(view: &View, window: (u32, u32), canvas: (u32, u32)) -> bool {
-    let m = view.to_screen();
-    let (cw, ch) = (canvas.0 as f32, canvas.1 as f32);
-    let corners = [Vec2::new(0.0, 0.0), Vec2::new(cw, 0.0), Vec2::new(0.0, ch), Vec2::new(cw, ch)].map(|p| m.apply(p));
-    let (x0, x1) = corners.iter().fold((f32::MAX, f32::MIN), |(a, b), p| (a.min(p.x), b.max(p.x)));
-    let (y0, y1) = corners.iter().fold((f32::MAX, f32::MIN), |(a, b), p| (a.min(p.y), b.max(p.y)));
-    let (ww, wh) = (window.0 as f32, window.1 as f32);
-    let seen = (x1.min(ww) - x0.max(0.0)).max(0.0) * (y1.min(wh) - y0.max(0.0)).max(0.0);
-    let whole = (x1 - x0) * (y1 - y0);
-    seen.is_finite() && (seen >= 0.1 * ww * wh || seen >= 0.5 * whole)
 }
 
 /// An artwork's time-lapse in a package: whether it records, its video's settings (quality 0 to 3,
@@ -171,7 +255,8 @@ pub(crate) struct SaveSnapshot {
     reading: Vec<(LayerId, procraft_gpu::Readback)>,
     /// Layers still the PNG files they were opened from (not shown yet), written as they are.
     files: Vec<(LayerId, Vec<u8>)>,
-    composite: Option<procraft_gpu::Readback>,
+    /// The picture for the gallery, made small on the GPU (only it comes back, not the canvas).
+    composite: Option<procraft_gpu::PendingThumbnail>,
     /// Not shown yet, with no thumbnail in the folder: one made from its top picture, for the
     /// gallery until the canvas draws its own.
     unshown: Option<(u32, u32, Vec<u8>)>,
@@ -180,17 +265,92 @@ pub(crate) struct SaveSnapshot {
     gpu: Option<procraft_gpu::Gpu>,
     /// The Reference window's picture, if it has one.
     reference_picture: Option<Arc<Vec<u8>>>,
+    /// The pictures of the windows opened besides it, each if it has one.
+    more_pictures: Vec<Option<Arc<Vec<u8>>>>,
     /// A plugin's artwork's data, if it is one.
     plugin_data: Option<Vec<u8>>,
     /// The data of each plugin's layer (empty while it has none yet), for its file beside the
     /// layer's pixels; those whose data couldn't be read left out.
     layer_data: Vec<(LayerId, Arc<Vec<u8>>)>,
+    /// The layers' stores (see `layer_store.rs`): those changed, their kind and their planes on
+    /// their way back from the GPU; and those whose files there stay as they are.
+    stores: Vec<(LayerId, u32, Vec<procraft_gpu::Readback>)>,
+    stores_kept: Vec<LayerId>,
+    /// Stores still the files they were opened from (not shown yet), written as they are.
+    store_files: Vec<(LayerId, Vec<u8>)>,
+}
+
+#[cfg(test)]
+impl SaveSnapshot {
+    /// The layers the snapshot started back from the GPU (not taken as read ahead).
+    pub(crate) fn read_again(&self) -> Vec<u64> {
+        self.reading.iter().map(|(id, _)| id.0).collect()
+    }
 }
 
 /// How much of a save's layers may still be on their way back from the GPU when the lock is let
-/// go; past it they are read (and those unchanged let go) under it. Small in tests, so their
-/// saves go both ways.
-const READ_AFTER_LOCK: usize = if cfg!(test) { 64 << 10 } else { 256 << 20 };
+/// go; past it they are read (and those unchanged let go) under it, or for the autosave read
+/// ahead of its snapshot as much at a time (see [`LayersAhead`]).
+const READ_AFTER_LOCK: usize = 256 << 20;
+
+/// [`READ_AFTER_LOCK`], in tests [`TESTS_READ_AFTER_LOCK`].
+fn read_after_lock() -> usize {
+    if cfg!(test) { TESTS_READ_AFTER_LOCK.load(std::sync::atomic::Ordering::Relaxed) } else { READ_AFTER_LOCK }
+}
+
+/// The tests' [`READ_AFTER_LOCK`]: small, so their saves go every way (the app's for a benchmark).
+pub(crate) static TESTS_READ_AFTER_LOCK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(64 << 10);
+
+/// How long an autosave, once it has read ahead what changed, waits for a moment with nothing
+/// under way (between strokes) to take its snapshot in, before it gives way and looks again later.
+const SNAPSHOT_WAIT: std::time::Duration = std::time::Duration::from_secs(if cfg!(test) { 2 } else { 4 });
+/// How often it looks for that moment.
+const SNAPSHOT_LOOK: std::time::Duration = std::time::Duration::from_millis(8);
+/// How many times a save asked for reads ahead what changed before the snapshot reads what is
+/// still left in its hold (only when changes keep coming as it reads).
+const SAVE_READS_AHEAD: u32 = 3;
+
+/// Layers a save read ahead of its snapshot, outside the snapshot's hold of the canvas (see
+/// [`CanvasSession::read_layers_ahead`]), painting going on meanwhile: each with its pixels'
+/// version as read, and their hash with the pixels, or none where they are what the folder has.
+/// The snapshot takes a layer as read when its version hasn't moved since (its pixels are the
+/// same: every change gives a layer a new version, in the render that makes it), and reads again
+/// only those whose has, so the save is the artwork at the snapshot's moment whatever was painted
+/// while it read.
+#[derive(Default)]
+pub(crate) struct LayersAhead {
+    layers: std::collections::HashMap<LayerId, ReadLayer>,
+}
+
+/// A layer read ahead (see [`LayersAhead`]).
+struct ReadLayer {
+    version: u64,
+    hash: u64,
+    /// None where the folder has these pixels already.
+    rgba: Option<Vec<u8>>,
+}
+
+impl LayersAhead {
+    /// Whether layer `id` was read at `version`.
+    fn has(&self, id: LayerId, version: u64) -> bool {
+        self.layers.get(&id).is_some_and(|l| l.version == version)
+    }
+
+    /// Layer `id` as read, if it was read at `version`: its hash and its pixels (none where the
+    /// folder has them).
+    fn take(&mut self, id: LayerId, version: u64) -> Option<(u64, Option<Vec<u8>>)> {
+        if !self.has(id, version) {
+            return None;
+        }
+        self.layers.remove(&id).map(|l| (l.hash, l.rgba))
+    }
+
+    /// How many layers are held read (for tests).
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.layers.len()
+    }
+}
 
 /// What the last saves wrote: the folder, and a hash of each layer's pixels, so layers that
 /// haven't changed aren't written again.
@@ -201,8 +361,10 @@ pub(crate) struct Saved {
     sets: crate::scene3d::SavedSets,
     /// Which autosave may save: one started under another number has been stopped.
     autosave: u64,
-    /// A hash of the Reference window's picture as the folder has it, if it has one.
+    /// A hash of the Reference window's picture as the folder has it, if it has one, and of each
+    /// picture of the windows opened besides it.
     reference_picture: Option<u64>,
+    more_pictures: Vec<Option<u64>>,
     /// A hash of each plugin's layer's data as its file in the folder has it.
     pub(crate) layer_data: std::collections::HashMap<LayerId, u64>,
 }
@@ -219,6 +381,7 @@ impl Saved {
         self.dir = dir.to_path_buf();
         self.layers.clear();
         self.reference_picture = None;
+        self.more_pictures.clear();
         self.layer_data.clear();
     }
 
@@ -254,36 +417,52 @@ impl crate::State {
         self.tracking_since = Some(now);
     }
 
-    /// See [`CanvasSession::edits`].
+    /// See [`CanvasSession::edits`]. A stroke counts from its lift, before the canvas lays it (and
+    /// its step) at the next frame.
     pub(crate) fn edits(&self) -> u64 {
-        self.revision.wrapping_add(self.canvas.as_ref().map_or(0, procraft_gpu::Canvas::steps_made))
+        let canvas = self.canvas.as_ref();
+        let steps = canvas.map_or(0, |c| c.steps_made().wrapping_add(c.strokes_ended()));
+        self.revision.wrapping_add(steps)
     }
 
-    /// Nothing under way that saving would end or cut short.
-    pub(crate) fn idle(&self) -> bool {
-        self.stroke.is_none()
-            && self.plugin_artwork.as_ref().is_none_or(|a| !a.down)
-            && self.transform.is_none()
+    /// Nothing long under way that saving would end or cut short (a transform, an adjustment, text
+    /// being edited, a selection or a fill being made): strokes aside, which come and go.
+    pub(crate) fn settled(&self) -> bool {
+        self.transform.is_none()
             && !self.adjusting
             && self.text_edit.is_none()
-            && self.shape.is_none()
             && self.pending_doc.is_none()
             && self.feather_base.is_none()
             && self.selection_before.is_none()
             // a ColorDrop's fill still open
             && self.pour.is_none()
+    }
+
+    /// Nothing under way that saving would end or cut short: nothing long ([`State::settled`]) and
+    /// no stroke.
+    pub(crate) fn idle(&self) -> bool {
+        self.settled()
+            && self.stroke.is_none()
+            && self.plugin_artwork.as_ref().is_none_or(|a| !a.down)
+            && self.shape.is_none()
             && self.scene.as_ref().is_none_or(|s| !s.stroking)
     }
 
     /// The artwork as it is now, for saving into `dir`: a layer already there as it is (its hash
     /// among the `known` and its file there) is let go as soon as it is read, so a save holds only
     /// the layers that changed. Up to [`READ_AFTER_LOCK`] of the layers, and the picture, are
-    /// only started back from the GPU here, to be waited for once the lock is let go.
+    /// only started back from the GPU here, to be waited for once the lock is let go; the rest
+    /// are read here. Layers read `ahead` as they are now are taken as read. `bounded`: none is
+    /// waited for here, the rest only started back; but if those come to more than
+    /// [`READ_AFTER_LOCK`], nothing is taken and there is no snapshot (none: they are read ahead
+    /// first).
     pub(crate) fn save_snapshot(
         &mut self,
         dir: &Path,
         known: &std::collections::HashMap<LayerId, u64>,
-    ) -> Result<SaveSnapshot, MobileError> {
+        mut ahead: Option<&mut LayersAhead>,
+        bounded: bool,
+    ) -> Result<Option<SaveSnapshot>, MobileError> {
         let changed = |id: LayerId, rgba: Vec<u8>| {
             let hash = pixels_hash(&rgba);
             let there = known.get(&id) == Some(&hash) && layer_path(dir, id).exists();
@@ -292,23 +471,19 @@ impl crate::State {
         // the time on it up to now saved with it
         self.count_tracked_time();
         let model = self.model_snapshot()?;
+        // the gallery's turn, as the canvas is left
+        self.turns = self.shown_turns();
         let file = ArtworkFile {
             format: FORMAT.to_owned(),
             version: VERSION,
             name: self.name.clone(),
             document: self.doc.clone(),
             info: self.info.clone(),
-            // as shown (while the guide editor is open, as it was before it), or as it opened if it
-            // hasn't been shown
-            view: self
-                .guide_before
-                .as_ref()
-                .map_or(self.view, |(_, before)| *before)
-                .as_ref()
-                .and_then(|v| SavedView::of(v, self.window_size))
-                .or(self.saved_view),
+            turns: Some(self.turns).filter(|&t| t != 0),
+            view: None,
             model: model.as_ref().map(|m| m.saved.clone()),
             reference: Some(self.reference_window.clone()).filter(|w| !w.is_unused()),
+            references: self.more_references.iter().map(|m| m.window.clone()).collect(),
             // (opened with its plugin off, it stays the plugin's: its kind and data kept as they were)
             plugin: self
                 .plugin_artwork
@@ -320,6 +495,7 @@ impl crate::State {
                 .as_ref()
                 .map(|a| a.layer.0)
                 .or_else(|| self.plugin_opened.as_ref().and_then(|o| o.layer)),
+            plugin_values: self.plugin_values.clone(),
         };
         let mut layers = Vec::new();
         let mut reading = Vec::new();
@@ -327,6 +503,7 @@ impl crate::State {
         let mut composite = None;
         let mut unshown = None;
         let mut changed_ids = Vec::new();
+        let (mut stores, mut stores_kept, mut store_files) = (Vec::new(), Vec::new(), Vec::new());
         // shown but its canvas still being made (on another thread): made now, so the save has its
         // picture for the gallery
         if self.gpu.is_some() && self.canvas.is_none() {
@@ -334,6 +511,24 @@ impl crate::State {
         }
         if let (Some(canvas), Some(gpu)) = (self.canvas.as_mut(), self.gpu.as_ref()) {
             canvas.render(gpu, &mut self.doc, None);
+            let (w, h) = (self.doc.width(), self.doc.height());
+            // bounded: what is left to read must come back after the hold, a lot of it at most
+            if bounded {
+                let changed = canvas.changed();
+                let read = |id: LayerId| ahead.as_deref().is_some_and(|a| a.has(id, canvas.layer_version(id)));
+                let unread = self
+                    .doc
+                    .pixel_layer_ids()
+                    .filter(|&id| {
+                        let wanted = changed.contains(&id) || !known.contains_key(&id) || !layer_path(dir, id).exists();
+                        let left_as_it_is = self.unreadable.contains(&id) && !changed.contains(&id);
+                        wanted && !left_as_it_is && !read(id)
+                    })
+                    .count();
+                if unread > 1 && unread.saturating_mul(layer_read_bytes(w, h)) > read_after_lock() {
+                    return Ok(None);
+                }
+            }
             let changed_now = canvas.take_changed();
             changed_ids = changed_now.iter().copied().collect();
             let mut read_all = || -> Result<(), MobileError> {
@@ -355,9 +550,16 @@ impl crate::State {
                         }
                         self.unreadable.remove(&id);
                     }
-                    let read = canvas.start_reading_layer(gpu, id).map_err(|e| file_error("reading a layer", e))?;
+                    // read ahead as it is now: taken as read (its pixels' version hasn't moved)
+                    if let Some((hash, rgba)) = ahead.as_deref_mut().and_then(|a| a.take(id, canvas.layer_version(id)))
+                    {
+                        layers.extend(rgba.map(|rgba| (id, hash, rgba)));
+                        continue;
+                    }
                     let after: usize = reading.iter().map(|(_, r): &(LayerId, procraft_gpu::Readback)| r.bytes()).sum();
-                    if after + read.bytes() <= READ_AFTER_LOCK {
+                    let read = canvas.start_reading_layer(gpu, id).map_err(|e| file_error("reading a layer", e))?;
+                    // (bounded, what is left was found to be little: all of it comes back after)
+                    if after + read.bytes() <= read_after_lock() || bounded {
                         reading.push((id, read));
                     } else {
                         let rgba = read.pixels().map_err(|e| file_error("reading a layer", e))?;
@@ -371,14 +573,44 @@ impl crate::State {
                 canvas.mark_changed(changed_ids);
                 return Err(e);
             }
-            // for the gallery's thumbnail: private layers left out
+            // the layers' stores: one whose layer is unchanged since a save into this folder stays
+            // as its file is; a store that can't be read isn't saved (its paint dries as it shows)
+            for (id, store) in canvas.stores() {
+                if self.doc.layer(id).is_none() {
+                    continue;
+                }
+                let path = crate::layer_store::store_path(dir, id);
+                if !changed_now.contains(&id) && known.contains_key(&id) && path.exists() {
+                    stores_kept.push(id);
+                    continue;
+                }
+                let reads: Result<Vec<_>, _> =
+                    store.planes.iter().map(|p| canvas.start_reading_layer(gpu, *p)).collect();
+                match reads {
+                    Ok(reads) => stores.push((id, store.kind, reads)),
+                    Err(e) => log::error!("layer {id:?}'s store: {e}"),
+                }
+            }
+            // for the gallery's thumbnail: private layers left out, the picture made small on the
+            // GPU, so only that comes back (the whole canvas, read each save, was most of an
+            // autosave's memory traffic on a large canvas)
             let private = self.doc.private_layers();
-            composite = Some(canvas.start_reading_composite_without(gpu, &mut self.doc, &private));
+            canvas.render_finished(gpu, &mut self.doc);
+            composite = Some(canvas.start_composite_thumbnail_without(gpu, &mut self.doc, THUMBNAIL_SIDE, &private));
         } else {
-            // not shown yet: what was opened is still what there is. A layer still its file's
-            // bytes isn't decoded: it is written as they are, or not at all if that file is there
+            // not shown yet: what was opened is still what there is. A layer still its file isn't
+            // decoded: it is written as it is, or not at all if that file is there
             for (id, layer) in &self.pending_pixels {
                 match layer {
+                    Opened::File(from) => {
+                        let to = layer_path(dir, *id);
+                        if *from != to {
+                            let bytes = fs::read(from).map_err(|e| file_error("reading a layer", e))?;
+                            if fs::read(&to).ok().as_ref() != Some(&bytes) {
+                                files.push((*id, bytes));
+                            }
+                        }
+                    }
                     Opened::Png(bytes) => {
                         if fs::read(layer_path(dir, *id)).ok().as_ref() != Some(bytes) {
                             files.push((*id, bytes.clone()));
@@ -387,13 +619,20 @@ impl crate::State {
                     Opened::Pixels(rgba) => layers.extend(changed(*id, rgba.clone())),
                 }
             }
+            for (id, bytes) in &self.pending_stores {
+                if fs::read(crate::layer_store::store_path(dir, *id)).ok().as_ref() != Some(bytes) {
+                    store_files.push((*id, bytes.clone()));
+                } else {
+                    stores_kept.push(*id);
+                }
+            }
             // a picture made into an artwork and saved before it is shown (the app may be closed
             // before it is): the gallery shows the picture
             if !dir.join("thumbnail.png").exists() {
                 let (w, h) = (self.doc.width(), self.doc.height());
                 unshown = self.pending_pixels.iter().rev().find_map(|(_, layer)| match layer {
                     Opened::Pixels(rgba) => Some(thumbnail(rgba, w, h, THUMBNAIL_SIDE)),
-                    Opened::Png(_) => None,
+                    Opened::File(_) | Opened::Png(_) => None,
                 });
             }
         }
@@ -409,6 +648,7 @@ impl crate::State {
         }
         let gpu = self.gpu.clone();
         let reference_picture = self.reference_picture.clone();
+        let more_pictures = self.more_references.iter().map(|m| m.picture.clone()).collect();
         let plugin_data = self
             .plugin_artwork
             .as_ref()
@@ -421,7 +661,7 @@ impl crate::State {
             .filter(|l| !self.layer_data_unread.contains(&l.id))
             .filter_map(|l| Some((l.id, l.plugin.as_ref()?.data.clone().unwrap_or_default())))
             .collect();
-        Ok(SaveSnapshot {
+        Ok(Some(SaveSnapshot {
             changed: changed_ids,
             file,
             layers,
@@ -432,9 +672,13 @@ impl crate::State {
             model,
             gpu,
             reference_picture,
+            more_pictures,
             plugin_data,
             layer_data,
-        })
+            stores,
+            stores_kept,
+            store_files,
+        }))
     }
 }
 
@@ -452,42 +696,141 @@ fn write_or_keep_changed(
     {
         canvas.mark_changed(changed);
     }
+    session.note_room(&result);
+    if result.is_ok() {
+        session.folder_saved(dir);
+    }
     result
+}
+
+impl CanvasSession {
+    /// The artwork was saved into `dir`: a plugin keeping artworks in a folder writes it there
+    /// before long (interface 22). Nothing with none on that hook.
+    fn folder_saved(&self, dir: &Path) {
+        let folders = self.shared.folders.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(folders) = folders {
+            folders.artwork_saved(self.me.clone(), dir);
+        }
+    }
+
+    /// The artwork in `dir` was left, saved: what a plugin's folder waits for goes before long.
+    fn folder_left(&self, dir: &Path) {
+        let folders = self.shared.folders.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(folders) = folders {
+            folders.artwork_left(dir);
+        }
+    }
+
+    /// Whether its canvas is there to read: made, on a GPU, and not let go.
+    pub(crate) fn shows_canvas(&self) -> bool {
+        let st = self.shared.lock();
+        st.canvas.is_some() && st.gpu.is_some() && !st.closed
+    }
+
+    /// Whether its canvas was let go ([`CanvasSession::release_canvas`]).
+    pub(crate) fn closed(&self) -> bool {
+        self.shared.lock().closed
+    }
+}
+
+impl CanvasSession {
+    /// What a save of the artwork came to, for the storage (see `storage.rs`): failed for want of
+    /// room, the storage is full; worked after a save or its time-lapse found it full, there is room
+    /// again, and the next time it fills is told again.
+    pub(crate) fn note_room(&self, result: &Result<(), MobileError>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        match result {
+            Err(e) if crate::storage::says_full(&e.to_string()) => {
+                crate::storage::found_full();
+                self.shared.found_full.store(true, Relaxed);
+            }
+            Ok(()) if self.shared.found_full.swap(false, Relaxed) => crate::storage::room_again(),
+            _ => {}
+        }
+    }
 }
 
 impl CanvasSession {
     /// [`CanvasSession::start_autosave`], looking `every` so long, and `again` after that when
     /// something was under way.
     pub(crate) fn keep_saved(self: Arc<Self>, dir: String, every: std::time::Duration, again: std::time::Duration) {
+        let kept = self.edits();
+        self.keep_saved_since(dir, every, again, kept);
+    }
+
+    /// [`CanvasSession::keep_saved`], with what is in `dir` as of the artwork's edits `kept`: an
+    /// artwork whose last save failed is saved at its next look even before it changes again.
+    pub(crate) fn keep_saved_since(
+        self: Arc<Self>,
+        dir: String,
+        every: std::time::Duration,
+        again: std::time::Duration,
+        mut kept: u64,
+    ) {
         let mine = {
             let mut saved = self.shared.saving.lock().unwrap_or_else(|e| e.into_inner());
             saved.autosave = saved.autosave.wrapping_add(1);
             saved.autosave
         };
-        let mut kept = self.edits();
         let session = Arc::downgrade(&self);
+        // open there: nothing from a plugin's folder comes in over it
+        crate::folders::opened(Path::new(&dir), Arc::downgrade(&self));
+        // (its own handle on the changes: waiting on them keeps nothing else of the session alive)
+        let nudge = Arc::clone(&self.shared.nudge);
+        let mut seen = nudge.seen();
         let started = std::thread::Builder::new().name("autosave".into()).spawn(move || {
             let mut wait = every;
+            // how long it waits for a change before it looks again anyway, while something it
+            // couldn't save yet waits (a tool left open): longer each time, none once all is saved
+            let mut unsaved: Option<std::time::Duration> = None;
             loop {
-                std::thread::sleep(wait);
+                // nothing is looked for until something changes (or, the app away, it shows again)
+                let Some(now) = nudge.wait_past(seen, unsaved) else { return };
+                let woken = now != seen;
+                seen = now;
+                {
+                    let Some(session) = session.upgrade() else { return };
+                    if session.shared.saving.lock().unwrap_or_else(|e| e.into_inner()).autosave != mine {
+                        return;
+                    }
+                    if session.shared.lock().hidden {
+                        unsaved = None;
+                        continue;
+                    }
+                }
+                // changes come in runs (a stroke after another): saved a little after one, once
+                // (a look again after a wait for nothing is made at once); the changes made
+                // meanwhile are this look's, not a reason for another after it
+                if woken {
+                    std::thread::sleep(wait);
+                    seen = nudge.seen();
+                }
                 wait = every;
                 let Some(session) = session.upgrade() else { return };
+                // (in the gap after a stroke: once the frames have laid its end, which reading the
+                // layers would otherwise lay at once, touches and frames waiting on it)
+                let _ = session.shared.await_frames_laid();
                 let mut saved = session.shared.saving.lock().unwrap_or_else(|e| e.into_inner());
                 if saved.autosave != mine {
                     return;
                 }
+                crate::activity::Counts::add(&session.shared.counts.autosave_looks);
                 let now = session.edits();
                 if now == kept {
+                    unsaved = None;
                     continue;
                 }
                 let lost = || session.shared.lock().gpu.as_ref().is_some_and(procraft_gpu::Gpu::is_lost);
                 if lost() {
                     return;
                 }
-                if !session.shared.lock().idle() {
+                // (strokes, which come and go, the save waits for itself, reading ahead meanwhile)
+                if !session.shared.lock().settled() {
                     wait = again;
+                    unsaved = Some(unsaved.map_or(again, |w| (w * 2).min(AUTOSAVE_LONGEST)));
                     continue;
                 }
+                let started = std::time::Instant::now();
                 let result = session.save_if_idle_with(&mut saved, &dir);
                 // lost during the save: that is what failed it, and it tells of itself
                 if result.is_err() && lost() {
@@ -498,13 +841,24 @@ impl CanvasSession {
                     Ok(true) => {
                         kept = now;
                         failure.1 = false;
+                        unsaved = None;
+                        // a slow save, a longer wait before the next
+                        wait = autosave_wait(every, started.elapsed());
                     }
-                    Ok(false) => wait = again,
+                    Ok(false) => {
+                        wait = again;
+                        unsaved = Some(unsaved.map_or(again, |w| (w * 2).min(AUTOSAVE_LONGEST)));
+                    }
                     Err(e) => {
                         log::error!("keeping the artwork saved: {e}");
                         if !failure.1 {
                             *failure = (Some(e.to_string()), true);
                         }
+                        // tried again with the next change, or before long; a failing save (the
+                        // storage full) reads and encodes as much as one that works, so it is
+                        // spaced as one is
+                        unsaved = Some(AUTOSAVE_LONGEST);
+                        wait = autosave_wait(every, started.elapsed());
                     }
                 }
             }
@@ -514,22 +868,136 @@ impl CanvasSession {
         }
     }
 
-    /// [`CanvasSession::save_if_idle`] with what the last saves wrote (its lock held).
+    /// [`CanvasSession::save_if_idle`] with what the last saves wrote (its lock held). The saving
+    /// goes on beside the painting, the canvas held only a moment at a time: the layers that
+    /// changed are read ahead (see [`LayersAhead`]) a lot at a time, each lot's copies started in
+    /// a short hold and waited for once it is let go, strokes going on meanwhile; then, at a
+    /// moment with nothing under way, the snapshot takes the document and those read as they
+    /// still are, and starts back the few that changed since. Nothing is waited for under a hold,
+    /// however many layers changed. False if no such moment came within [`SNAPSHOT_WAIT`] (looked
+    /// for again later).
     fn save_if_idle_with(&self, saved: &mut Saved, dir: &str) -> Result<bool, MobileError> {
-        let (snapshot, edits) = {
-            let mut guard = self.shared.lock_finished();
-            let st = &mut *guard;
-            if !st.idle() {
+        let dir = Path::new(dir);
+        let known = saved.known(dir);
+        let mut ahead = LayersAhead::default();
+        // read ahead first, and again only when the snapshot finds more left than it may start
+        let mut read = true;
+        let mut until = std::time::Instant::now();
+        loop {
+            // a model's layers are its colour's only while the snapshot is taken: read in its hold
+            let flat = self.shared.lock().scene.is_none();
+            if read {
+                if flat {
+                    self.read_layers_ahead(&mut ahead, dir, &known)?;
+                }
+                read = false;
+                until = std::time::Instant::now() + SNAPSHOT_WAIT;
+            }
+            // a moment with nothing under way, and nothing the frames lay a share at a time (which
+            // the snapshot's render would lay at once, the frames and touches waiting on it)
+            if self.shared.quiet() {
+                let mut guard = self.shared.lock_finished();
+                let st = &mut *guard;
+                if st.idle() {
+                    // a model saves its colour as the artwork's document
+                    let ahead = (flat && st.scene.is_none()).then_some(&mut ahead);
+                    let bounded = ahead.is_some();
+                    match st.with_colour(|st| st.save_snapshot(dir, &known, ahead, bounded))? {
+                        Some(snapshot) => {
+                            let edits = st.edits();
+                            drop(guard);
+                            write_or_keep_changed(self, saved, dir, snapshot)?;
+                            self.shared.edits_saved.store(edits, std::sync::atomic::Ordering::Relaxed);
+                            return Ok(true);
+                        }
+                        // more changed since the look ahead than may come back after the hold
+                        None => read = true,
+                    }
+                }
+            }
+            if !read && std::time::Instant::now() >= until {
                 return Ok(false);
             }
-            // a model saves its colour as the artwork's document
-            let known = saved.known(Path::new(dir));
-            (st.with_colour(|st| st.save_snapshot(Path::new(dir), &known))?, st.edits())
-        };
-        write_or_keep_changed(self, saved, Path::new(dir), snapshot)?;
-        self.shared.edits_saved.store(edits, std::sync::atomic::Ordering::Relaxed);
-        Ok(true)
+            std::thread::sleep(SNAPSHOT_LOOK);
+        }
     }
+
+    /// Reads ahead, outside the snapshot's hold (see [`LayersAhead`]), what a save into `dir` would
+    /// read: the layers changed, or not in the folder as they are (`known` its layers' hashes),
+    /// that weren't read already as they are now; as much at a time as may be on its way back
+    /// from the GPU at once, the buffers made first, each lot's copies started in a short hold
+    /// and waited for once it is let go. Painting may go on meanwhile: a layer it changes after
+    /// it was read is read again by the snapshot (or by the next look ahead).
+    pub(crate) fn read_layers_ahead(
+        &self,
+        ahead: &mut LayersAhead,
+        dir: &Path,
+        known: &std::collections::HashMap<LayerId, u64>,
+    ) -> Result<(), MobileError> {
+        // which layer files there are, looked at once outside the holds
+        let there: std::collections::HashSet<LayerId> =
+            known.keys().copied().filter(|&id| layer_path(dir, id).exists()).collect();
+        // what to read, as the canvas is now
+        let (gpu, bytes, ids) = {
+            let st = self.shared.lock();
+            let (Some(canvas), Some(gpu)) = (st.canvas.as_ref(), st.gpu.as_ref()) else { return Ok(()) };
+            let changed = canvas.changed();
+            let ids: Vec<LayerId> = st
+                .doc
+                .pixel_layer_ids()
+                .filter(|&id| changed.contains(&id) || !there.contains(&id))
+                // (one whose file couldn't be read is the snapshot's to see to)
+                .filter(|id| !st.unreadable.contains(id))
+                .filter(|&id| !ahead.has(id, canvas.layer_version(id)))
+                .collect();
+            (gpu.clone(), layer_read_bytes(st.doc.width(), st.doc.height()), ids)
+        };
+        let per_lot = (read_after_lock() / bytes.max(1)).max(1);
+        for lot in ids.chunks(per_lot) {
+            // the buffers the lot is copied into made before its hold
+            gpu.keep_readbacks(bytes as u64, lot.len());
+            let reads = {
+                let st = self.shared.lock();
+                let Some(canvas) = st.canvas.as_ref() else { return Ok(()) };
+                let mut reads = Vec::new();
+                for &id in lot {
+                    let version = canvas.layer_version(id);
+                    if st.doc.layer(id).is_none() || ahead.has(id, version) {
+                        continue;
+                    }
+                    // (one the canvas hasn't made yet, added since its last render, is the snapshot's
+                    // to read, after its render)
+                    let Ok(read) = canvas.start_reading_layer(&gpu, id) else { continue };
+                    reads.push((id, version, read));
+                }
+                reads
+            };
+            for (id, version, read) in reads {
+                let rgba = read.pixels().map_err(|e| file_error("reading a layer", e))?;
+                let hash = pixels_hash(&rgba);
+                let as_there = known.get(&id) == Some(&hash) && there.contains(&id);
+                ahead.layers.insert(id, ReadLayer { version, hash, rgba: (!as_there).then_some(rgba) });
+            }
+            #[cfg(test)]
+            std::thread::sleep(std::time::Duration::from_millis(TESTS_READ_AHEAD_PAUSE.get()));
+        }
+        // a buffer for the snapshot's read of the layer painted on meanwhile, likewise
+        gpu.keep_readbacks(bytes as u64, 1);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// The tests' pause after each lot read ahead on this thread (ms), so painting goes on
+    /// between lots.
+    pub(crate) static TESTS_READ_AHEAD_PAUSE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The bytes a layer of a `width` x `height` canvas takes on its way back from the GPU (its rows
+/// padded as a copy to a buffer has them).
+fn layer_read_bytes(width: u32, height: u32) -> usize {
+    (width as usize * 4).div_ceil(256) * 256 * height as usize
 }
 
 /// Writes a save into `dir` (made if missing): the layers that changed since the last save there,
@@ -545,8 +1013,12 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
         model,
         gpu,
         reference_picture,
+        more_pictures,
         plugin_data,
         layer_data,
+        stores,
+        stores_kept,
+        store_files,
         ..
     } = snapshot;
     // what was still on its way back: those unchanged since the last save there are let go
@@ -558,8 +1030,10 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
             layers.push((id, hash, rgba));
         }
     }
-    let composite =
-        composite.map(procraft_gpu::Readback::pixels).transpose().map_err(|e| file_error("reading the picture", e))?;
+    let composite = composite
+        .map(procraft_gpu::PendingThumbnail::pixels)
+        .transpose()
+        .map_err(|e| file_error("reading the picture", e))?;
     // a device lost meanwhile read back nothing true: the last save is kept as it is
     if gpu.as_ref().is_some_and(procraft_gpu::Gpu::is_lost) {
         return Err(file_error("reading the layers", "the graphics device was lost"));
@@ -569,24 +1043,32 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
         saved.layers.clear();
         saved.sets.clear();
         saved.reference_picture = None;
+        saved.more_pictures.clear();
         saved.layer_data.clear();
     }
     let (w, h) = (file.document.width(), file.document.height());
+    // (what it writes beside isn't taken for a save cut short meanwhile)
+    let _saving = SavingInto::begin(dir);
     fs::create_dir_all(dir.join("layers")).map_err(|e| file_error("making the folder", e))?;
     // Everything new is written beside its place first and only then put in place, the document
     // last: a save cut short while writing (the slow part) leaves the last one as it was. Written
     // in place one by one, a save after a crop cut short left layers of the new size beside a
-    // document of the old, which the next open would drop.
+    // document of the old, which the next open would drop. A first save cut short once its
+    // document is written is put in place when the gallery next looks (see `finish_first_save`).
     let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
     let stage = |result: Result<PathBuf, MobileError>, to: PathBuf, staged: &mut Vec<(PathBuf, PathBuf)>| {
-        result.map(|tmp| staged.push((tmp, to)))
+        let staged = result.map(|tmp| staged.push((tmp, to)));
+        cut_short::step();
+        staged
     };
+    // the layers whose stores are in the folder once this save is in place
+    let mut stored = stores_kept;
     let written = (|| {
         // only those not already there as they are, encoded and written side by side, each
         // layer's PNG made in memory before it is written
         let each = w as usize * h as usize * 4;
         let results = procraft_engine::par::side_by_side_within(&layers, each, |(id, _, rgba)| {
-            write_beside(&layer_path(dir, *id), |p| write_png(p, w, h, rgba, &[]))
+            stage_beside(&layer_path(dir, *id), |p| write_png(p, w, h, rgba, &[]))
         });
         // every one written kept track of, so a failure among them leaves none of them beside
         let mut failed = None;
@@ -602,7 +1084,7 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
         for (id, bytes) in &files {
             let to = layer_path(dir, *id);
             stage(
-                write_beside(&to, |p| fs::write(p, bytes).map_err(|e| file_error("writing a layer", e))),
+                stage_beside(&to, |p| crate::storage::write(p, bytes).map_err(|e| file_error("writing a layer", e))),
                 to,
                 &mut staged,
             )?;
@@ -614,26 +1096,40 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
         let thumb = dir.join("thumbnail.png");
         if let Some((pw, ph, rgba)) = model.and_then(|m| m.picture) {
             let (tw, th, small) = thumbnail(&rgba, pw, ph, THUMBNAIL_SIDE);
-            stage(write_beside(&thumb, |p| write_png(p, tw, th, &small, &[])), thumb, &mut staged)?;
-        } else if let Some((tw, th, mut small)) =
-            composite.map(|rgba| thumbnail(&rgba, w, h, THUMBNAIL_SIDE)).or(unshown)
+            stage(stage_beside(&thumb, |p| write_png(p, tw, th, &small, &[])), thumb, &mut staged)?;
+        } else if let Some((tw, th, small)) =
+            composite.map(|t| (t.width, t.height, straight_alpha(&t.rgba))).or(unshown)
         {
+            // turned as the gallery shows it
+            let (tw, th, mut small) = turned(tw, th, small, file.turns.unwrap_or(0));
             // the gallery shows it in the artwork's colours (a CMYK canvas's: as its press prints them)
             if let Some(table) = proof_table(&file.document) {
                 table.apply_rgba(&mut small, false);
             }
             let icc = file.document.picture_icc();
-            stage(write_beside(&thumb, |p| write_png(p, tw, th, &small, &icc)), thumb, &mut staged)?;
+            stage(stage_beside(&thumb, |p| write_png(p, tw, th, &small, &icc)), thumb, &mut staged)?;
         }
         // the Reference window's picture, unless the folder has it already
         let picture_path = dir.join(crate::reference_window::REFERENCE_PICTURE);
         if let Some(png) = reference_picture.as_deref()
             && (saved.reference_picture != Some(pixels_hash(png)) || !picture_path.exists())
         {
-            let written = write_beside(&picture_path, |p| {
-                fs::write(p, png).map_err(|e| file_error("writing the reference picture", e))
+            let written = stage_beside(&picture_path, |p| {
+                crate::storage::write(p, png).map_err(|e| file_error("writing the reference picture", e))
             });
             stage(written, picture_path, &mut staged)?;
+        }
+        // those of the windows opened besides it likewise
+        for (i, png) in more_pictures.iter().enumerate() {
+            let path = dir.join(crate::reference_window::more_picture(i));
+            let Some(png) = png.as_deref() else { continue };
+            if saved.more_pictures.get(i).copied().flatten() == Some(pixels_hash(png)) && path.exists() {
+                continue;
+            }
+            let written = stage_beside(&path, |p| {
+                crate::storage::write(p, png).map_err(|e| file_error("writing a reference picture", e))
+            });
+            stage(written, path, &mut staged)?;
         }
         // plugins' layers' data, each whole, unless its file there has it already
         for (id, data) in &layer_data {
@@ -641,29 +1137,62 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
             if saved.layer_data.get(id) == Some(&pixels_hash(data)) && path.exists() {
                 continue;
             }
-            let written = write_beside(&path, |p| {
-                fs::write(p, data.as_slice()).map_err(|e| file_error("writing a layer's plugin data", e))
+            let written = stage_beside(&path, |p| {
+                crate::storage::write(p, data.as_slice()).map_err(|e| file_error("writing a layer's plugin data", e))
             });
             stage(written, path, &mut staged)?;
+        }
+        // the layers' stores, each whole with the hash of its layer's pixels as saved now (one whose
+        // layer's isn't known can't be told from a stale one when opened, so it isn't saved)
+        for (id, kind, reads) in stores {
+            let layer_hash =
+                layers.iter().find(|(l, ..)| *l == id).map(|(_, h, _)| *h).or(saved.layers.get(&id).copied());
+            let Some(layer_hash) = layer_hash else { continue };
+            let planes = reads
+                .into_iter()
+                .map(|r| r.pixels().map_err(|e| file_error("reading a layer's store", e)))
+                .collect::<Result<Vec<_>, _>>()?;
+            let bytes = crate::layer_store::encode(kind, (w, h), layer_hash, &planes)?;
+            let path = crate::layer_store::store_path(dir, id);
+            let written = stage_beside(&path, |p| {
+                crate::storage::write(p, &bytes).map_err(|e| file_error("writing a layer's store", e))
+            });
+            stage(written, path, &mut staged)?;
+            stored.push(id);
+        }
+        for (id, bytes) in &store_files {
+            let path = crate::layer_store::store_path(dir, *id);
+            let written = stage_beside(&path, |p| {
+                crate::storage::write(p, bytes).map_err(|e| file_error("writing a layer's store", e))
+            });
+            stage(written, path, &mut staged)?;
+            stored.push(*id);
         }
         // a plugin's artwork's own data, whole, before the document that names its kind
         if let Some(data) = plugin_data.as_deref() {
             let path = dir.join(PLUGIN_DATA);
-            let written =
-                write_beside(&path, |p| fs::write(p, data).map_err(|e| file_error("writing the plugin's artwork", e)));
+            let written = stage_beside(&path, |p| {
+                crate::storage::write(p, data).map_err(|e| file_error("writing the plugin's artwork", e))
+            });
             stage(written, path, &mut staged)?;
         }
         let json = serde_json::to_string(&file).map_err(|e| file_error("writing the artwork", e))?;
         let doc = dir.join("artwork.json");
         stage(
-            write_beside(&doc, |p| fs::write(p, json.as_bytes()).map_err(|e| file_error("writing the artwork", e))),
+            stage_beside(&doc, |p| {
+                crate::storage::write(p, json.as_bytes()).map_err(|e| file_error("writing the artwork", e))
+            }),
             doc,
             &mut staged,
         )
     })();
     // in place, in the order written (the document last), or, short of that, none of it
     let placed = written.and_then(|()| {
-        staged.iter().try_for_each(|(tmp, to)| fs::rename(tmp, to).map_err(|e| file_error("saving", e)))
+        staged.iter().try_for_each(|(tmp, to)| {
+            fs::rename(tmp, to).map_err(|e| file_error("saving", e))?;
+            cut_short::step();
+            Ok(())
+        })
     });
     if let Err(e) = placed {
         for (tmp, _) in &staged {
@@ -682,6 +1211,12 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
     if reference_picture.is_none() {
         let _ = fs::remove_file(dir.join(crate::reference_window::REFERENCE_PICTURE));
     }
+    saved.more_pictures = more_pictures.iter().map(|png| png.as_deref().map(|png| pixels_hash(png))).collect();
+    for i in 0..crate::reference_window::MOST_REFERENCE_WINDOWS {
+        if more_pictures.get(i).is_none_or(Option::is_none) {
+            let _ = fs::remove_file(dir.join(crate::reference_window::more_picture(i)));
+        }
+    }
     for (id, _) in &files {
         // its pixels' hash isn't known: the next save writes it again
         saved.layers.remove(id);
@@ -697,7 +1232,10 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
             let path = layer_data_path(dir, l.id);
             if path.exists() { path } else { old_layer_data_path(dir, l.id) }
         });
-        let keep: Vec<PathBuf> = file.document.layer_ids().map(|id| layer_path(dir, id)).chain(plugins).collect();
+        // (and a layer's store while it has one)
+        let stores = stored.iter().map(|id| crate::layer_store::store_path(dir, *id));
+        let keep: Vec<PathBuf> =
+            file.document.layer_ids().map(|id| layer_path(dir, id)).chain(plugins).chain(stores).collect();
         for entry in entries.flatten() {
             let path = entry.path();
             if !keep.contains(&path) {
@@ -783,6 +1321,10 @@ impl CanvasSession {
     #[uniffi::constructor]
     pub fn open(dir: String) -> Result<Arc<CanvasSession>, MobileError> {
         let dir = PathBuf::from(dir);
+        // noted as being opened before anything is read, until it shows (see `open_marks.rs`): an
+        // opening that ends the app, even as its session is built, is asked about when next picked.
+        // One that fails here is told, and its mark goes
+        let open_mark = crate::open_marks::Mark::new(&dir);
         let text = fs::read_to_string(dir.join("artwork.json")).map_err(|e| file_error("reading the artwork", e))?;
         let file: ArtworkFile = serde_json::from_str(&text).map_err(|e| file_error("reading the artwork", e))?;
         if file.format != FORMAT || file.version > VERSION {
@@ -790,6 +1332,8 @@ impl CanvasSession {
                 reason: format!("not an artwork this version can open ({} {})", file.format, file.version),
             });
         }
+        // the quarter turn it is kept at (before its parts are taken)
+        let turns = file.kept_turns();
         let mut doc = file.document.repaired();
         // plugins' layers' data, as it is (an empty file: none yet). One whose file is gone or can't
         // be read takes no strokes, which would draw it again without what its pixels show, and
@@ -811,44 +1355,55 @@ impl CanvasSession {
                 }
             }
         }
-        // each layer's file as it is, decoded as it goes to the GPU
+        // each layer's file, read and decoded only as it goes to the GPU (an artwork of many
+        // layers isn't all in memory as it opens), and its store's, if it has one
         let mut pngs = Vec::new();
-        let mut unread = Vec::new();
+        let mut stores = Vec::new();
         for layer in doc.layers() {
+            if let Ok(bytes) = fs::read(crate::layer_store::store_path(&dir, layer.id)) {
+                stores.push((layer.id, bytes));
+            }
             let path = layer_path(&dir, layer.id);
             // a layer with no file is empty
-            if !path.exists() {
-                continue;
-            }
-            // (tried twice: the file is there)
-            match fs::read(&path).or_else(|_| fs::read(&path)) {
-                Ok(bytes) => pngs.push((layer.id, Opened::Png(bytes))),
-                Err(e) => {
-                    log::error!("layer {:?}: {e}", layer.id);
-                    unread.push(layer.id);
-                }
+            if path.exists() {
+                pngs.push((layer.id, Opened::File(path)));
             }
         }
         let scene = file.model.as_ref().map(|m| crate::scene3d::open_saved_model(&dir, m)).transpose()?;
         let session = CanvasSession::with_document(doc, file.name, Vec::new());
         // its files are as the last save left them: one unchanged since isn't written again
         let reference_picture = fs::read(dir.join(crate::reference_window::REFERENCE_PICTURE)).ok();
+        let more_references: Vec<crate::reference_window::MoreReference> = file
+            .references
+            .iter()
+            .take(crate::reference_window::MOST_REFERENCE_WINDOWS - 1)
+            .enumerate()
+            .map(|(i, window)| crate::reference_window::MoreReference {
+                window: window.clone(),
+                picture: fs::read(dir.join(crate::reference_window::more_picture(i))).ok().map(Arc::new),
+            })
+            .collect();
         {
             let mut saving = session.shared.saving.lock().unwrap_or_else(|e| e.into_inner());
             saving.opened(&dir);
             saving.reference_picture = reference_picture.as_deref().map(pixels_hash);
+            saving.more_pictures =
+                more_references.iter().map(|m| m.picture.as_deref().map(|png| pixels_hash(png))).collect();
             saving.layer_data.extend(data_hashes);
         }
         {
             let mut st = session.shared.lock();
+            st.open_mark = open_mark;
             st.pending_pixels = pngs;
-            st.layers_unread(unread);
+            st.pending_stores = stores;
             st.layer_data_unread.extend(data_unread);
             st.info = file.info;
-            st.saved_view = file.view;
-            st.scene = scene;
+            st.turns = turns;
+            st.scene = scene.map(Box::new);
             st.reference_window = file.reference.unwrap_or_default();
             st.reference_picture = reference_picture.map(Arc::new);
+            st.more_references = more_references;
+            st.plugin_values = file.plugin_values.into_iter().filter(|(_, v)| v.is_finite()).collect();
             // a plugin's artwork: its kind and data, for the app to open it with its plugin
             st.plugin_opened = file.plugin.map(|kind| crate::plugin_artwork::PluginOpened {
                 kind,
@@ -864,16 +1419,35 @@ impl CanvasSession {
     /// app going into the background) stays open: its layers are saved as they show, and again
     /// once it ends.
     pub fn save(&self, dir: String) -> Result<(), MobileError> {
+        // a time-lapse frame asked for and not taken yet (the frames stopped), and those on their
+        // way to the disk, kept first: the app may make a video of them next
+        self.keep_time_lapse();
         let mut saved = self.shared.saving.lock().unwrap_or_else(|e| e.into_inner());
-        let (snapshot, edits) = {
+        let dir = Path::new(&dir);
+        let known = saved.known(dir);
+        // the layers that changed read ahead first, the canvas held only a moment at a time (as
+        // the autosave reads them); after a few rounds, whatever is still left is read in the
+        // snapshot's hold
+        let mut ahead = LayersAhead::default();
+        let mut round = 0;
+        let (snapshot, edits) = loop {
+            // (a model's layers are its colour's only while the snapshot is taken: read in its hold)
+            let flat = self.shared.lock().scene.is_none();
+            if flat {
+                self.read_layers_ahead(&mut ahead, dir, &known)?;
+            }
             let mut guard = self.shared.lock_finished();
             let st = &mut *guard;
             st.finish_stroke();
+            let ahead = (flat && st.scene.is_none()).then_some(&mut ahead);
+            let bounded = ahead.is_some() && round < SAVE_READS_AHEAD;
             // a model saves its colour as the artwork's document
-            let known = saved.known(Path::new(&dir));
-            (st.with_colour(|st| st.save_snapshot(Path::new(&dir), &known))?, st.edits())
+            if let Some(snapshot) = st.with_colour(|st| st.save_snapshot(dir, &known, ahead, bounded))? {
+                break (snapshot, st.edits());
+            }
+            round += 1;
         };
-        write_or_keep_changed(self, &mut saved, Path::new(&dir), snapshot)?;
+        write_or_keep_changed(self, &mut saved, dir, snapshot)?;
         self.shared.edits_saved.store(edits, std::sync::atomic::Ordering::Relaxed);
         // saves work again: the autosave's next failure is told
         self.shared.save_failure.lock().unwrap_or_else(|e| e.into_inner()).1 = false;
@@ -898,13 +1472,49 @@ impl CanvasSession {
         Some(self.shared.edits_saved.load(std::sync::atomic::Ordering::Relaxed)).filter(|&e| e != NOT_SAVED)
     }
 
-    /// Keeps the artwork saved into `dir` while it is open, from a thread of its own: every few
-    /// seconds, when it has changed, as soon as nothing is under way that saving would cut short
-    /// (only the layers that changed are written). Ends with [`CanvasSession::stop_autosave`],
+    /// Keeps the artwork saved into `dir` while it is open, from a thread of its own: a few
+    /// seconds after it changes, as soon as nothing is under way that saving would cut short
+    /// (only the layers that changed are written). The thread waits for a change: while nothing
+    /// changes, or the app is away ([`CanvasSession::set_shown`]), it does nothing at all. Ends with [`CanvasSession::stop_autosave`],
     /// with another start, when the session is let go, or with the GPU's device: what that held
     /// can't be read, the last save stands, and [`CanvasSession::take_failure`] tells it.
     pub fn start_autosave(self: Arc<Self>, dir: String) {
         self.keep_saved(dir, AUTOSAVE_EVERY, AUTOSAVE_AGAIN);
+    }
+
+    /// Saves the artwork into `dir` to leave it: [`Leaving::Left`] once all of it is saved (what is
+    /// painted while it saves saved too), and the canvas may go. An artwork is never left with work
+    /// that is only in memory: one that can't be saved (the storage full, say) [`Leaving::Stays`]
+    /// open, painting from memory and kept saved again (what wasn't saved goes at the autosave's next
+    /// look, once there is room), with what to ask: stay, or leave without saving, which loses it.
+    /// The apps all leave so; only the system ending the app can lose it.
+    pub fn save_to_leave(self: Arc<Self>, dir: String) -> Leaving {
+        self.stop_autosave();
+        let mut failed = None;
+        for _ in 0..LEAVE_SAVES {
+            match self.save(dir.clone()) {
+                Ok(()) if self.edits_saved() == Some(self.edits()) => {
+                    self.folder_left(Path::new(&dir));
+                    return Leaving::Left;
+                }
+                Ok(()) => failed = None,
+                Err(e) => {
+                    failed = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        // (painted on through every round: what the last saved stands, the rest is the next save's)
+        let Some(reason) = failed else {
+            self.folder_left(Path::new(&dir));
+            return Leaving::Left;
+        };
+        let saved = self.shared.edits_saved.load(std::sync::atomic::Ordering::Relaxed);
+        let ever_saved = Path::new(&dir).join("artwork.json").is_file();
+        let (title, message) = crate::storage::leave_unsaved_said(&reason, ever_saved);
+        Arc::clone(&self).keep_saved_since(dir, AUTOSAVE_EVERY, AUTOSAVE_AGAIN, saved);
+        self.shared.nudge.nudge();
+        Leaving::Stays { title, message }
     }
 
     /// Ends the autosave started last: a save it is making is finished first, and none follows.
@@ -917,14 +1527,19 @@ impl CanvasSession {
     pub fn stop_autosave(&self) {
         let mut saved = self.shared.saving.lock().unwrap_or_else(|e| e.into_inner());
         saved.autosave = saved.autosave.wrapping_add(1);
+        // its thread, waiting for a change, sees it is to end
+        self.shared.nudge.nudge();
     }
 
-    /// Gives an artwork opened only to be exported (never shown) a GPU device of its own, so its
-    /// exports work; false if there is none.
+    /// Gives an artwork opened only to be exported (never shown) a GPU device, so its exports
+    /// work: the app's own where it has made one (the backend chosen for this machine, not
+    /// whichever comes first, as a driver that takes the app down on another may), else one of its
+    /// own; false if there is none.
     pub fn prepare_offscreen(&self) -> bool {
+        let app = crate::device::kept().clone();
         let mut st = self.shared.lock();
         if st.gpu.is_none() {
-            match procraft_gpu::Gpu::headless() {
+            match app.map_or_else(procraft_gpu::Gpu::headless, Ok) {
                 Ok(gpu) => st.gpu = Some(gpu),
                 Err(e) => {
                     log::error!("exporting offscreen: {e}");
@@ -965,9 +1580,11 @@ impl CanvasSession {
     pub fn export_jpeg(&self, path: String) -> Result<(), MobileError> {
         let (w, h, straight, icc) = self.finished_picture()?;
         self.exported(0.7);
-        let bytes = procraft_engine::jpeg::encode_tagged(&onto_white(&straight), w, h, JPEG_QUALITY, &icc);
+        let rgb = onto_white(&straight)?;
+        drop(straight);
+        let bytes = procraft_engine::jpeg::encode_tagged(&rgb, w, h, JPEG_QUALITY, &icc);
         self.exported(0.95);
-        write_atomically(Path::new(&path), |p| fs::write(p, &bytes).map_err(|e| file_error("saving", e)))?;
+        write_atomically(Path::new(&path), |p| crate::storage::write(p, &bytes).map_err(|e| file_error("saving", e)))?;
         self.exported(1.0);
         Ok(())
     }
@@ -985,8 +1602,10 @@ impl CanvasSession {
             st.info.tracked_ms = (imported.tracked_seconds * 1000.0) as u64;
             st.info.author = imported.author;
             st.reference_window = imported.reference;
-            st.reference_picture =
-                imported.reference_picture.map(|(png, turn)| Arc::new(crate::reference_window::upright(png, turn)));
+            // upright, and no bigger than a window keeps a picture
+            st.reference_picture = imported.reference_picture.map(|(png, turn)| {
+                Arc::new(crate::reference_window::kept_picture(crate::reference_window::upright(png, turn)))
+            });
         }
         Ok(session)
     }
@@ -998,6 +1617,21 @@ impl CanvasSession {
         seed: u64,
         time_lapse: Option<PackageTimeLapse>,
     ) -> Result<(), MobileError> {
+        self.export_package_when(path, seed, time_lapse, false).map(|_| ())
+    }
+}
+
+impl CanvasSession {
+    /// [`CanvasSession::export_package`]; with `idle_only`, only while nothing is under way that it
+    /// would end (false then, nothing written), and quietly: the progress of an export someone
+    /// started is left as it is (a package made for a plugin's folder).
+    pub(crate) fn export_package_when(
+        &self,
+        path: String,
+        seed: u64,
+        time_lapse: Option<PackageTimeLapse>,
+        idle_only: bool,
+    ) -> Result<bool, MobileError> {
         let time_lapse = match time_lapse {
             Some(t) => {
                 let mut segments = Vec::with_capacity(t.segments.len());
@@ -1017,10 +1651,16 @@ impl CanvasSession {
             }
             None => None,
         };
-        self.exported(0.0);
-        let (doc, pixels, composite, name, info, reference, reference_picture) = {
+        // (made for a plugin's folder: the progress of an export someone started is left alone)
+        if !idle_only {
+            self.exported(0.0);
+        }
+        let (doc, composite, name, info, reference, reference_picture, turns, edits) = {
             let mut guard = self.shared.lock_finished();
             let st = &mut *guard;
+            if idle_only && !st.idle() {
+                return Ok(false);
+            }
             st.finish_stroke();
             st.settle();
             let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else {
@@ -1031,25 +1671,29 @@ impl CanvasSession {
             let composite = canvas
                 .read_composite_without(gpu, &mut st.doc, &private)
                 .map_err(|e| file_error("reading the picture", e))?;
-            let mut pixels = std::collections::HashMap::new();
-            let count = st.doc.layers().len().max(1);
-            for (i, l) in st.doc.layers().iter().enumerate() {
-                if l.kind != LayerKind::Group {
-                    pixels.insert(l.id, canvas.read_layer(gpu, l.id).map_err(|e| file_error("reading a layer", e))?);
-                }
-                self.exported(0.1 + 0.6 * (i + 1) as f32 / count as f32);
-            }
             let reference = (st.reference_window.clone(), st.reference_picture.clone());
             st.count_tracked_time();
-            (st.doc.clone(), pixels, composite, st.name.clone(), st.info.clone(), reference.0, reference.1)
+            let turns = st.shown_turns();
+            let edits = st.edits();
+            (st.doc.clone(), composite, st.name.clone(), st.info.clone(), reference.0, reference.1, turns, edits)
         };
         let (w, h) = (doc.width(), doc.height());
-        let (tw, th, mut thumb) = thumbnail(&straight_alpha(&composite), w, h, PACKAGE_PREVIEW_SIDE);
+        // the preview turned as the package says the canvas shows
+        let (tw, th, thumb) = {
+            let mut straight = composite.clone();
+            straighten(&mut straight);
+            thumbnail(&straight, w, h, PACKAGE_PREVIEW_SIDE)
+        };
+        let (tw, th, mut thumb) = turned(tw, th, thumb, turns);
         if let Some(table) = proof_table(&doc) {
             table.apply_rgba(&mut thumb, false);
         }
         let preview = png_bytes(tw, th, &thumb, &doc.picture_icc())?;
-        let bytes = procraft_engine::native::write(&procraft_engine::native::Export {
+        // every layer and mask read as it is written, a layer at a time
+        let count = doc.layers().iter().filter(|l| l.kind != LayerKind::Group).count();
+        let mut pixels = ExportLayers::new(self, edits, count, (0.1, 0.9));
+        pixels.tells = !idle_only;
+        let export = procraft_engine::native::Export {
             document: &doc,
             pixels: &pixels,
             composite: &composite,
@@ -1062,52 +1706,89 @@ impl CanvasSession {
             time_lapse: time_lapse.as_ref(),
             reference: Some(&reference),
             reference_picture: reference_picture.as_deref().map(Vec::as_slice),
-        });
-        self.exported(0.95);
-        write_atomically(Path::new(&path), |f| fs::write(f, &bytes).map_err(|e| file_error("saving", e)))?;
-        self.exported(1.0);
-        Ok(())
+            turns: u32::from(turns),
+        };
+        write_file_atomically(Path::new(&path), |out| procraft_engine::native::write_to(&export, out).map(|_| ()))?;
+        if !idle_only {
+            self.exported(1.0);
+        }
+        Ok(true)
     }
+}
 
-    /// The artwork as a layered PSD (groups, masks, clipping, blend modes kept) at `path`.
+#[uniffi::export]
+impl CanvasSession {
+    /// The artwork as a layered PSD (groups, masks, clipping, blend modes kept) at `path`, its
+    /// layers read and written one at a time.
     pub fn export_psd(&self, path: String) -> Result<(), MobileError> {
-        let p = self.pictures(true)?;
-        let layers = psd_layers(&p);
+        let (p, edits) = self.picture()?;
+        let (w, h) = (p.width, p.height);
+        let (layers, from) = psd_layers(&p.doc);
         let (icc, inks) = file_colours(&p.doc);
-        let bytes = formats::psd(p.width, p.height, p.doc.dpi, &icc, &layers, &p.composite, inks.as_ref());
-        self.exported(0.95);
-        write_atomically(Path::new(&path), |f| fs::write(f, &bytes).map_err(|e| file_error("saving", e)))?;
+        let count = from.iter().map(|f| f.reads()).sum();
+        let reader = ExportLayers::new(self, edits, count, (0.1, 0.9));
+        let [r, g, b] = p.doc.background.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
+        let mut read = |i: usize| -> std::io::Result<formats::PsdPixels> {
+            let pixels = match from.get(i) {
+                Some(PsdFrom::Layer(id, mask)) => {
+                    formats::PsdPixels { rgba: reader.straight(*id)?, mask: mask.map(|m| reader.grey(m)).transpose()? }
+                }
+                Some(PsdFrom::Background) => {
+                    formats::PsdPixels { rgba: [r, g, b, 255].repeat(w as usize * h as usize), mask: None }
+                }
+                _ => return Err(std::io::Error::other("no such layer")),
+            };
+            Ok(pixels)
+        };
+        write_file_atomically(Path::new(&path), |out| {
+            formats::write_psd(out, w, h, p.doc.dpi, &icc, &layers, &mut read, &p.composite, inks.as_ref())
+        })?;
         self.exported(1.0);
         Ok(())
     }
 
     /// The flattened picture as a TIFF at `path`.
     pub fn export_tiff(&self, path: String) -> Result<(), MobileError> {
-        let p = self.pictures(false)?;
+        let (p, _) = self.picture()?;
         let bytes = match file_colours(&p.doc) {
             (icc, Some(inks)) => formats::tiff_cmyk(p.width, p.height, p.doc.dpi, &icc, &p.composite, &inks),
             (icc, None) => formats::tiff(p.width, p.height, p.doc.dpi, &icc, &p.composite),
         };
         self.exported(0.95);
-        write_atomically(Path::new(&path), |f| fs::write(f, &bytes).map_err(|e| file_error("saving", e)))?;
+        write_atomically(Path::new(&path), |f| crate::storage::write(f, &bytes).map_err(|e| file_error("saving", e)))?;
         self.exported(1.0);
         Ok(())
     }
 
-    /// The picture as a one-page PDF, or (`layers`) a page for each layer, bottom first, at `path`.
     /// The flattened picture, or each layer (`layers`), as a page of a PDF at `path`: exact at
-    /// `quality` 100, JPEG below it.
+    /// `quality` 100, JPEG below it. Each layer is read and written in turn.
     pub fn export_pdf(&self, path: String, layers: bool, quality: u8) -> Result<(), MobileError> {
-        let p = self.pictures(layers)?;
-        let pages: Vec<&[u8]> = if layers {
-            p.doc.layers().iter().filter_map(|l| p.layers.get(&l.id)).map(Vec::as_slice).collect()
-        } else {
-            vec![p.composite.as_slice()]
-        };
+        let (p, edits) = self.picture()?;
         let (icc, inks) = file_colours(&p.doc);
-        let bytes = formats::pdf(p.width, p.height, p.doc.dpi, &icc, &pages, quality.min(100), inks.as_ref());
-        self.exported(0.95);
-        write_atomically(Path::new(&path), |f| fs::write(f, &bytes).map_err(|e| file_error("saving", e)))?;
+        let (w, h, quality) = (p.width, p.height, quality.min(100));
+        if !layers {
+            let bytes = formats::pdf(w, h, p.doc.dpi, &icc, &[p.composite.as_slice()], quality, inks.as_ref());
+            self.exported(0.95);
+            write_atomically(Path::new(&path), |f| {
+                crate::storage::write(f, &bytes).map_err(|e| file_error("saving", e))
+            })?;
+            self.exported(1.0);
+            return Ok(());
+        }
+        drop(p.composite);
+        // a page for each paint layer, bottom first
+        let pages: Vec<LayerId> = p.doc.layers().iter().filter(|l| l.kind == LayerKind::Paint).map(|l| l.id).collect();
+        let reader = ExportLayers::new(self, edits, pages.len(), (0.1, 0.95));
+        write_file_atomically(Path::new(&path), |out| {
+            let mut pdf = formats::PdfWriter::new(out)?;
+            for id in &pages {
+                let rgba = reader.straight(*id)?;
+                let picture = formats::PdfPicture::new(w, h, &rgba, quality, inks.as_ref());
+                drop(rgba);
+                pdf.page(&picture, p.doc.dpi, &icc)?;
+            }
+            pdf.finish().map(|_| ())
+        })?;
         self.exported(1.0);
         Ok(())
     }
@@ -1135,9 +1816,12 @@ impl CanvasSession {
         st.info.clone()
     }
 
-    /// Time on the artwork counts while `on` (it is shown and the app in front), from now; off,
-    /// what was counted is added to the artwork's. Each save and [`Self::artwork_info`] takes the
-    /// time counted so far. (Android counts it itself, by [`Self::add_tracked_time`].)
+    /// Time on the artwork counts while `on` (it is shown and the app active: not while the
+    /// device is locked, or the app is in the background or under the system's own screens, nor
+    /// for being idle otherwise), from now; on again while on, it counts on from when it was
+    /// turned on. Off, what was counted is added to the artwork's. Each save and
+    /// [`Self::artwork_info`] takes the time counted so far. (Android counts it itself, by
+    /// [`Self::add_tracked_time`].)
     pub fn set_tracking(&self, on: bool) {
         let mut st = self.shared.lock();
         st.count_tracked_time();
@@ -1168,6 +1852,85 @@ impl CanvasSession {
     }
 }
 
+/// Several artworks as one PDF (a gallery's stack, or artworks picked, shared as a PDF): a page
+/// for each, in the order they are added, each its artwork's flattened picture at its own size,
+/// resolution and colours. Written beside its place a page at a time and put there by
+/// [`PdfBook::finish`]; dropped unfinished, nothing is left.
+#[derive(uniffi::Object)]
+pub struct PdfBook {
+    path: PathBuf,
+    quality: u8,
+    /// The file being written and its writer, until finished.
+    writing: parking_lot::Mutex<Option<(PathBuf, formats::PdfWriter<std::io::BufWriter<fs::File>>)>>,
+}
+
+#[uniffi::export]
+impl PdfBook {
+    /// A PDF to be put at `path`, its pictures kept exactly at `quality` 100, as JPEG below it.
+    #[uniffi::constructor]
+    pub fn create(path: String, quality: u8) -> Result<Arc<PdfBook>, MobileError> {
+        let path = PathBuf::from(path);
+        let tmp = beside(&path);
+        let file = fs::File::create(&tmp).map_err(|e| file_error("saving", e))?;
+        let writer = formats::PdfWriter::new(std::io::BufWriter::new(file)).map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            file_error("saving", e)
+        })?;
+        Ok(Arc::new(PdfBook { path, quality: quality.min(100), writing: parking_lot::Mutex::new(Some((tmp, writer))) }))
+    }
+
+    /// The flattened picture of the artwork open in `session` (made ready to draw offscreen) as
+    /// the next page.
+    pub fn add(&self, session: Arc<CanvasSession>) -> Result<(), MobileError> {
+        let (p, _) = session.picture()?;
+        let (icc, inks) = file_colours(&p.doc);
+        let picture = formats::PdfPicture::new(p.width, p.height, &p.composite, self.quality, inks.as_ref());
+        let dpi = p.doc.dpi;
+        drop(p);
+        let mut writing = self.writing.lock();
+        let Some((_, writer)) = writing.as_mut() else {
+            return Err(file_error("saving", "the PDF is finished"));
+        };
+        writer.page(&picture, dpi, &icc).map_err(|e| file_error("saving", e))?;
+        session.exported(1.0);
+        Ok(())
+    }
+
+    /// How many pages it has.
+    pub fn pages(&self) -> u32 {
+        self.writing.lock().as_ref().map_or(0, |(_, w)| w.pages() as u32)
+    }
+
+    /// Ends the PDF and puts it in its place.
+    pub fn finish(&self) -> Result<(), MobileError> {
+        let Some((tmp, writer)) = self.writing.lock().take() else {
+            return Err(file_error("saving", "the PDF is finished"));
+        };
+        let ended = writer.finish().and_then(|mut out| {
+            use std::io::Write;
+            out.flush()?;
+            out.into_inner().map_err(std::io::IntoInnerError::into_error)?.sync_all()
+        });
+        if let Err(e) = ended
+            .map_err(|e| file_error("saving", e))
+            .and_then(|()| fs::rename(&tmp, &self.path).map_err(|e| file_error("saving", e)))
+        {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PdfBook {
+    fn drop(&mut self) {
+        if let Some((tmp, writer)) = self.writing.get_mut().take() {
+            drop(writer);
+            let _ = fs::remove_file(tmp);
+        }
+    }
+}
+
 /// The signature kept in the artwork's folder `dir` (about/signature.json): its strokes, each the
 /// x, y of its points across the signature's box (0..1); none if there is none.
 #[uniffi::export]
@@ -1184,7 +1947,7 @@ pub fn write_signature(dir: String, strokes: Vec<Vec<f32>>) -> Result<(), Mobile
     fs::create_dir_all(&about).map_err(|e| file_error("keeping the signature", e))?;
     let json = serde_json::to_string(&strokes).map_err(|e| file_error("keeping the signature", e))?;
     write_atomically(&about.join("signature.json"), |p| {
-        fs::write(p, &json).map_err(|e| file_error("keeping the signature", e))
+        crate::storage::write(p, &json).map_err(|e| file_error("keeping the signature", e))
     })
 }
 
@@ -1194,7 +1957,9 @@ pub fn write_signature(dir: String, strokes: Vec<Vec<f32>>) -> Result<(), Mobile
 pub fn write_photo(dir: String, bytes: Vec<u8>) -> Result<(), MobileError> {
     let about = Path::new(&dir).join("about");
     fs::create_dir_all(&about).map_err(|e| file_error("keeping the photo", e))?;
-    write_atomically(&about.join("photo.jpg"), |p| fs::write(p, &bytes).map_err(|e| file_error("keeping the photo", e)))
+    write_atomically(&about.join("photo.jpg"), |p| {
+        crate::storage::write(p, &bytes).map_err(|e| file_error("keeping the photo", e))
+    })
 }
 
 /// The table showing a CMYK canvas's colours as its press prints them (in Display P3, as its
@@ -1217,16 +1982,13 @@ fn file_colours(doc: &Document) -> (Vec<u8>, Option<procraft_engine::cms::Lut>) 
     }
 }
 
-/// What an export reads from the canvas, straight alpha: the flattened picture, and (if asked
-/// for) every paint layer's pixels, every mask's grey and the background colour as a layer.
+/// What an export reads from the canvas first: the flattened picture (straight alpha) and the
+/// document. The layers are read as the file is written (see [`ExportLayers`]).
 struct Pictures {
     width: u32,
     height: u32,
     doc: Document,
     composite: Vec<u8>,
-    layers: std::collections::HashMap<LayerId, Vec<u8>>,
-    masks: std::collections::HashMap<LayerId, Vec<u8>>,
-    background: Vec<u8>,
 }
 
 impl CanvasSession {
@@ -1236,20 +1998,20 @@ impl CanvasSession {
         dir: String,
         wanted: impl Fn(&Document, LayerId) -> bool,
     ) -> Result<Vec<String>, MobileError> {
-        let p = self.pictures(true)?;
+        let (p, edits) = self.picture()?;
+        drop(p.composite);
         let icc = p.doc.picture_icc();
         let proof = proof_table(&p.doc);
         let dir = PathBuf::from(dir);
         fs::create_dir_all(&dir).map_err(|e| file_error("making the folder", e))?;
         let mut paths = Vec::new();
         let mut used = std::collections::HashSet::new();
-        let count = p.doc.layers().len().max(1);
-        for (i, l) in p.doc.layers().iter().enumerate() {
-            self.exported(0.7 + 0.3 * i as f32 / count as f32);
-            if !wanted(&p.doc, l.id) {
-                continue;
-            }
-            let Some(rgba) = p.layers.get(&l.id) else { continue };
+        // each read and written in turn
+        let chosen: Vec<&procraft_engine::document::Layer> =
+            p.doc.layers().iter().filter(|l| l.kind == LayerKind::Paint && wanted(&p.doc, l.id)).collect();
+        let reader = ExportLayers::new(self, edits, chosen.len(), (0.1, 1.0));
+        for l in chosen {
+            let rgba = &reader.straight(l.id)?;
             let base: String =
                 l.name.chars().map(|c| if c.is_alphanumeric() || " _-".contains(c) { c } else { '_' }).collect();
             let base = if base.trim().is_empty() { "Layer".to_owned() } else { base.trim().to_owned() };
@@ -1272,7 +2034,9 @@ impl CanvasSession {
         Ok(paths)
     }
 
-    fn pictures(&self, with_layers: bool) -> Result<Pictures, MobileError> {
+    /// The flattened picture an export writes (straight alpha), with the document as it is and
+    /// its edits then (see [`ExportLayers`]).
+    fn picture(&self) -> Result<(Pictures, u64), MobileError> {
         self.exported(0.0);
         let mut guard = self.shared.lock_finished();
         let st = &mut *guard;
@@ -1282,40 +2046,37 @@ impl CanvasSession {
             return Err(file_error("reading the picture", "the canvas is not shown yet"));
         };
         canvas.render_finished(gpu, &mut st.doc);
-        let composite = straight_alpha(&canvas.read_composite(gpu).map_err(|e| file_error("reading the picture", e))?);
-        let mut layers = std::collections::HashMap::new();
-        let mut masks = std::collections::HashMap::new();
+        let mut composite = canvas.read_composite(gpu).map_err(|e| file_error("reading the picture", e))?;
+        straighten(&mut composite);
         self.exported(0.1);
-        if with_layers {
-            let count = st.doc.layers().len().max(1);
-            for (i, l) in st.doc.layers().iter().enumerate() {
-                self.exported(0.1 + 0.6 * i as f32 / count as f32);
-                match l.kind {
-                    LayerKind::Paint => {
-                        let rgba = canvas.read_layer(gpu, l.id).map_err(|e| file_error("reading a layer", e))?;
-                        layers.insert(l.id, straight_alpha(&rgba));
-                    }
-                    LayerKind::Mask => {
-                        let rgba = canvas.read_layer(gpu, l.id).map_err(|e| file_error("reading a mask", e))?;
-                        let grey = rgba.as_chunks::<4>().0.iter().map(|&p| procraft_engine::document::mask_grey(p));
-                        masks.insert(l.id, grey.collect());
-                    }
-                    LayerKind::Group => {}
-                }
-            }
-        }
-        let [r, g, b] = st.doc.background.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
         let (w, h) = (st.doc.width(), st.doc.height());
-        let background = if with_layers { [r, g, b, 255].repeat(w as usize * h as usize) } else { Vec::new() };
-        self.exported(0.7);
-        Ok(Pictures { width: w, height: h, doc: st.doc.clone(), composite, layers, masks, background })
+        Ok((Pictures { width: w, height: h, doc: st.doc.clone(), composite }, st.edits()))
+    }
+}
+
+/// Where a PSD's layer's pixels are read from as it is written: a paint layer (and its mask, if
+/// it has one shown), or the background colour.
+enum PsdFrom {
+    Layer(LayerId, Option<LayerId>),
+    Background,
+    /// A group's start or end: no pixels.
+    Nothing,
+}
+
+impl PsdFrom {
+    /// How many layers the canvas reads back for it.
+    fn reads(&self) -> usize {
+        match self {
+            PsdFrom::Layer(_, mask) => 1 + usize::from(mask.is_some()),
+            _ => 0,
+        }
     }
 }
 
 /// The PSD's layers, top first: groups as a start, their layers and an end; masks with their
-/// layers; the background colour, when shown, at the bottom.
-fn psd_layers(p: &Pictures) -> Vec<PsdLayer<'_>> {
-    let doc = &p.doc;
+/// layers; the background colour, when shown, at the bottom. Their pixels are read as the file is
+/// written, from where the second list says (by place).
+fn psd_layers(doc: &Document) -> (Vec<PsdLayer<'_>>, Vec<PsdFrom>) {
     let end = || PsdLayer {
         name: "",
         kind: PsdKind::GroupEnd,
@@ -1324,7 +2085,7 @@ fn psd_layers(p: &Pictures) -> Vec<PsdLayer<'_>> {
         blend: BlendMode::Normal,
         clipped: false,
     };
-    let mut out = Vec::new();
+    let (mut out, mut from) = (Vec::new(), Vec::new());
     let mut open: Vec<LayerId> = Vec::new();
     for l in doc.layers().iter().rev() {
         if l.kind == LayerKind::Mask {
@@ -1336,19 +2097,18 @@ fn psd_layers(p: &Pictures) -> Vec<PsdLayer<'_>> {
             }
             open.pop();
             out.push(end());
+            from.push(PsdFrom::Nothing);
         }
         let kind = match l.kind {
             LayerKind::Group => {
                 open.push(l.id);
+                from.push(PsdFrom::Nothing);
                 PsdKind::GroupStart { open: !l.collapsed }
             }
             _ => {
-                let Some(rgba) = p.layers.get(&l.id) else { continue };
-                let mask = doc
-                    .mask_of(l.id)
-                    .filter(|m| doc.layer(*m).is_some_and(|m| m.visible))
-                    .and_then(|m| p.masks.get(&m));
-                PsdKind::Pixels { rgba, mask: mask.map(Vec::as_slice) }
+                let mask = doc.mask_of(l.id).filter(|m| doc.layer(*m).is_some_and(|m| m.visible));
+                from.push(PsdFrom::Layer(l.id, mask));
+                PsdKind::Read { masked: mask.is_some() }
             }
         };
         out.push(PsdLayer {
@@ -1362,18 +2122,104 @@ fn psd_layers(p: &Pictures) -> Vec<PsdLayer<'_>> {
     }
     for _ in open {
         out.push(end());
+        from.push(PsdFrom::Nothing);
     }
     if doc.background_visible {
         out.push(PsdLayer {
             name: "Background",
-            kind: PsdKind::Pixels { rgba: &p.background, mask: None },
+            kind: PsdKind::Read { masked: false },
             opacity: 1.0,
             visible: true,
             blend: BlendMode::Normal,
             clipped: false,
         });
+        from.push(PsdFrom::Background);
     }
-    out
+    (out, from)
+}
+
+/// Reads an open artwork's layers for an export as its file is written, a layer at a time, the
+/// session held only while each is read back: an artwork of many layers is never all in memory
+/// at once, and nothing waits on the whole export. A layer read after the artwork changed fails
+/// the export (its file would show the artwork partly as it was and partly as it is).
+struct ExportLayers<'a> {
+    session: &'a CanvasSession,
+    /// The artwork's edits when the export began.
+    edits: u64,
+    /// How many layers it reads, how many it has, and the share of the export's progress their
+    /// reading takes (from, to).
+    count: usize,
+    done: std::cell::Cell<usize>,
+    progress: (f32, f32),
+    /// Whether it tells the export's progress (not for a package made for a plugin's folder).
+    tells: bool,
+}
+
+impl<'a> ExportLayers<'a> {
+    fn new(session: &'a CanvasSession, edits: u64, count: usize, progress: (f32, f32)) -> ExportLayers<'a> {
+        ExportLayers { session, edits, count, done: std::cell::Cell::new(0), progress, tells: true }
+    }
+
+    /// Layer `id`'s pixels as the canvas has them (premultiplied RGBA8, the canvas's size).
+    fn premultiplied(&self, id: LayerId) -> Result<Vec<u8>, MobileError> {
+        let pixels = {
+            let mut guard = self.session.shared.lock();
+            let st = &mut *guard;
+            if st.edits() != self.edits {
+                return Err(file_error("reading a layer", "the artwork changed while it was exported"));
+            }
+            let (Some(canvas), Some(gpu)) = (st.canvas.as_ref(), st.gpu.as_ref()) else {
+                return Err(file_error("reading a layer", "the canvas is not shown yet"));
+            };
+            canvas.read_layer(gpu, id).map_err(|e| file_error("reading a layer", e))?
+        };
+        let done = self.done.get() + 1;
+        self.done.set(done);
+        let (from, to) = self.progress;
+        if self.tells {
+            self.session.exported(from + (to - from) * done.min(self.count) as f32 / self.count.max(1) as f32);
+        }
+        Ok(pixels)
+    }
+
+    /// Layer `id`'s pixels with straight alpha.
+    fn straight(&self, id: LayerId) -> Result<Vec<u8>, MobileError> {
+        let mut pixels = self.premultiplied(id)?;
+        straighten(&mut pixels);
+        Ok(pixels)
+    }
+
+    /// Mask `id`'s grey, a byte a pixel.
+    fn grey(&self, id: LayerId) -> Result<Vec<u8>, MobileError> {
+        let rgba = self.premultiplied(id)?;
+        Ok(rgba.as_chunks::<4>().0.iter().map(|&p| procraft_engine::document::mask_grey(p)).collect())
+    }
+}
+
+impl procraft_engine::native::LayerPixels for ExportLayers<'_> {
+    fn pixels(&self, id: LayerId) -> std::io::Result<Option<std::borrow::Cow<'_, [u8]>>> {
+        Ok(Some(std::borrow::Cow::Owned(self.premultiplied(id)?)))
+    }
+}
+
+impl From<MobileError> for std::io::Error {
+    fn from(e: MobileError) -> std::io::Error {
+        std::io::Error::other(e.to_string())
+    }
+}
+
+/// Writes `path` with `write`, given the file (buffered) to write into, as [`write_atomically`]
+/// does: a file that couldn't be written whole is never left there.
+fn write_file_atomically(
+    path: &Path,
+    write: impl FnOnce(&mut std::io::BufWriter<crate::storage::File>) -> std::io::Result<()>,
+) -> Result<(), MobileError> {
+    write_atomically(path, |tmp| {
+        let file = crate::storage::create(tmp).map_err(|e| file_error("saving", e))?;
+        let mut out = std::io::BufWriter::new(file);
+        write(&mut out).map_err(|e| file_error("saving", e))?;
+        out.into_inner().map(drop).map_err(|e| file_error("saving", e.into_error()))
+    })
 }
 
 fn layer_path(dir: &Path, id: LayerId) -> PathBuf {
@@ -1394,8 +2240,8 @@ fn old_layer_data_path(dir: &Path, id: LayerId) -> PathBuf {
 /// What the apps say when saving an artwork failed for `reason` (a save's error).
 #[uniffi::export]
 pub fn save_failure_said(reason: String) -> String {
-    if reason.to_lowercase().contains("space") {
-        "There's no room left to save this artwork.".to_owned()
+    if crate::storage::says_full(&reason) {
+        crate::storage::NO_ROOM.to_owned()
     } else {
         "This artwork couldn't be saved.".to_owned()
     }
@@ -1416,10 +2262,7 @@ pub(crate) fn write_beside(
     path: &Path,
     write: impl FnOnce(&Path) -> Result<(), MobileError>,
 ) -> Result<PathBuf, MobileError> {
-    // a name of its own, so that no other write of the same file can touch it
-    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = path.with_extension(format!("{}.tmp", n));
+    let tmp = beside(path);
     if let Err(e) = write(&tmp) {
         let _ = fs::remove_file(&tmp);
         return Err(e);
@@ -1427,15 +2270,192 @@ pub(crate) fn write_beside(
     Ok(tmp)
 }
 
+/// The number of the next write beside a file: each its own, one after another in this run.
+fn next_write() -> u64 {
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A file beside `path` to write what goes there into: a name of its own, so that no other write
+/// of the same file can touch it.
+fn beside(path: &Path) -> PathBuf {
+    path.with_extension(format!("{}.tmp", next_write()))
+}
+
+/// What a save of an artwork writes into `path` written beside it first (removed again if the write
+/// fails), as [`write_beside`] does, under a name that keeps the whole name of the file it goes to
+/// (`<name>.<n>.tmp`, `n` larger for each written later): a save cut short once its document was
+/// written can then be put in place (see [`finish_first_save`]).
+fn stage_beside(path: &Path, write: impl FnOnce(&Path) -> Result<(), MobileError>) -> Result<PathBuf, MobileError> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = path.with_file_name(format!("{name}.{}.tmp", next_write()));
+    if let Err(e) = write(&tmp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(tmp)
+}
+
+/// Of a file a save wrote beside its place (`<name>.<n>.tmp`), the name it goes to (one with an
+/// extension: earlier versions' names dropped it) and its number.
+fn staged_for(file: &str) -> Option<(&str, u64)> {
+    let (to, n) = file.strip_suffix(".tmp")?.rsplit_once('.')?;
+    let n = n.parse().ok().filter(|_| n.bytes().all(|b| b.is_ascii_digit()))?;
+    (to.contains('.') && !to.starts_with('.')).then_some((to, n))
+}
+
+/// The folders saves are being written into in this run, each as many times as saves into it.
+static SAVING: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// A save being written into a folder, while this is held.
+struct SavingInto(PathBuf);
+
+impl SavingInto {
+    fn begin(dir: &Path) -> SavingInto {
+        SAVING.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(dir.to_path_buf());
+        SavingInto(dir.to_path_buf())
+    }
+}
+
+impl Drop for SavingInto {
+    fn drop(&mut self) {
+        let mut saving = SAVING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(at) = saving.iter().position(|d| *d == self.0) {
+            saving.swap_remove(at);
+        }
+    }
+}
+
+/// Whether a save is being written into `dir` in this run (what it has written beside isn't left
+/// from a save cut short).
+fn being_saved(dir: &Path) -> bool {
+    SAVING.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|d| d == dir)
+}
+
+/// Whether the file at `path` holds an artwork's document whole.
+fn whole_document(path: &Path) -> bool {
+    fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .is_some_and(|j| j.get("document").is_some())
+}
+
+/// Finishes the first save of an artwork into `dir` that the app being ended cut short once all
+/// of it was written beside its place, before the document was put there: what it wrote put in
+/// place as that save would have, the document last, so the artwork is in the gallery whole. Only
+/// a folder with no document yet and no save being written into it now; the document written
+/// beside must be whole (written last, it means everything before it was). An earlier version's
+/// save, whose names don't tell where each file goes, is finished only when its document is all
+/// it left. True if it was finished.
+pub(crate) fn finish_first_save(dir: &Path) -> bool {
+    let doc = dir.join("artwork.json");
+    if doc.exists() || being_saved(dir) {
+        return false;
+    }
+    let left_in = |at: &Path| -> Vec<(PathBuf, String)> {
+        fs::read_dir(at).map_or_else(
+            |_| Vec::new(),
+            |entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+                    .map(|e| (e.path(), e.file_name().to_string_lossy().into_owned()))
+                    .filter(|(_, name)| name.ends_with(".tmp"))
+                    .collect()
+            },
+        )
+    };
+    let mut left = left_in(dir);
+    left.extend(left_in(&dir.join("layers")));
+    let staged: Vec<(&PathBuf, PathBuf, u64)> = left
+        .iter()
+        .filter_map(|(tmp, name)| {
+            let (to, n) = staged_for(name)?;
+            Some((tmp, tmp.with_file_name(to), n))
+        })
+        .collect();
+    let newest_doc =
+        staged.iter().filter(|(tmp, to, _)| *to == doc && whole_document(tmp)).max_by_key(|(_, _, n)| *n).cloned();
+    let Some((doc_tmp, _, last)) = newest_doc else {
+        // an earlier version's: its document alone left, whole
+        return match left.as_slice() {
+            [(tmp, name)] if name.starts_with("artwork.") && staged_for(name).is_none() && whole_document(tmp) => {
+                fs::rename(tmp, &doc).is_ok()
+            }
+            _ => false,
+        };
+    };
+    // the rest of that save (written before its document), the latest for each place
+    let mut rest: Vec<(&PathBuf, &PathBuf, u64)> = Vec::new();
+    for (tmp, to, n) in &staged {
+        if *to == doc || *n > last {
+            continue;
+        }
+        match rest.iter_mut().find(|(_, t, _)| *t == to) {
+            Some(kept) if kept.2 < *n => *kept = (tmp, to, *n),
+            Some(_) => {}
+            None => rest.push((tmp, to, *n)),
+        }
+    }
+    rest.iter().all(|(tmp, to, _)| fs::rename(tmp, to).is_ok()) && fs::rename(doc_tmp, &doc).is_ok()
+}
+
+/// Tests end a save (or a copy in the gallery) part way, as the app being ended would: after so
+/// many of its steps (a file written beside its place, one put in place, an artwork copied),
+/// nothing after it done and nothing tidied away.
+#[cfg(test)]
+pub(crate) mod cut_short {
+    use std::cell::Cell;
+
+    thread_local! {
+        static AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// What a save ended part way unwinds with.
+    pub(crate) struct Ended;
+
+    /// The next save on this thread ends after `steps` more of its steps (none: it isn't ended).
+    pub(crate) fn after(steps: Option<usize>) {
+        AFTER.with(|a| a.set(steps));
+    }
+
+    /// A step of a save: the one it is to end at ends it (unwinding, with no message).
+    pub(crate) fn step() {
+        AFTER.with(|a| match a.get() {
+            Some(0) => {
+                a.set(None);
+                std::panic::resume_unwind(Box::new(Ended));
+            }
+            Some(n) => a.set(Some(n - 1)),
+            None => {}
+        });
+    }
+}
+
+#[cfg(not(test))]
+pub(crate) mod cut_short {
+    pub(crate) fn step() {}
+}
+
 /// A PNG of RGBA8 pixels, carrying the colour profile `icc` (none if empty).
 pub(crate) fn write_png(path: &Path, width: u32, height: u32, rgba: &[u8], icc: &[u8]) -> Result<(), MobileError> {
     let bytes = png_bytes(width, height, rgba, icc)?;
-    fs::write(path, bytes).map_err(|e| file_error("saving", e))
+    crate::storage::write(path, bytes).map_err(|e| file_error("saving", e))
 }
 
 /// A PNG of premultiplied RGBA8 pixels (as the GPU gives them), none on failure but empty.
 pub(crate) fn rgba_png(width: u32, height: u32, premultiplied: &[u8]) -> Vec<u8> {
     png_bytes(width, height, &straight_alpha(premultiplied), &[]).unwrap_or_default()
+}
+
+/// A PNG of RGBA8 pixels as they are (a layer's store's plane).
+pub(crate) fn png_of(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, MobileError> {
+    png_bytes(width, height, rgba, &[])
+}
+
+/// The RGBA8 pixels of the PNG `bytes`, which must be `width` × `height`.
+pub(crate) fn png_pixels(bytes: &[u8], width: u32, height: u32) -> Result<Vec<u8>, MobileError> {
+    decode_png(std::io::Cursor::new(bytes), width, height)
 }
 
 /// A PNG of straight RGBA8 pixels, carrying `icc` if it isn't empty.
@@ -1457,11 +2477,13 @@ fn png_bytes(width: u32, height: u32, rgba: &[u8], icc: &[u8]) -> Result<Vec<u8>
     Ok(out)
 }
 
-/// A layer's pixels waiting for the GPU: as they are, or (an opened artwork's) still the PNG they
-/// were read from, decoded only as each goes up, so a large artwork isn't all in memory at once.
+/// A layer's pixels waiting for the GPU: as they are, or (an opened artwork's) still its PNG file,
+/// read and decoded only as each goes up, so a large artwork isn't all in memory at once.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Opened {
     Pixels(Vec<u8>),
+    File(PathBuf),
+    /// Its PNG file's bytes, read before its folder went (see [`CanvasSession::hold_opened_files`]).
     Png(Vec<u8>),
 }
 
@@ -1472,9 +2494,108 @@ impl Opened {
     pub(crate) fn pixels(self, width: u32, height: u32) -> Result<Vec<u8>, MobileError> {
         match self {
             Opened::Pixels(rgba) => Ok(rgba),
+            Opened::File(path) => {
+                // (tried twice: the file was there)
+                let file = fs::File::open(&path)
+                    .or_else(|_| fs::File::open(&path))
+                    .map_err(|e| file_error("opening a layer", e))?;
+                decode_png_into(BufReader::new(file), width, height, true)
+            }
             Opened::Png(bytes) => decode_png_into(std::io::Cursor::new(bytes), width, height, true),
         }
     }
+}
+
+impl CanvasSession {
+    /// Reads the layers' files the artwork was opened from into memory, as they are (packed), so
+    /// that their folder can go before the canvas is made: an artwork opened from a folder of the
+    /// moment (a file brought in and opened at once). A file that can't be read stays where it is
+    /// (it is told, and shows empty, when the canvas is made).
+    pub fn hold_opened_files(&self) {
+        let mut st = self.shared.lock();
+        for (_, layer) in &mut st.pending_pixels {
+            if let Opened::File(path) = layer
+                && let Ok(bytes) = fs::read(&*path)
+            {
+                *layer = Opened::Png(bytes);
+            }
+        }
+    }
+}
+
+/// A layer's PNG `bytes` decoded as [`Opened::pixels`] decodes its file.
+#[cfg(test)]
+pub(crate) fn layer_png(bytes: &[u8], width: u32, height: u32) -> Result<Vec<u8>, MobileError> {
+    decode_png_into(std::io::Cursor::new(bytes), width, height, true)
+}
+
+/// Layers decoded on a few threads, `read(i)` making layer `i`'s, and handed to `put` in order on
+/// this thread, `at_once` of them held at most (being read, or read and waiting for one before
+/// them to be put): an artwork of many layers is never all in memory at once. `put` returning
+/// false stops the reading (what is being read is let go).
+pub(crate) fn read_in_order<T: Send>(
+    count: usize,
+    at_once: usize,
+    read: impl Fn(usize) -> T + Sync,
+    mut put: impl FnMut(usize, T) -> bool,
+) {
+    let at_once = at_once.max(1);
+    let workers =
+        std::thread::available_parallelism().map_or(2, |n| n.get()).saturating_sub(1).clamp(1, 6).min(at_once);
+    // how many more may be held, and whether the reading stops
+    let room = (parking_lot::Mutex::new((at_once, false)), parking_lot::Condvar::new());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let (send, receive) = std::sync::mpsc::channel();
+        for _ in 0..workers {
+            let (send, room, next, read) = (send.clone(), &room, &next, &read);
+            scope.spawn(move || {
+                loop {
+                    // room for a layer first, then the next layer: those held are always the
+                    // first not yet put, so the one put next never waits for room
+                    {
+                        let mut r = room.0.lock();
+                        while r.0 == 0 && !r.1 {
+                            room.1.wait(&mut r);
+                        }
+                        if r.1 {
+                            break;
+                        }
+                        r.0 -= 1;
+                    }
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= count || send.send((i, read(i))).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(send);
+        /// Stops the readers once the putting ends, however it ends.
+        struct Stop<'a>(&'a (parking_lot::Mutex<(usize, bool)>, parking_lot::Condvar));
+        impl Drop for Stop<'_> {
+            fn drop(&mut self) {
+                self.0.0.lock().1 = true;
+                self.0.1.notify_all();
+            }
+        }
+        let _stop = Stop(&room);
+        let mut waiting = std::collections::BTreeMap::new();
+        let mut at = 0;
+        for (i, item) in receive {
+            waiting.insert(i, item);
+            while let Some(item) = waiting.remove(&at) {
+                let go_on = put(at, item);
+                at += 1;
+                // let go of: another may be read
+                room.0.lock().0 += 1;
+                room.1.notify_one();
+                if !go_on {
+                    return;
+                }
+            }
+        }
+    });
 }
 
 /// Layers' pixels as they are, waiting for the GPU.
@@ -1606,7 +2727,8 @@ impl CanvasSession {
             (w, h, rgba, (icc, proof))
         };
         let (icc, proof) = icc;
-        let mut straight = straight_alpha(&rgba);
+        let mut straight = rgba;
+        straighten(&mut straight);
         if let Some(table) = proof {
             table.apply_rgba(&mut straight, false);
         }
@@ -1630,16 +2752,30 @@ pub fn export_file_name(name: String, package: bool) -> String {
 /// How finely JPEGs are written (1..100): fine enough to keep a painting's edges and grain.
 pub(crate) const JPEG_QUALITY: u8 = 92;
 
-/// Straight RGBA8 pixels laid onto white, as RGB8 (for a JPEG, which has nothing see-through).
-pub(crate) fn onto_white(rgba: &[u8]) -> Vec<u8> {
+/// Straight RGBA8 pixels laid onto white, as RGB8 (for a JPEG, which has nothing see-through); an
+/// error if there is no memory for them (a big canvas's, on a computer short of it), not a crash.
+pub(crate) fn onto_white(rgba: &[u8]) -> Result<Vec<u8>, MobileError> {
     let (pixels, _) = rgba.as_chunks::<4>();
-    let mut out = Vec::with_capacity(pixels.len() * 3);
+    let mut out = Vec::new();
+    out.try_reserve_exact(pixels.len() * 3).map_err(|e| file_error("making the picture", e))?;
     for &[r, g, b, a] in pixels {
         let a = u16::from(a);
         let over = |c: u8| ((u16::from(c) * a + 255 * (255 - a) + 127) / 255) as u8;
         out.extend_from_slice(&[over(r), over(g), over(b)]);
     }
-    out
+    Ok(out)
+}
+
+/// [`straight_alpha`] in place, in pieces made side by side.
+pub(crate) fn straighten(rgba: &mut [u8]) {
+    procraft_engine::par::each_part(rgba, 1 << 20, |piece| {
+        for px in piece.as_chunks_mut::<4>().0 {
+            let [r, g, b, a] = *px;
+            let alpha = u32::from(a);
+            let un = |c: u8| (u32::from(c) * 255 + alpha / 2).checked_div(alpha).map_or(0, |v| v.min(255) as u8);
+            *px = [un(r), un(g), un(b), a];
+        }
+    });
 }
 
 pub(crate) fn straight_alpha(rgba: &[u8]) -> Vec<u8> {
@@ -1726,6 +2862,8 @@ pub fn import_pages(
             assisted: false,
             control: None,
             plugin: None,
+            filter: None,
+            marks: Default::default(),
         });
     }
     let mut doc = Document::from_layers(w, h, layers, LayerId(1));
@@ -1737,6 +2875,8 @@ pub fn import_pages(
         if name.trim().is_empty() { "Untitled Artwork".to_owned() } else { name.trim().chars().take(256).collect() };
     // the first page is the gallery's thumbnail until the artwork is opened
     let first = pixels.first().map(|(_, p)| thumbnail(p, w, h, THUMBNAIL_SIDE));
+    // the folder isn't an artwork until it is whole (taken away if the app stops meanwhile)
+    let importing = crate::gallery::Importing::begin(Path::new(&dir));
     let session = CanvasSession::with_document(doc, name, pixels);
     if let Err(e) = session.save(dir.clone()) {
         log::error!("saving imported pages: {e}");
@@ -1747,6 +2887,7 @@ pub fn import_pages(
     {
         log::error!("imported pages' thumbnail: {e}");
     }
+    importing.done();
     PagesOutcome::Imported
 }
 
@@ -1754,10 +2895,12 @@ pub fn import_pages(
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum PsdOutcome {
     Imported,
-    /// More layers than a canvas its size holds (`most`).
+    /// More layers than a canvas its size holds (`most`): none of it comes in.
     TooManyLayers {
         most: u32,
     },
+    /// A canvas larger than this device holds (its sides, or a layer's memory).
+    TooLarge,
     /// A kind of PSD not read here (bitmap, indexed, Lab, 32 bits a channel).
     Unsupported,
     /// Not a PSD, or damaged.
@@ -1781,7 +2924,7 @@ pub fn package_time_lapse(path: String, dir: String) -> Result<Option<PackageTim
     let mut segments = Vec::with_capacity(t.segments.len());
     for (i, data) in t.segments.iter().enumerate() {
         let file = dir.join(format!("segment-{}.mp4", i + 1));
-        fs::write(&file, data).map_err(|e| file_error("saving the time-lapse", e))?;
+        crate::storage::write(&file, data).map_err(|e| file_error("saving the time-lapse", e))?;
         segments.push(file.to_string_lossy().into_owned());
     }
     Ok(Some(PackageTimeLapse {
@@ -1797,50 +2940,125 @@ pub fn package_time_lapse(path: String, dir: String) -> Result<Option<PackageTim
     }))
 }
 
+/// Keeps the preview the layered package at `path` brings (its `QuickLook/Thumbnail.png`) as the
+/// gallery's thumbnail of the artwork made of it in the folder `dir`, until that is opened and
+/// saved; false if it brings none (or it can't be kept).
+#[uniffi::export]
+pub fn keep_package_thumbnail(path: String, dir: String) -> bool {
+    let Ok(bytes) = fs::read(&path) else { return false };
+    let Some(png) = procraft_engine::zip::ZipReader::new(&bytes).and_then(|zip| zip.read(PACKAGE_PREVIEW)) else {
+        return false;
+    };
+    let kept = write_atomically(&Path::new(&dir).join("thumbnail.png"), |p| {
+        crate::storage::write(p, &png).map_err(|e| file_error("keeping the package's preview", e))
+    });
+    if let Err(e) = &kept {
+        log::error!("{e}");
+    }
+    kept.is_ok()
+}
+
+/// Where a layered package keeps its preview.
+const PACKAGE_PREVIEW: &str = "QuickLook/Thumbnail.png";
+
 /// Makes the layered PSD (or PSB) at `path` an artwork named `name` in the folder `dir`: its
 /// layers, groups and masks, and its flattened picture as the gallery's thumbnail until opened.
+/// The file is only read, a part at a time where it is needed: each layer is read and written as
+/// a file of its own a few at a time, so a file of many layers is never all in memory, and the
+/// document goes last, so an import cut short (the app stopped) leaves no artwork in the gallery.
 #[uniffi::export]
 pub fn import_psd(path: String, dir: String, name: String) -> PsdOutcome {
-    use procraft_engine::psd::{self, PsdError};
-    let Ok(bytes) = fs::read(&path) else { return PsdOutcome::Unreadable };
-    let imported = match psd::read(&bytes) {
-        Ok(i) => i,
+    use procraft_engine::psd::{self, FileSource, PsdError};
+    let file = match FileSource::open(Path::new(&path)) {
+        Ok(f) => f,
+        Err(e) => {
+            log::error!("opening a PSD: {e}");
+            return PsdOutcome::Unreadable;
+        }
+    };
+    let art = match psd::open(&file) {
+        Ok(a) => a,
         Err(PsdError::TooManyLayers(most)) => {
             return PsdOutcome::TooManyLayers { most: u32::try_from(most).unwrap_or(u32::MAX) };
         }
+        Err(PsdError::TooLarge) => return PsdOutcome::TooLarge,
         Err(PsdError::Unsupported(_)) => return PsdOutcome::Unsupported,
         Err(e) => {
             log::error!("reading a PSD: {e:?}");
             return PsdOutcome::Unreadable;
         }
     };
-    let name = if name.trim().is_empty() { imported.name } else { name };
-    let session = CanvasSession::with_document(imported.document, name, imported.pixels);
-    if let Err(e) = session.save(dir.clone()) {
-        log::error!("saving an imported PSD: {e}");
-        return PsdOutcome::Unreadable;
+    if art.salvaged {
+        log::warn!("a PSD's layers couldn't be read: its flattened picture came in as its one layer");
     }
-    if let Some((w, h, flat)) = psd::flattened(&bytes) {
-        // on the white of a new canvas
-        let opaque: Vec<u8> = flat
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .flat_map(|&[r, g, b, a]| {
-                let over = |c: u8| ((u16::from(c) * u16::from(a) + 255 * (255 - u16::from(a)) + 127) / 255) as u8;
-                [over(r), over(g), over(b), 255]
-            })
-            .collect();
-        let (tw, th, thumb) = thumbnail(&opaque, w, h, THUMBNAIL_SIDE);
-        if let Err(e) = write_atomically(&Path::new(&dir).join("thumbnail.png"), |p| write_png(p, tw, th, &thumb, &[]))
-        {
-            log::error!("an imported PSD's thumbnail: {e}");
+    log::info!(
+        "importing a PSD: {} x {}, {} layers",
+        art.document.width(),
+        art.document.height(),
+        art.document.layers().len()
+    );
+    // the folder isn't an artwork until it is whole (taken away if the app stops meanwhile)
+    let importing = crate::gallery::Importing::begin(Path::new(&dir));
+    match write_psd_artwork(&art, Path::new(&dir), name) {
+        Ok(()) => {
+            importing.done();
+            PsdOutcome::Imported
+        }
+        Err(e) => {
+            log::error!("saving an imported PSD: {e}");
+            PsdOutcome::Unreadable
         }
     }
-    PsdOutcome::Imported
+}
+
+/// The PSD's artwork written into the folder `dir`, named `name`: each layer read and written whole
+/// as it is read (a few side by side, as many as the memory work side by side may hold takes: each
+/// holds its pixels, what they are read from, and its file), none for a clear one; the thumbnail;
+/// the document last.
+fn write_psd_artwork<S: procraft_engine::psd::Source + ?Sized>(
+    art: &procraft_engine::psd::PsdArtwork<'_, S>,
+    dir: &Path,
+    name: String,
+) -> Result<(), MobileError> {
+    let (w, h) = (art.document.width(), art.document.height());
+    fs::create_dir_all(dir.join("layers")).map_err(|e| file_error("making the folder", e))?;
+    let ids = art.layers_with_pixels();
+    let each = w as usize * h as usize * 4 * 3;
+    let written = procraft_engine::par::side_by_side_within(&ids, each, |&id| -> Result<bool, MobileError> {
+        let Some(rgba) = art.pixels(id) else { return Ok(false) };
+        write_atomically(&layer_path(dir, id), |p| write_png(p, w, h, &rgba, &[]))?;
+        Ok(true)
+    });
+    let mut files = Vec::with_capacity(ids.len());
+    for (id, done) in ids.iter().zip(written) {
+        match done.unwrap_or_else(|| Err(file_error("writing a layer", "it stopped"))) {
+            Ok(true) => files.push((*id, Opened::File(layer_path(dir, *id)))),
+            Ok(false) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    // the gallery's thumbnail until it is opened: the flattened picture on the white of a new
+    // canvas, made small as it is read
+    if let Some((tw, th, thumb)) = art.thumbnail(THUMBNAIL_SIDE)
+        && let Err(e) = write_atomically(&dir.join("thumbnail.png"), |p| write_png(p, tw, th, &thumb, &[]))
+    {
+        log::error!("an imported PSD's thumbnail: {e}");
+    }
+    // the document last, its layers the files just written
+    let name = if name.trim().is_empty() { "Untitled Artwork".to_owned() } else { name };
+    let session = CanvasSession::with_document(art.document.clone(), name, Vec::new());
+    session.shared.lock().pending_pixels = files;
+    session.save(dir.to_string_lossy().into_owned())
 }
 
 /// The picture scaled down (box filter) to fit `side`, straight alpha, for viewing elsewhere.
+/// A picture (`width` x `height`, RGBA) turned `turns` quarter turns clockwise.
+fn turned(width: u32, height: u32, rgba: Vec<u8>, turns: u8) -> (u32, u32, Vec<u8>) {
+    let turns = u32::from(turns % 4);
+    let rgba = procraft_engine::native::orient(rgba, width as usize, height as usize, 4, turns, false, false);
+    if turns % 2 == 1 { (height, width, rgba) } else { (width, height, rgba) }
+}
+
 pub(crate) fn thumbnail(rgba: &[u8], width: u32, height: u32, side: u32) -> (u32, u32, Vec<u8>) {
     let scale = (side as f32 / width.max(height).max(1) as f32).min(1.0);
     let (tw, th) = (((width as f32 * scale).round() as u32).max(1), ((height as f32 * scale).round() as u32).max(1));
@@ -1897,6 +3115,53 @@ mod signature_tests {
     use super::*;
 
     #[test]
+    fn a_package_s_preview_is_kept_as_the_thumbnail_until_opened() {
+        let root = std::env::temp_dir().join(format!("procraft-package-preview-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let preview: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        let with = root.join("with.procreate");
+        let mut zip = procraft_engine::zip::ZipWriter::new();
+        zip.add("Document.archive", b"plist");
+        zip.add(PACKAGE_PREVIEW, &preview);
+        fs::write(&with, zip.finish()).unwrap();
+        let without = root.join("without.procreate");
+        let mut zip = procraft_engine::zip::ZipWriter::new();
+        zip.add("Document.archive", b"plist");
+        fs::write(&without, zip.finish()).unwrap();
+        let dir = root.join("artwork");
+        fs::create_dir_all(&dir).unwrap();
+        let path = |p: &Path| p.to_string_lossy().into_owned();
+        // a package with a preview: its 1000 bytes, as they are
+        assert!(keep_package_thumbnail(path(&with), path(&dir)));
+        assert_eq!(fs::read(dir.join("thumbnail.png")).unwrap(), preview);
+        // one without, a file that isn't a zip, or none at all: nothing is kept, the thumbnail
+        // there before stays
+        fs::write(dir.join("thumbnail.png"), [7u8; 3]).unwrap();
+        assert!(!keep_package_thumbnail(path(&without), path(&dir)));
+        fs::write(root.join("not.zip"), b"not a zip").unwrap();
+        assert!(!keep_package_thumbnail(path(&root.join("not.zip")), path(&dir)));
+        assert!(!keep_package_thumbnail(path(&root.join("gone.procreate")), path(&dir)));
+        assert_eq!(fs::read(dir.join("thumbnail.png")).unwrap(), [7u8; 3]);
+        // no file left beside it by the writes
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_autosave_waits_longer_after_a_slow_save() {
+        use std::time::Duration;
+        let every = Duration::from_secs(3);
+        // a quick save: its usual time
+        assert_eq!(autosave_wait(every, Duration::from_millis(200)), every);
+        assert_eq!(autosave_wait(every, Duration::ZERO), every);
+        // a slow one: four times as long as it took, at most half a minute
+        assert_eq!(autosave_wait(every, Duration::from_millis(1500)), Duration::from_secs(6));
+        assert_eq!(autosave_wait(every, Duration::from_secs(20)), AUTOSAVE_LONGEST);
+        assert_eq!(autosave_wait(every, Duration::MAX), AUTOSAVE_LONGEST);
+    }
+
+    #[test]
     fn a_layer_file_cut_short_keeps_the_rows_before_the_cut() {
         let (w, h) = (64u32, 64u32);
         // each row its own grey, so a row in the wrong place shows
@@ -1910,15 +3175,15 @@ mod signature_tests {
         write_png(&path, w, h, &rgba, &[]).unwrap();
         let whole = fs::read(&path).unwrap();
         let _ = fs::remove_file(&path);
-        assert_eq!(Opened::Png(whole.clone()).pixels(w, h).unwrap(), rgba);
+        assert_eq!(layer_png(&whole, w, h).unwrap(), rgba);
         // cut short part way: the first rows as they were, the rest clear
-        let cut = Opened::Png(whole[..whole.len() * 2 / 3].to_vec()).pixels(w, h).unwrap();
+        let cut = layer_png(&whole[..whole.len() * 2 / 3], w, h).unwrap();
         let line = w as usize * 4;
         let kept = cut.chunks(line).zip(rgba.chunks(line)).take_while(|(a, b)| a == b).count();
         assert!(kept > 0 && kept < h as usize, "{kept} rows kept");
         assert!(cut[kept * line..].iter().all(|&v| v == 0));
         // cut before any row: none can be read
-        assert!(Opened::Png(whole[..40].to_vec()).pixels(w, h).is_err());
+        assert!(layer_png(&whole[..40], w, h).is_err());
     }
 
     #[test]
@@ -1931,13 +3196,13 @@ mod signature_tests {
         let _ = fs::remove_file(&path);
         let at = |px: &[u8], cw: u32, x: u32, y: u32| px[((y * cw + x) * 4) as usize..][..4].to_vec();
         // smaller: the top left part
-        let cut = Opened::Png(bytes.clone()).pixels(4, 3).unwrap();
+        let cut = layer_png(&bytes, 4, 3).unwrap();
         assert_eq!(cut.len(), 4 * 3 * 4);
         for (x, y) in [(0, 0), (3, 0), (0, 2), (3, 2)] {
             assert_eq!(at(&cut, 4, x, y), at(&rgba, w, x, y));
         }
         // bigger: all of it at the top left, clear around it
-        let grown = Opened::Png(bytes.clone()).pixels(8, 5).unwrap();
+        let grown = layer_png(&bytes, 8, 5).unwrap();
         assert_eq!(at(&grown, 8, 5, 3), at(&rgba, w, 5, 3));
         assert_eq!(at(&grown, 8, 6, 0), vec![0; 4]);
         assert_eq!(at(&grown, 8, 0, 4), vec![0; 4]);

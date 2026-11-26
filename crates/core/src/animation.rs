@@ -1,5 +1,6 @@
 //! The layers as an animation: each visible top-level layer or group a frame, bottom first, as
-//! an animated GIF or PNG, or a frame at a time for a video or a preview.
+//! an animated GIF or PNG, or a frame at a time for a video or a preview. A background frame (the
+//! first) and a foreground frame (the last) don't play: they show with every frame that does.
 
 use std::fs;
 use std::io::BufWriter;
@@ -24,21 +25,72 @@ fn frames(doc: &Document) -> Vec<LayerId> {
     animation::frames(doc)
 }
 
-/// The frames as they play: each as often as Animation Assist holds it.
-fn sequence(doc: &Document) -> Vec<LayerId> {
+/// The frames that play: all but a background frame and a foreground frame.
+fn played(doc: &Document) -> Vec<LayerId> {
+    let all = frames(doc);
+    let range = animation::played(doc.animation.as_ref(), all.len());
+    all.get(range).map(<[LayerId]>::to_vec).unwrap_or_default()
+}
+
+/// The frames shown with every frame played: a background frame and a foreground frame.
+fn shown_with_each(doc: &Document) -> Vec<LayerId> {
+    let all = frames(doc);
+    let range = animation::played(doc.animation.as_ref(), all.len());
+    all.into_iter().enumerate().filter(|(i, _)| !range.contains(i)).map(|(_, id)| id).collect()
+}
+
+/// `units`, each as often as Animation Assist holds it.
+fn held(doc: &Document, units: Vec<LayerId>) -> Vec<LayerId> {
     let holds = |id: LayerId| doc.animation.as_ref().map_or(0, |a| a.hold(id)) as usize;
-    frames(doc).into_iter().flat_map(|id| std::iter::repeat_n(id, 1 + holds(id))).collect()
+    units.into_iter().flat_map(|id| std::iter::repeat_n(id, 1 + holds(id))).collect()
+}
+
+/// The timeline's places: every frame (a background and a foreground too), each as often as it
+/// is held.
+fn timeline(doc: &Document) -> Vec<LayerId> {
+    held(doc, frames(doc))
+}
+
+/// The frames as they play: each frame that plays, as often as it is held.
+fn sequence(doc: &Document) -> Vec<LayerId> {
+    held(doc, played(doc))
 }
 
 #[uniffi::export]
 impl CanvasSession {
-    /// The frames in playing order (indices into the frames), each as often as it is held.
+    /// The timeline's places: the frames (indices into `animation_frames`), each as often as it
+    /// is held; a background and a foreground frame among them.
     pub fn animation_sequence(&self) -> Vec<u32> {
         let doc = &self.shared.lock().doc;
         let all = frames(doc);
-        sequence(doc)
+        timeline(doc)
             .iter()
             .filter_map(|id| all.iter().position(|f| f == id))
+            .filter_map(|i| u32::try_from(i).ok())
+            .collect()
+    }
+
+    /// The places of `animation_sequence` that play, in order: all but a background frame's and a
+    /// foreground frame's, which show with each of them instead.
+    pub fn animation_played_places(&self) -> Vec<u32> {
+        let doc = &self.shared.lock().doc;
+        let plays: std::collections::HashSet<LayerId> = played(doc).into_iter().collect();
+        timeline(doc)
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| plays.contains(id))
+            .filter_map(|(k, _)| u32::try_from(k).ok())
+            .collect()
+    }
+
+    /// The frames in playing order, as `animation_frame` numbers them, each as often as it is
+    /// held.
+    pub fn animation_play_order(&self) -> Vec<u32> {
+        let doc = &self.shared.lock().doc;
+        let plays = played(doc);
+        sequence(doc)
+            .iter()
+            .filter_map(|id| plays.iter().position(|f| f == id))
             .filter_map(|i| u32::try_from(i).ok())
             .collect()
     }
@@ -55,15 +107,16 @@ impl CanvasSession {
         st.canvas.is_some()
     }
 
-    /// How many frames the animation has.
+    /// How many frames the animation plays (a background or foreground frame is not one of them).
     pub fn animation_frame_count(&self) -> u32 {
-        u32::try_from(frames(&self.shared.lock().doc).len()).unwrap_or(u32::MAX)
+        u32::try_from(played(&self.shared.lock().doc).len()).unwrap_or(u32::MAX)
     }
 
-    /// Frame `index` (bottom first), straight alpha, scaled to fit `max_side` (0: full size),
-    /// over the background unless `transparent`; none if there is no such frame.
+    /// Played frame `index` (bottom first) with a background frame under it and a foreground
+    /// frame over it, straight alpha, scaled to fit `max_side` (0: full size), over the background
+    /// unless `transparent`; none if there is no such frame.
     pub fn animation_frame(&self, index: u32, transparent: bool, max_side: u32) -> Option<ThumbnailImage> {
-        let unit = frames(&self.shared.lock().doc).get(usize::try_from(index).ok()?).copied()?;
+        let unit = played(&self.shared.lock().doc).get(usize::try_from(index).ok()?).copied()?;
         match self.render_frame(unit, transparent, max_side) {
             Ok((width, height, rgba)) => Some(ThumbnailImage { width, height, rgba }),
             Err(e) => {
@@ -126,7 +179,7 @@ impl CanvasSession {
             self.exported(start + (0.95 - start) * next as f32 / units.len() as f32);
         }
         let bytes = gif.ok_or_else(|| file_error("saving", "there are no frames"))?.finish();
-        write_atomically(Path::new(&path), |f| fs::write(f, &bytes).map_err(|e| file_error("saving", e)))?;
+        write_atomically(Path::new(&path), |f| crate::storage::write(f, &bytes).map_err(|e| file_error("saving", e)))?;
         self.exported(1.0);
         Ok(())
     }
@@ -198,8 +251,9 @@ impl CanvasSession {
         Ok(size.map(|(w, h)| GifWriter::shared(w, h, &samples)))
     }
 
-    /// `unit` alone (the background too unless `transparent`), straight alpha, scaled to fit
-    /// `max_side` (0: full size). The canvas shows the whole picture again afterwards.
+    /// `unit` with a background and a foreground frame and no other (the background too unless
+    /// `transparent`), straight alpha, scaled to fit `max_side` (0: full size). The canvas shows
+    /// the whole picture again afterwards.
     fn render_frame(
         &self,
         unit: LayerId,
@@ -212,8 +266,9 @@ impl CanvasSession {
             st.finish_stroke();
             st.settle();
             let mut doc = st.doc.clone();
+            let with = shown_with_each(&doc);
             for id in doc.members(None) {
-                if id != unit {
+                if id != unit && !with.contains(&id) {
                     doc.set_visible(id, false);
                 }
             }
@@ -224,9 +279,13 @@ impl CanvasSession {
             let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else {
                 return Err(file_error("reading the picture", "the canvas is not shown yet"));
             };
+            // drawn as playing shows it: the frame plain, not an onion skin of the current one
+            let playing = canvas.play_frame();
+            canvas.set_play_frame(frames(&doc).iter().position(|f| *f == unit));
             canvas.invalidate();
             canvas.render_finished(gpu, &mut doc);
             let rgba = canvas.read_composite(gpu);
+            canvas.set_play_frame(playing);
             canvas.invalidate();
             canvas.render(gpu, &mut st.doc, None);
             self.shared.frame(st);

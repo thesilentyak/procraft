@@ -35,6 +35,17 @@ pub struct Screen {
     pub last: bool,
     /// The system's on-screen keyboard, for a field focused by a finger or a pen.
     pub touch_keyboard: crate::touch_keyboard::TouchKeyboard,
+    /// Whether the interface was told it is on a touch screen, for a tablet's pen that moves the
+    /// mouse pointer.
+    pen_touch_screen: crate::input::PenTouchScreen,
+    /// The interface's frames missed in a row, and what the app is to do after the last one (see
+    /// `interface_pass`).
+    misses: crate::interface_pass::Misses,
+    after_frame: crate::interface_pass::AfterFrame,
+    /// The frames the window's surface gave no picture for, in a row (see `window_watch`).
+    surface_misses: crate::window_watch::SurfaceMisses,
+    /// The surface found at another size than the window's, told in the log at most so often.
+    size_told: crate::window_watch::LogBudget,
 }
 
 /// A canvas drawn into a picture of its own (the surface's format), its size, and the
@@ -87,9 +98,21 @@ const INTERFACE_WIDE: bool = false;
 /// How soon a window left without its surface asks for it again.
 const SURFACE_RETRY: Duration = Duration::from_millis(100);
 
+/// How soon a frame whose interface couldn't go up to the GPU is drawn again, once the app has let
+/// go of what it keeps.
+const MISSED_RETRY: Duration = Duration::from_millis(50);
+
 /// A window of no size is minimised: nothing shows until it has one.
 fn is_minimised(size: winit::dpi::PhysicalSize<u32>) -> bool {
     size.width == 0 || size.height == 0
+}
+
+/// Whether the window's surface, set up at `set` (none: not set up), is to be set up again for the
+/// window at `window`: when it isn't, or is at another size, and the window isn't minimised. A size
+/// the window was given without its resize coming through (as it goes into or out of a Mac's full
+/// screen) is caught by the next frame.
+fn needs_set_up(set: Option<(u32, u32)>, window: winit::dpi::PhysicalSize<u32>) -> bool {
+    !is_minimised(window) && set != Some((window.width, window.height))
 }
 
 impl Screen {
@@ -197,7 +220,25 @@ impl Screen {
             tried: 0,
             last,
             touch_keyboard: crate::touch_keyboard::TouchKeyboard::default(),
+            pen_touch_screen: crate::input::PenTouchScreen::default(),
+            misses: crate::interface_pass::Misses::default(),
+            after_frame: crate::interface_pass::AfterFrame::Fine,
+            surface_misses: crate::window_watch::SurfaceMisses::default(),
+            size_told: crate::window_watch::LogBudget::new(10, Duration::from_secs(60)),
         })
+    }
+
+    /// What the app is to do after the last frame drawn: whether its interface missed (told once).
+    pub fn take_after_frame(&mut self) -> crate::interface_pass::AfterFrame {
+        std::mem::replace(&mut self.after_frame, crate::interface_pass::AfterFrame::Fine)
+    }
+
+    /// What the window's events gave the interface since its last frame; once a tablet's pen moves
+    /// the mouse pointer, it is told it is on a touch screen (see [`crate::input::PenTouchScreen`]).
+    pub fn take_input(&mut self) -> egui::RawInput {
+        let mut raw = self.egui.take_egui_input(&self.window);
+        self.pen_touch_screen.tell(&mut raw, crate::pen::mouse_pen().is_some());
+        raw
     }
 
     /// Whether the canvases' pipelines were made without a GPU error, once they are made (told
@@ -221,11 +262,15 @@ impl Screen {
         self.canvases_later.is_some()
     }
 
-    /// Whether nothing may be drawn now: on OpenGL while the canvases' pipelines are made. Its one
-    /// context is held by one thread at a time, and one that waits for it more than a second
-    /// panics (wgpu's lock), while a pipeline can take longer than that to compile.
+    /// Whether nothing may be drawn now: on OpenGL while the canvases' pipelines are made, or the
+    /// artwork open is exported or saved on a thread of its own. Its one context is held by one
+    /// thread at a time, and one that waits for it more than a second panics (wgpu's lock), while
+    /// a pipeline can take longer than that to compile, and an export's work on a big canvas (its
+    /// picture made and read back) longer than that to send and wait for.
     pub fn gl_busy(&self) -> bool {
-        self.gpu.is_gl() && self.canvases.as_ref().is_some_and(|made| !made.is_finished())
+        self.gpu.is_gl()
+            && (self.canvases.as_ref().is_some_and(|made| !made.is_finished())
+                || crate::files::exporting_since().is_some())
     }
 
     /// Whether nothing can show: its next size brings it back.
@@ -274,9 +319,7 @@ impl Screen {
     /// Whether `p` (window pixels) is on the interface rather than the canvas, which shows in
     /// `canvas` (points).
     pub fn over_interface(&self, p: (f32, f32), canvas: egui::Rect) -> bool {
-        let ctx = self.egui.egui_ctx();
-        let at = egui::pos2(p.0, p.1) / ctx.pixels_per_point();
-        !canvas.contains(at) || ctx.layer_id_at(at).is_some_and(|l| l.order != egui::Order::Background)
+        on_interface(self.egui.egui_ctx(), p, canvas)
     }
 
     /// Draws `pad` (the brush studio's drawing pad) into its own picture, `size` pixels (made again
@@ -344,19 +387,29 @@ impl Screen {
             .filter(|d| *d < Duration::from_secs(60 * 60));
         // textures change even when nothing is shown, so none is missed (the device keeps one
         // let go of until what drew with it is done)
-        let (device, queue) = (&self.gpu.device, &self.gpu.queue);
         for (id, deltas) in std::mem::take(&mut textures_delta.set) {
             for delta in &deltas {
-                self.renderer.update_texture(device, queue, id, delta);
+                crate::interface_pass::upload(&mut self.renderer, &self.gpu, id, delta);
             }
         }
         for id in std::mem::take(&mut textures_delta.free) {
             self.renderer.free_texture(&id);
         }
         // a surface the GPU refused (it couldn't come idle, another thread submitting work) is asked
-        // for again here: only a new size would, and the window would stay as it was until then
+        // for again here: only a new size would, and the window would stay as it was until then;
+        // and one at another size than the window's is set up again at the window's
         let window = self.window.inner_size();
-        if self.config.is_none() && !is_minimised(window) {
+        let set = self.config.as_ref().map(|c| (c.width, c.height));
+        if needs_set_up(set, window) {
+            if let Some((width, height)) = set
+                && let Some(end) = self.size_told.take(Instant::now())
+            {
+                log::info!(
+                    "the window's surface was {width}×{height}, the window {}×{}: set up again{end}",
+                    window.width,
+                    window.height
+                );
+            }
             self.resize(window.width, window.height);
         }
         let Some(config) = self.config.as_ref() else {
@@ -364,51 +417,49 @@ impl Screen {
         };
         let size = (config.width, config.height);
         let (format, screen) = (config.format, screen_profile(config));
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.resize(size.0, size.1);
-                return Some(Duration::ZERO);
+        let frame = match crate::window_watch::picture(self.surface.get_current_texture()) {
+            Ok(frame) => frame,
+            // drawn again whatever the surface said, soon, then less often while it says it: on a
+            // Mac an occluded window is one the system counts as hidden, and it can be late to count
+            // it as shown again (as it opens, or once its full screen space is ready); nothing else
+            // may ask for a frame then, and the window would stay black
+            Err(miss) => {
+                let (retry, line) = self.surface_misses.missed(miss, Instant::now());
+                if let Some(line) = line {
+                    log::info!("{line}");
+                }
+                // made again at the window's size as it now is: the window changing is what put
+                // the surface out of date, and made at its old size it would stay so
+                if retry.set_up_again {
+                    self.resize(window.width, window.height);
+                }
+                return Some(retry.after);
             }
-            wgpu::CurrentSurfaceTexture::Timeout
-            | wgpu::CurrentSurfaceTexture::Occluded
-            | wgpu::CurrentSurfaceTexture::Validation => return None,
         };
+        if let Some(line) = self.surface_misses.shown(Instant::now()) {
+            log::info!("{line}");
+        }
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let canvas_after = session.and_then(|s| s.draw(&view, format, size, screen, started));
 
-        let (device, queue) = (&self.gpu.device, &self.gpu.queue);
         let jobs = self.egui.egui_ctx().tessellate(shapes, pixels_per_point);
         let screen = egui_wgpu::ScreenDescriptor { size_in_pixels: [size.0, size.1], pixels_per_point };
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("interface") });
-        let uploads = self.renderer.update_buffers(device, queue, &mut encoder, &jobs, &screen);
-        {
-            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("interface"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    // over the canvas just drawn (the gallery covers the whole window)
-                    ops: wgpu::Operations {
-                        load: if session.is_some() {
-                            wgpu::LoadOp::Load
-                        } else {
-                            wgpu::LoadOp::Clear(wgpu::Color::BLACK)
-                        },
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            self.renderer.render(&mut pass.forget_lifetime(), &jobs, &screen);
-        }
-        queue.submit(uploads.into_iter().chain([encoder.finish()]));
+        let mut encoder =
+            self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("interface") });
+        // over the canvas just drawn (the gallery covers the whole window)
+        let load = if session.is_some() { wgpu::LoadOp::Load } else { wgpu::LoadOp::Clear(wgpu::Color::BLACK) };
+        let recorded =
+            crate::interface_pass::record(&mut self.renderer, &self.gpu, &mut encoder, &view, load, &jobs, &screen);
+        let Some(uploads) = recorded else {
+            // the interface couldn't go up to the GPU: the frame goes unshown (the window keeps the
+            // last), and the app lets go of what it keeps and draws again (see `interface_pass`)
+            self.after_frame = self.misses.frame(false);
+            return Some(MISSED_RETRY);
+        };
+        self.after_frame = self.misses.frame(true);
+        self.gpu.queue.submit(uploads.into_iter().chain([encoder.finish()]));
         self.window.pre_present_notify();
-        queue.present(frame);
+        self.gpu.queue.present(frame);
         // the backend shows: a crash from now on isn't its start's
         crate::startup::gpu_shown();
         // on OpenGL the canvases' pipelines once there is a window to see
@@ -433,16 +484,124 @@ impl Screen {
     }
 }
 
+/// Whether `p` (window pixels) is on `ctx`'s interface rather than the canvas, which shows in
+/// `canvas` (points): off the canvas, or on anything shown over it (an area, or what was
+/// [`claim`]ed).
+pub fn on_interface(ctx: &egui::Context, p: (f32, f32), canvas: egui::Rect) -> bool {
+    let at = egui::pos2(p.0, p.1) / ctx.pixels_per_point();
+    !canvas.contains(at) || ctx.layer_id_at(at).is_some_and(|l| l.order != egui::Order::Background) || claimed(ctx, at)
+}
+
+/// What the interface took of the window as the frames were drawn (the window's points): the
+/// frame's, and the one's before.
+#[derive(Clone, Default)]
+struct Claims {
+    frame: u64,
+    now: Vec<egui::Rect>,
+    before: Vec<egui::Rect>,
+}
+
+fn claims_id() -> egui::Id {
+    egui::Id::unique("interface claims")
+}
+
+/// `rect` (`ui`'s points) is the interface's this frame, though its area doesn't take it (an area
+/// is only as big as what it lays out, and a bar, a window's strip, a grabber or a handle is drawn
+/// and touched without laying anything out): a press there never reaches the canvas, for all its
+/// drag and its release.
+pub fn claim(ui: &egui::Ui, rect: egui::Rect) {
+    let to_window = ui.ctx().layer_transform_to_global(ui.layer_id()).unwrap_or_default();
+    claim_window(ui.ctx(), to_window.mul_rect(rect));
+}
+
+/// [`claim`] for `rect` in the window's points.
+pub fn claim_window(ctx: &egui::Context, rect: egui::Rect) {
+    let frame = ctx.cumulative_frame_nr();
+    ctx.data_mut(|d| {
+        let c = d.get_temp_mut_or_default::<Claims>(claims_id());
+        if c.frame != frame {
+            // (from the frame just before, or none: older ones show no more)
+            let last = std::mem::take(&mut c.now);
+            c.before = if c.frame + 1 == frame { last } else { Vec::new() };
+            c.frame = frame;
+        }
+        c.now.push(rect);
+    });
+}
+
+/// Whether `at` (points) was claimed by the frame drawn last (between frames), or by the one drawing
+/// now or the one before (as it draws).
+fn claimed(ctx: &egui::Context, at: egui::Pos2) -> bool {
+    let frame = ctx.cumulative_frame_nr();
+    ctx.data(|d| {
+        d.get_temp::<Claims>(claims_id()).is_some_and(|c| {
+            let now = c.frame + 1 >= frame && c.now.iter().any(|r| r.contains(at));
+            now || (c.frame == frame && c.before.iter().any(|r| r.contains(at)))
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use winit::dpi::PhysicalSize;
 
-    use super::is_minimised;
+    use super::{claim, is_minimised, needs_set_up, on_interface};
 
     #[test]
     fn only_a_window_of_no_size_counts_as_minimised() {
         assert!(is_minimised(PhysicalSize::new(0, 0)));
         assert!(is_minimised(PhysicalSize::new(0, 600)));
         assert!(!is_minimised(PhysicalSize::new(1, 1)));
+    }
+
+    /// The surface is set up again when the window's size isn't the one it was set up at (a
+    /// window gone full screen on a Mac without its resize coming through stayed at its old size),
+    /// or it isn't set up; never for a minimised window, nor at the size it has.
+    #[test]
+    fn a_surface_at_another_size_than_the_window_is_set_up_again() {
+        let window = PhysicalSize::new(2560, 1440);
+        assert!(!needs_set_up(Some((2560, 1440)), window));
+        assert!(needs_set_up(Some((1440, 900)), window));
+        assert!(needs_set_up(None, window));
+        assert!(!needs_set_up(Some((1440, 900)), PhysicalSize::new(0, 0)));
+        assert!(!needs_set_up(None, PhysicalSize::new(1440, 0)));
+    }
+
+    /// A handle drawn and touched in an area that lays nothing out (Edit layout's Done, a floating
+    /// window's grabber, a folded window's tab): the area alone is no bigger than a point, so a
+    /// press on the handle went to the canvas and painted; claimed, it is the interface's while it
+    /// shows and for the frame after, and the canvas's again once it is gone.
+    #[test]
+    fn a_handle_drawn_without_laying_anything_out_keeps_its_presses_off_the_canvas() {
+        let ctx = egui::Context::default();
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0));
+        let done = egui::Rect::from_min_size(egui::pos2(500.0, 700.0), egui::vec2(90.0, 44.0));
+        let frame = |claimed: bool| {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                egui::Area::new(egui::Id::unique("handles"))
+                    .fixed_pos(egui::Pos2::ZERO)
+                    .order(egui::Order::Foreground)
+                    .show(ui.ctx(), |ui| {
+                        let _ = ui.interact(done, egui::Id::unique("done"), egui::Sense::click());
+                        if claimed {
+                            claim(ui, done);
+                        }
+                    });
+            });
+            output.textures_delta.clear();
+        };
+        let on_done = (545.0, 722.0);
+        // drawn but not claimed: the press goes through to the canvas
+        frame(false);
+        assert!(!on_interface(&ctx, on_done, canvas));
+        // claimed: the interface's, between frames and while the next draws
+        frame(true);
+        assert!(on_interface(&ctx, on_done, canvas));
+        assert!(!on_interface(&ctx, (100.0, 100.0), canvas), "the rest of the canvas stays the canvas's");
+        frame(true);
+        assert!(on_interface(&ctx, on_done, canvas));
+        // gone (a frame without it): the canvas's again
+        frame(false);
+        assert!(!on_interface(&ctx, on_done, canvas));
     }
 }

@@ -12,16 +12,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use egui::{Align2, Color32, Id, Pos2, Rect, Sense, Stroke, Ui, pos2, vec2};
-use procraft_core::{BlobShape, CanvasSession, ColourBlob, ColourDrag, DragStep, Fill};
+use procraft_core::{BlobShape, CanvasSession, ColourBlob, ColourDrag, ColourPress, DragStep, Fill, PressTurn};
 
 use crate::colours::{of_hex, srgb};
 use crate::look::{Themed, Weight, argb, pc, text};
 use crate::overlays::ease;
 
-/// A press moved this far (points) drags the colour out.
+/// A swatch's press moved this far (points) drags the colour out.
 const SLOP: f32 = 8.0;
-/// A press held still this long is a hold.
-const HOLD: Duration = Duration::from_millis(400);
+/// A swatch's press held still this long (ms) is a hold.
+const HOLD_MS: u32 = 400;
 /// How long the band offers to continue filling after a drop.
 const OFFERED: Duration = Duration::from_millis(2500);
 const SLIDE: f32 = 0.3;
@@ -53,14 +53,14 @@ pub enum Touch {
     Dragged,
 }
 
-/// A press on a colour that can be dragged out: where and when it went down, and what it has
-/// turned out to be so far.
+/// A press on a colour that can be dragged out: where it went down and was last, the core's
+/// reading of what it is, and whether it is being dragged.
 #[derive(Clone)]
 struct Press {
     id: Id,
     origin: Pos2,
-    since: Instant,
-    held: bool,
+    last: Pos2,
+    reading: Arc<ColourPress>,
     dragging: bool,
     /// Where it may be let go without filling (the panel it came from).
     avoid: Option<Rect>,
@@ -111,8 +111,10 @@ impl Default for ColourDrop {
 
 impl ColourDrop {
     /// A colour that can be dragged out at `rect`: the colour button, or a swatch (`swatch`) of
-    /// colour `rgb`. Tapped, or held still when `holds`, it says so; dragged, its colour goes with
-    /// the pointer as a dot and fills where it is let go below the top bar (and off `avoid`).
+    /// colour `rgb`. Tapped or held still, it says so; dragged, its colour goes with the pointer as
+    /// a dot and fills where it is let go below the top bar (and off `avoid`). The core tells which
+    /// a press is: the colour button's held still goes back to the previous colour and then drags
+    /// nothing out; moved far enough first, it drags.
     #[allow(clippy::too_many_arguments)]
     pub fn source(
         &mut self,
@@ -122,15 +124,17 @@ impl ColourDrop {
         rect: Rect,
         rgb: u32,
         swatch: bool,
-        holds: bool,
         avoid: Option<Rect>,
     ) -> Option<Touch> {
         let response = ui.interact(rect, id, Sense::click_and_drag());
         let ctx = ui.ctx();
+        // where it, and the panel it is on, show in the window (a panel may show bigger or smaller)
+        let to_window = ctx.layer_transform_to_global(ui.layer_id()).unwrap_or(egui::emath::TSTransform::IDENTITY);
+        let (centre, avoid) = (to_window * rect.center(), avoid.map(|a| to_window.mul_rect(a)));
         if !swatch {
-            self.button = Some(rect.center());
+            self.button = Some(centre);
         }
-        let (at, down) = ctx.input(|i| (i.pointer.interact_pos(), i.pointer.primary_down()));
+        let (at, down, ms) = ctx.input(|i| (i.pointer.interact_pos(), i.pointer.primary_down(), i.time * 1000.0));
         // pressed and let go between two frames: a tap never seen down
         if response.clicked() && self.press.as_ref().is_none_or(|p| p.id != id) {
             return Some(Touch::Tap);
@@ -139,31 +143,31 @@ impl ColourDrop {
             && response.is_pointer_button_down_on()
             && let Some(origin) = at
         {
-            self.press = Some(Press {
-                id,
-                origin,
-                since: Instant::now(),
-                held: false,
-                dragging: false,
-                avoid,
-                drag: None,
-                blob: None,
-            });
+            let reading = if swatch {
+                ColourPress::swatch(origin.x, origin.y, ms, Some(HOLD_MS), SLOP)
+            } else {
+                ColourPress::button(origin.x, origin.y, ms)
+            };
+            self.press =
+                Some(Press { id, origin, last: origin, reading, dragging: false, avoid, drag: None, blob: None });
         }
         let press = self.press.as_mut().filter(|p| p.id == id)?;
         let at = at.unwrap_or(press.origin);
         if !down {
-            let (held, dragging) = (press.held, press.dragging);
-            if dragging {
+            if press.dragging {
                 self.let_go(ctx, session, Some(at));
-            } else {
-                self.press = None;
+                return None;
             }
-            return (!held && !dragging).then_some(Touch::Tap);
+            let turn = press.reading.lifted(ms);
+            self.press = None;
+            return match turn {
+                PressTurn::Tap => Some(Touch::Tap),
+                PressTurn::Hold => Some(Touch::Hold),
+                PressTurn::Drag | PressTurn::None => None,
+            };
         }
         if press.dragging {
             let (drag, avoid, blob) = (press.drag.clone(), press.avoid, press.blob.clone());
-            let ms = ctx.input(|i| i.time) * 1000.0;
             let step = drag.as_ref().map_or(
                 DragStep { dot_x: at.x, dot_y: at.y, resting: false, threshold: self.threshold, slid: false },
                 |d| d.moved(at.x, at.y, ms),
@@ -177,7 +181,7 @@ impl ColourDrop {
                     let ppp = ctx.pixels_per_point();
                     rested = drag.rest(
                         ms,
-                        dot.y > pc::BAR_HEIGHT
+                        dot.y > crate::panel::bar_shown(ctx)
                             && !avoid.is_some_and(|a| a.contains(dot))
                             && session.pour_lands(dot.x * ppp, dot.y * ppp),
                     );
@@ -199,17 +203,22 @@ impl ColourDrop {
             }
             return None;
         }
-        if press.held {
-            return None;
+        let turn = if at == press.last {
+            press.reading.tick(ms)
+        } else {
+            press.last = at;
+            press.reading.moved(at.x, at.y, ms)
+        };
+        if turn == PressTurn::Hold {
+            return Some(Touch::Hold);
         }
-        if at.distance(press.origin) > SLOP {
+        if turn == PressTurn::Drag {
             press.dragging = true;
-            let ms = ctx.input(|i| i.time) * 1000.0;
             // a mouse or a pen: a little wobble still rests
             press.drag = Some(ColourDrag::new(at.x, at.y, ms, true, self.threshold));
             // pulled out of the colour button's centre, or from where a swatch was pressed; a pen
             // moving the pointer drags a pen's dot
-            let from = if swatch { press.origin } else { rect.center() };
+            let from = if swatch { press.origin } else { centre };
             let pen = crate::pen::mouse_pen().is_some();
             let blob = ColourBlob::new(from.x, from.y, !swatch, pen, reduce_motion(), ms);
             let button = self.button.unwrap_or(from);
@@ -222,13 +231,9 @@ impl ColourDrop {
             self.band = Band::Dragging;
             return Some(Touch::Dragged);
         }
-        if holds {
-            let held_for = press.since.elapsed();
-            if held_for >= HOLD {
-                press.held = true;
-                return Some(Touch::Hold);
-            }
-            ctx.request_repaint_after(HOLD - held_for);
+        // kept still, it may turn into a hold by itself
+        if let Some(due) = press.reading.due() {
+            ctx.request_repaint_after(Duration::from_secs_f64(((due - ms) / 1000.0).max(0.0)));
         }
         None
     }
@@ -247,8 +252,8 @@ impl ColourDrop {
             self.band = Band::Dropped(Instant::now());
             return;
         }
-        let at =
-            at.map(|a| rested.unwrap_or(a)).filter(|p| p.y > pc::BAR_HEIGHT && !avoid.is_some_and(|a| a.contains(*p)));
+        let bar = crate::panel::bar_shown(ctx);
+        let at = at.map(|a| rested.unwrap_or(a)).filter(|p| p.y > bar && !avoid.is_some_and(|a| a.contains(*p)));
         let poured = match (at, dot) {
             (Some(at), Some((_, rgb))) => {
                 let ppp = ctx.pixels_per_point();
@@ -421,9 +426,10 @@ impl ColourDrop {
     }
 }
 
-/// Whether window point `p` (points) is over one of the bars: the top bar, or the side bar.
+/// Whether window point `p` (points) is over one of the bars as they show: the top bar, or the side
+/// bar.
 fn over_bar(ctx: &egui::Context, p: Pos2) -> bool {
-    p.y <= pc::BAR_HEIGHT || crate::panel::side_bar_shown_at(ctx).is_some_and(|bar| bar.contains(p))
+    p.y <= crate::panel::bar_shown(ctx) || crate::panel::side_bar_shown_at(ctx).is_some_and(|bar| bar.contains(p))
 }
 
 /// Fills `shape` in `colour`: its triangles, their edges smoothed by its rims drawn a pixel wide.

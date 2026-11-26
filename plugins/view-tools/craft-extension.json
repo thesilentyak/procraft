@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "id": "io.github.artcraftandroid.view-tools",
+  "name": "View tools",
+  "version": "1.1.0",
+  "holds": ["hooks"],
+  "publisher": {"name": "ProCraft"},
+  "description": "Values only, more Reference windows and Reset rotation, each with a switch of its own. What you save and export stays as it is.",
+  "compat": {"procraft": {"interface": 16}},
+  "permissions": ["view"],
+  "hooks": ["view_look", "reference_windows", "gesture_lock"],
+  "controls": [
+    {"key": "value_check", "type": "feature", "label": "Value check", "description": "Values only, in Actions > Canvas or on Alt+G, shows the canvas in greys to check its values, on the screen alone: what you save, export and pick stays in colour.", "hooks": ["view_look"]},
+    {"key": "values", "type": "switch", "label": "Values only", "starts": false, "place": "canvas", "press": "alt+g", "under": "value_check"},
+    {"key": "contrast", "type": "slider", "label": "Contrast", "least": 1, "most": 2, "step": 0.05, "starts": 1, "shown_times": 100, "unit": "%", "live": true, "under": "values"},
+    {"key": "reference_windows", "type": "feature", "label": "Reference windows", "description": "More than one Reference window open at once: + on a window opens another, each showing the canvas or a picture of its own, kept with the artwork.", "hooks": ["reference_windows"]},
+    {"key": "windows", "type": "slider", "label": "Windows at once", "least": 2, "most": 8, "step": 1, "starts": 3, "under": "reference_windows"},
+    {"key": "rotation_reset", "type": "feature", "label": "Rotation reset", "description": "Reset rotation, in Actions > Canvas or on Alt+R, turns the canvas upright or to the nearest right angle. Switches keep pinching from turning it, and a quick pinch from fitting it to the screen.", "hooks": ["gesture_lock"]},
+    {"key": "to", "type": "slider", "label": "Reset to", "least": 0, "most": 1, "step": 1, "starts": 0, "names": ["Upright", "Nearest 90°"], "under": "rotation_reset"},
+    {"key": "lock", "type": "switch", "label": "Lock rotation while pinching", "starts": false, "place": "canvas", "under": "rotation_reset"},
+    {"key": "no_fit", "type": "switch", "label": "No fit on a quick pinch", "starts": false, "place": "canvas", "under": "rotation_reset"}
+  ],
+  "actions": [
+    {"key": "reset", "label": "Reset rotation", "place": "canvas", "press": "alt+r", "under": "rotation_reset"}
+  ],
+  "replaces": [
+    {"id": "io.github.artcraftandroid.value-check", "switch": "value_check", "controls": {"values": "values", "contrast": "contrast"}},
+    {"id": "io.github.artcraftandroid.reference-windows", "switch": "reference_windows", "controls": {"most": "windows"}},
+    {"id": "io.github.artcraftandroid.rotation-reset", "switch": "rotation_reset", "controls": {"to": "to", "lock": "lock", "no_fit": "no_fit"}}
+  ]
+}
