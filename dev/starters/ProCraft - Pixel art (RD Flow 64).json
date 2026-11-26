@@ -1,0 +1,1044 @@
+{
+  "id": "procraft-procraft---pixel-art-(rd-flow-64)",
+  "revision": 0,
+  "last_node_id": 99,
+  "last_link_id": 25,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "ETN_KritaCanvas",
+      "pos": [
+        0,
+        600
+      ],
+      "size": [
+        300,
+        100
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "links": [],
+          "slot_index": 0
+        },
+        {
+          "name": "width",
+          "type": "INT",
+          "links": [
+            16,
+            20
+          ],
+          "slot_index": 1
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "links": [
+            17,
+            21
+          ],
+          "slot_index": 2
+        },
+        {
+          "name": "seed",
+          "type": "INT",
+          "links": [
+            3,
+            12
+          ],
+          "slot_index": 3
+        },
+        {
+          "name": "mask",
+          "type": "MASK",
+          "links": [],
+          "slot_index": 4
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ETN_KritaCanvas"
+      },
+      "widgets_values": [],
+      "title": "Canvas (from the app)"
+    },
+    {
+      "id": 2,
+      "type": "ETN_Parameter",
+      "pos": [
+        0,
+        0
+      ],
+      "size": [
+        300,
+        100
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "value",
+          "type": "*",
+          "links": [
+            1
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ETN_Parameter"
+      },
+      "widgets_values": [
+        "Prompt",
+        "prompt (positive)",
+        "",
+        -10000000000.0,
+        10000000000.0
+      ],
+      "title": "Prompt (from the app)"
+    },
+    {
+      "id": 3,
+      "type": "ETN_Parameter",
+      "pos": [
+        0,
+        200
+      ],
+      "size": [
+        300,
+        100
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "value",
+          "type": "*",
+          "links": [
+            2,
+            9,
+            13
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ETN_Parameter"
+      },
+      "widgets_values": [
+        "Background",
+        "choice",
+        "transparent",
+        -10000000000.0,
+        10000000000.0
+      ],
+      "title": "Background (from the app)"
+    },
+    {
+      "id": 4,
+      "type": "ETN_Parameter",
+      "pos": [
+        0,
+        400
+      ],
+      "size": [
+        300,
+        100
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "value",
+          "type": "*",
+          "links": [
+            4,
+            14
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ETN_Parameter"
+      },
+      "widgets_values": [
+        "Palette",
+        "text",
+        "",
+        -10000000000.0,
+        10000000000.0
+      ],
+      "title": "Palette: hex colours, or empty (from the app)"
+    },
+    {
+      "id": 5,
+      "type": "RDFlow64SystemPrompt",
+      "pos": [
+        380,
+        0
+      ],
+      "size": [
+        300,
+        100
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "request",
+          "type": "STRING",
+          "link": 1,
+          "widget": {
+            "name": "request"
+          }
+        },
+        {
+          "name": "background",
+          "type": "COMBO",
+          "link": 2,
+          "widget": {
+            "name": "background"
+          }
+        },
+        {
+          "name": "seed",
+          "type": "INT",
+          "link": 3,
+          "widget": {
+            "name": "seed"
+          }
+        },
+        {
+          "name": "palette",
+          "type": "STRING",
+          "link": 4,
+          "widget": {
+            "name": "palette"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "system_prompt",
+          "type": "STRING",
+          "links": [
+            6
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "user_message",
+          "type": "STRING",
+          "links": [
+            7
+          ],
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RDFlow64SystemPrompt"
+      },
+      "widgets_values": [
+        "",
+        "transparent",
+        0,
+        ""
+      ]
+    },
+    {
+      "id": 6,
+      "type": "CLIPLoader",
+      "pos": [
+        380,
+        260
+      ],
+      "size": [
+        300,
+        100
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "links": [
+            5
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPLoader"
+      },
+      "widgets_values": [
+        "qwen3vl_4b_fp8_scaled.safetensors",
+        "krea2",
+        "default"
+      ]
+    },
+    {
+      "id": 7,
+      "type": "TextGenerateV2",
+      "pos": [
+        760,
+        0
+      ],
+      "size": [
+        300,
+        100
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 5
+        },
+        {
+          "name": "system_prompt",
+          "type": "STRING",
+          "link": 6
+        },
+        {
+          "name": "prompt",
+          "type": "STRING",
+          "link": 7,
+          "widget": {
+            "name": "prompt"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "generated_text",
+          "type": "STRING",
+          "links": [
+            8
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "thinking",
+          "type": "STRING",
+          "links": [],
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "TextGenerateV2"
+      },
+      "widgets_values": [
+        "",
+        700,
+        "on",
+        0.6,
+        20,
+        0.95,
+        0,
+        1.05,
+        0,
+        0,
+        false,
+        true,
+        "auto"
+      ],
+      "title": "Writes the long description"
+    },
+    {
+      "id": 8,
+      "type": "RDFlow64CleanCaption",
+      "pos": [
+        1140,
+        0
+      ],
+      "size": [
+        300,
+        100
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "llm_output",
+          "type": "STRING",
+          "link": 8
+        },
+        {
+          "name": "background",
+          "type": "COMBO",
+          "link": 9,
+          "widget": {
+            "name": "background"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "caption",
+          "type": "STRING",
+          "links": [
+            11
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RDFlow64CleanCaption"
+      },
+      "widgets_values": [
+        "transparent"
+      ]
+    },
+    {
+      "id": 9,
+      "type": "RDFlow64Loader",
+      "pos": [
+        1140,
+        260
+      ],
+      "size": [
+        300,
+        100
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "rd_flow_64",
+          "type": "RDFLOW64",
+          "links": [
+            10
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RDFlow64Loader"
+      },
+      "widgets_values": [
+        "cpu",
+        "auto",
+        "auto",
+        ""
+      ],
+      "title": "RD Flow 64 (its prompt reader on the CPU, leaving the GPU to ComfyUI)"
+    },
+    {
+      "id": 10,
+      "type": "RDFlow64Generate",
+      "pos": [
+        1500,
+        0
+      ],
+      "size": [
+        300,
+        100
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "rd_flow_64",
+          "type": "RDFLOW64",
+          "link": 10
+        },
+        {
+          "name": "caption",
+          "type": "STRING",
+          "link": 11,
+          "widget": {
+            "name": "caption"
+          }
+        },
+        {
+          "name": "seed",
+          "type": "INT",
+          "link": 12,
+          "widget": {
+            "name": "seed"
+          }
+        },
+        {
+          "name": "background",
+          "type": "COMBO",
+          "link": 13,
+          "widget": {
+            "name": "background"
+          }
+        },
+        {
+          "name": "palette",
+          "type": "STRING",
+          "link": 14,
+          "widget": {
+            "name": "palette"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "links": [
+            15
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "mask",
+          "type": "MASK",
+          "links": [
+            18
+          ],
+          "slot_index": 1
+        },
+        {
+          "name": "palette",
+          "type": "STRING",
+          "links": [],
+          "slot_index": 2
+        },
+        {
+          "name": "rgba",
+          "type": "IMAGE",
+          "links": [],
+          "slot_index": 3
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RDFlow64Generate"
+      },
+      "widgets_values": [
+        "",
+        0,
+        "fixed",
+        1,
+        "transparent",
+        16,
+        4.0,
+        1,
+        ""
+      ]
+    },
+    {
+      "id": 11,
+      "type": "ResizeAndPadImage",
+      "pos": [
+        1880,
+        0
+      ],
+      "size": [
+        300,
+        100
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 15
+        },
+        {
+          "name": "target_width",
+          "type": "INT",
+          "link": 16,
+          "widget": {
+            "name": "target_width"
+          }
+        },
+        {
+          "name": "target_height",
+          "type": "INT",
+          "link": 17,
+          "widget": {
+            "name": "target_height"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            23
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ResizeAndPadImage"
+      },
+      "widgets_values": [
+        512,
+        512,
+        "black",
+        "nearest-exact"
+      ],
+      "title": "Sharp pixels, fitted to the canvas"
+    },
+    {
+      "id": 12,
+      "type": "MaskToImage",
+      "pos": [
+        1880,
+        260
+      ],
+      "size": [
+        300,
+        100
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "mask",
+          "type": "MASK",
+          "link": 18
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            19
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MaskToImage"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 13,
+      "type": "ResizeAndPadImage",
+      "pos": [
+        2200,
+        260
+      ],
+      "size": [
+        300,
+        100
+      ],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 19
+        },
+        {
+          "name": "target_width",
+          "type": "INT",
+          "link": 20,
+          "widget": {
+            "name": "target_width"
+          }
+        },
+        {
+          "name": "target_height",
+          "type": "INT",
+          "link": 21,
+          "widget": {
+            "name": "target_height"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            22
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ResizeAndPadImage"
+      },
+      "widgets_values": [
+        512,
+        512,
+        "white",
+        "nearest-exact"
+      ],
+      "title": "Transparent round it"
+    },
+    {
+      "id": 14,
+      "type": "ImageToMask",
+      "pos": [
+        2520,
+        260
+      ],
+      "size": [
+        300,
+        100
+      ],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 22
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": [
+            24
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ImageToMask"
+      },
+      "widgets_values": [
+        "red"
+      ]
+    },
+    {
+      "id": 15,
+      "type": "JoinImageWithAlpha",
+      "pos": [
+        2520,
+        0
+      ],
+      "size": [
+        300,
+        100
+      ],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 23
+        },
+        {
+          "name": "alpha",
+          "type": "MASK",
+          "link": 24
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            25
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "JoinImageWithAlpha"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 16,
+      "type": "ETN_KritaOutput",
+      "pos": [
+        2840,
+        0
+      ],
+      "size": [
+        300,
+        100
+      ],
+      "flags": {},
+      "order": 15,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 25
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "ETN_KritaOutput"
+      },
+      "widgets_values": [
+        0,
+        0,
+        "Pixel art",
+        "default",
+        false
+      ],
+      "title": "Back to the app"
+    },
+    {
+      "id": 99,
+      "type": "MarkdownNote",
+      "pos": [
+        0,
+        -260
+      ],
+      "size": [
+        620,
+        220
+      ],
+      "flags": {},
+      "order": 16,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "## ProCraft - Pixel art (RD Flow 64)\n\nMade for ProCraft Diffusion. Keep this workflow **open in ComfyUI**: the app on your phone gets it as the **ComfyUI (live)** card. On the phone, hold that card and choose **Keep** to keep it for good.\n\nThe nodes marked *(from the app)* are filled in by the app: your canvas, your prompt, the selection. **Back to the app** sends the result to your phone. Pressing Run here does nothing useful."
+      ]
+    }
+  ],
+  "links": [
+    [
+      1,
+      2,
+      0,
+      5,
+      0,
+      "*"
+    ],
+    [
+      2,
+      3,
+      0,
+      5,
+      1,
+      "*"
+    ],
+    [
+      3,
+      1,
+      3,
+      5,
+      2,
+      "INT"
+    ],
+    [
+      4,
+      4,
+      0,
+      5,
+      3,
+      "*"
+    ],
+    [
+      5,
+      6,
+      0,
+      7,
+      0,
+      "CLIP"
+    ],
+    [
+      6,
+      5,
+      0,
+      7,
+      1,
+      "STRING"
+    ],
+    [
+      7,
+      5,
+      1,
+      7,
+      2,
+      "STRING"
+    ],
+    [
+      8,
+      7,
+      0,
+      8,
+      0,
+      "STRING"
+    ],
+    [
+      9,
+      3,
+      0,
+      8,
+      1,
+      "*"
+    ],
+    [
+      10,
+      9,
+      0,
+      10,
+      0,
+      "RDFLOW64"
+    ],
+    [
+      11,
+      8,
+      0,
+      10,
+      1,
+      "STRING"
+    ],
+    [
+      12,
+      1,
+      3,
+      10,
+      2,
+      "INT"
+    ],
+    [
+      13,
+      3,
+      0,
+      10,
+      3,
+      "*"
+    ],
+    [
+      14,
+      4,
+      0,
+      10,
+      4,
+      "*"
+    ],
+    [
+      15,
+      10,
+      0,
+      11,
+      0,
+      "IMAGE"
+    ],
+    [
+      16,
+      1,
+      1,
+      11,
+      1,
+      "INT"
+    ],
+    [
+      17,
+      1,
+      2,
+      11,
+      2,
+      "INT"
+    ],
+    [
+      18,
+      10,
+      1,
+      12,
+      0,
+      "MASK"
+    ],
+    [
+      19,
+      12,
+      0,
+      13,
+      0,
+      "IMAGE"
+    ],
+    [
+      20,
+      1,
+      1,
+      13,
+      1,
+      "INT"
+    ],
+    [
+      21,
+      1,
+      2,
+      13,
+      2,
+      "INT"
+    ],
+    [
+      22,
+      13,
+      0,
+      14,
+      0,
+      "IMAGE"
+    ],
+    [
+      23,
+      11,
+      0,
+      15,
+      0,
+      "IMAGE"
+    ],
+    [
+      24,
+      14,
+      0,
+      15,
+      1,
+      "MASK"
+    ],
+    [
+      25,
+      15,
+      0,
+      16,
+      0,
+      "IMAGE"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.7,
+      "offset": [
+        60,
+        320
+      ]
+    }
+  },
+  "version": 0.4
+}

@@ -190,7 +190,7 @@ the same way; a result carries its layer name and offset.
 | W4 | Desktop popover | The desktop app on the user's PC |
 | W5 | Android popover (**built 2026-11-26**; kept workflows are `.json` files in the styles folder itself, beside the styles, not a Workflows folder below it; the popover's prompt field is the workflow's first prompt) | The APK from GitHub Actions on the user's phone |
 | W6 | Import and Export, layer pickers (**built on Android 2026-11-26**) | Both apps |
-| W7 | Starter workflows for the user's own models (text to image, refine, selection fill), with only a prompt in view (**first two 2026-11-26**: Z-Image Turbo "new picture" and "paint over", in `dev/starters/`, made by `make_starters.py` at about 1 MP, the app scaling the result to the canvas) | The user's server and phone |
+| W7 | Starter workflows for the user's own models (text to image, refine, selection fill), with only a prompt in view (**first two 2026-11-26**: Z-Image Turbo "new picture" and "paint over", in `dev/starters/`, made by `make_starters.py` at about 1 MP, the app scaling the result to the canvas; then MiniMax H3 "new picture" and "edit"; and "Pixel art (RD Flow 64)": Retro Diffusion's 64 × 64 model and node pack, Qwen3-VL 4B writing the long description it wants from the prompt, the sprite scaled up with hard edges and padded, transparent round it) | The user's server and phone |
 
 ## C2. Testing
 
@@ -207,4 +207,5 @@ the same way; a result carries its layer name and offset.
 | 2026-11-26 | Krita's marker nodes, file import and layer nodes, so Krita workflows run as they are |
 | 2026-11-26 | Kept workflows are files in the styles folder's Workflows folder, beside the styles |
 | 2026-11-26 | Parameter values are written into the inputs a Parameter feeds, typed (its node passes switches on as text) |
+| 2026-11-26 | The seed is fitted to each node's own range (wrapping round), as some custom nodes take seeds only up to 2³¹ - 1 |
 | 2026-11-26 | Only the prompt in view; the rest folded under More; starter workflows included (the user: maximum functionality, few options) |

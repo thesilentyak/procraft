@@ -647,7 +647,7 @@ fn workflow_run(
         }
         let seed = request.inputs.seed.wrapping_add(u64::from(i));
         let inputs = WorkflowInputs { seed, ..request.inputs.clone() };
-        let prepared = request.workflow.prepare(&request.params, &inputs)?;
+        let prepared = request.workflow.prepare(&request.params, &inputs, &info)?;
         // each KSampler an equal share of the run's progress (other samplers report as they go)
         let samplers = prepared.graph.nodes_of("KSampler").len().max(1);
         let weights = vec![1.0 / samplers as f64; samplers];

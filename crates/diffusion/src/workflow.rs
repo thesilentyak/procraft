@@ -250,8 +250,14 @@ impl Workflow {
 
     /// The graph to queue for `inputs`: every marker swapped for what the server runs (see the
     /// module's notes). `params` are this workflow's [`parameters`](Self::parameters), for their
-    /// kinds and defaults.
-    pub fn prepare(&self, params: &[Param], inputs: &WorkflowInputs) -> Result<Prepared, Error> {
+    /// kinds and defaults. `info` is the server's `/object_info` (empty if unknown): the seed is
+    /// fitted to each node's range there.
+    pub fn prepare(
+        &self,
+        params: &[Param],
+        inputs: &WorkflowInputs,
+        info: &Map<String, Value>,
+    ) -> Result<Prepared, Error> {
         let mut g = self.graph.clone();
         let canvas_size = (inputs.canvas.width, inputs.canvas.height);
         let selection = inputs.selection.as_deref().filter(|mask| mask.iter().any(|&v| v > 0));
@@ -267,7 +273,10 @@ impl Workflow {
         for node in g.nodes_of(CANVAS) {
             g.relink(&node, 1, &json!(aw));
             g.relink(&node, 2, &json!(ah));
-            g.relink(&node, 3, &json!(inputs.seed));
+            for (consumer, input) in g.consumers(&node, 3) {
+                let spec = g.class(&consumer).and_then(|class| info.get(class)).and_then(|i| input_spec(i, &input));
+                g.set(&consumer, &input, json!(fit_seed(inputs.seed, spec)));
+            }
             if !g.consumers(&node, 4).is_empty() {
                 let loader = g.add("ETN_LoadMaskBase64", [("mask", mask_png()?)]);
                 g.relink(&node, 4, &loader.out(0).into());
@@ -412,6 +421,21 @@ fn text_input(inputs: &Map<String, Value>, key: &str) -> Option<String> {
 /// An input's description in a node's `/object_info`: `[type or list, {options}]`.
 fn input_spec<'a>(info: &'a Value, input: &str) -> Option<&'a Value> {
     info.pointer(&format!("/input/required/{input}")).or_else(|| info.pointer(&format!("/input/optional/{input}")))
+}
+
+/// `seed` within an integer input's range, as `spec` (`[type, {min, max}]`) gives it: a seed past
+/// the end wraps round, so seeds one apart stay apart. Some nodes take seeds only up to 2³¹ - 1.
+fn fit_seed(seed: u64, spec: Option<&Value>) -> u64 {
+    let options = spec.and_then(|s| s.get(1));
+    let bound = |key: &str| options.and_then(|o| o.get(key)).and_then(Value::as_f64);
+    let min = bound("min").map_or(0, |m| m.max(0.0) as u64);
+    match bound("max") {
+        Some(max) if max >= 0.0 && (max as u64) >= min && seed > max as u64 => {
+            let span = (max as u64 - min).saturating_add(1);
+            min + seed % span
+        }
+        _ => seed,
+    }
 }
 
 /// The choices an input offers, required or optional.
@@ -562,7 +586,11 @@ mod tests {
         let w = text_to_image();
         let params = w.parameters(&info());
         let prepared = w
-            .prepare(&params, &inputs(&[("Prompt", ParamValue::Text("koi pond, scenery, no humans".into()))]))
+            .prepare(
+                &params,
+                &inputs(&[("Prompt", ParamValue::Text("koi pond, scenery, no humans".into()))]),
+                &Map::new(),
+            )
             .unwrap();
         let g = &prepared.graph;
         assert!(g.nodes_of(CANVAS).is_empty() && g.nodes_of(OUTPUT).is_empty());
@@ -595,6 +623,7 @@ mod tests {
                     ("Upscale", ParamValue::Toggle(true)),
                     ("Sampler", ParamValue::Text("dpmpp_2m".into())),
                 ]),
+                &Map::new(),
             )
             .unwrap();
         assert_eq!(input(&prepared, "KSampler", "steps"), 12);
@@ -626,7 +655,7 @@ mod tests {
         }
         let mut run = inputs(&[]);
         run.selection = Some(mask);
-        let prepared = w.prepare(&params, &run).unwrap();
+        let prepared = w.prepare(&params, &run, &Map::new()).unwrap();
         assert_eq!(prepared.area, [28, 8, 14, 14]);
         assert_eq!(prepared.outputs, vec![OutputPlace { node: "4".into(), name: String::new(), x: 28, y: 8 }]);
         assert_eq!(input(&prepared, "Inpaint", "w"), 14);
@@ -640,7 +669,7 @@ mod tests {
         let whole = Workflow::parse("Fill", &text.replace("automatic", "entire image")).unwrap();
         let mut run = inputs(&[]);
         run.selection = Some(vec![255; 64 * 48]);
-        assert_eq!(whole.prepare(&params, &run).unwrap().area, [0, 0, 64, 48]);
+        assert_eq!(whole.prepare(&params, &run, &Map::new()).unwrap().area, [0, 0, 64, 48]);
     }
 
     #[test]
@@ -649,7 +678,11 @@ mod tests {
         let params = new_picture.parameters(&Map::new());
         assert_eq!(params, vec![Param { name: "Prompt".into(), kind: ParamKind::Prompt, default: String::new() }]);
         let prepared = new_picture
-            .prepare(&params, &inputs(&[("Prompt", ParamValue::Text("koi pond, scenery, no humans".into()))]))
+            .prepare(
+                &params,
+                &inputs(&[("Prompt", ParamValue::Text("koi pond, scenery, no humans".into()))]),
+                &Map::new(),
+            )
             .unwrap();
         assert_eq!(input(&prepared, "KSampler", "seed"), 7);
         assert_eq!(input(&prepared, "CLIPTextEncode", "text"), "koi pond, scenery, no humans");
@@ -665,7 +698,7 @@ mod tests {
         let mut mask = vec![0u8; 64 * 48];
         mask[20 * 64 + 20] = 255;
         run.selection = Some(mask);
-        let prepared = paint_over.prepare(&params, &run).unwrap();
+        let prepared = paint_over.prepare(&params, &run, &Map::new()).unwrap();
         assert_eq!(input(&prepared, "KSampler", "denoise"), 0.6);
         // the selection's point and its 32 pixels' padding, kept on the canvas
         assert_eq!(prepared.area, [0, 0, 53, 48]);
@@ -678,16 +711,58 @@ mod tests {
         let new_picture = Workflow::parse("New", include_str!("../tests/workflows/minimax-new-picture.json")).unwrap();
         let params = new_picture.parameters(&Map::new());
         assert_eq!(params.len(), 1);
-        let prepared = new_picture.prepare(&params, &inputs(&[("Prompt", ParamValue::Text("a ring".into()))])).unwrap();
+        let prepared = new_picture
+            .prepare(&params, &inputs(&[("Prompt", ParamValue::Text("a ring".into()))]), &Map::new())
+            .unwrap();
         assert_eq!(input(&prepared, "MiniMaxH3ImageConditioning", "prompt"), "a ring");
         assert_eq!(input(&prepared, "KSampler", "seed"), 7);
 
         let edit = Workflow::parse("Edit", include_str!("../tests/workflows/minimax-edit.json")).unwrap();
         let params = edit.parameters(&Map::new());
-        let prepared = edit.prepare(&params, &inputs(&[("Prompt", ParamValue::Text("make it gold".into()))])).unwrap();
+        let prepared = edit
+            .prepare(&params, &inputs(&[("Prompt", ParamValue::Text("make it gold".into()))]), &Map::new())
+            .unwrap();
         assert_eq!(input(&prepared, "StringConcatenate", "string_b"), "make it gold");
         let picture = input(&prepared, "MiniMaxH3ImageConditioning", "images.image_1");
         assert_eq!(prepared.graph.class(picture[0].as_str().unwrap()), Some("ETN_LoadImageBase64"));
+    }
+
+    #[test]
+    fn the_pixel_art_starter_reads_and_prepares() {
+        let w = Workflow::parse("Pixel", include_str!("../tests/workflows/rd-flow-pixel-art.json")).unwrap();
+        let seed = json!(["INT", {"default": 0, "min": 0, "max": 2_147_483_647}]);
+        let background = json!([["transparent", "opaque"], {"default": "transparent"}]);
+        let info = json!({
+            "RDFlow64Generate": {"input": {"required": {"seed": seed, "background": background}}},
+            "RDFlow64SystemPrompt": {"input": {"required": {"seed": seed, "background": background}}},
+            "RDFlow64CleanCaption": {"input": {"required": {"background": background}}},
+        });
+        let info = info.as_object().cloned().unwrap_or_default();
+        let params = w.parameters(&info);
+        let names: Vec<_> = params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Background", "Palette", "Prompt"]);
+        assert_eq!(params[0].kind, ParamKind::Choice(vec!["transparent".into(), "opaque".into()]));
+        let mut run = inputs(&[("Prompt", ParamValue::Text("a red potion".into()))]);
+        run.seed = 5_000_000_007;
+        let prepared = w.prepare(&params, &run, &info).unwrap();
+        assert_eq!(input(&prepared, "RDFlow64SystemPrompt", "request"), "a red potion");
+        assert_eq!(input(&prepared, "RDFlow64Generate", "background"), "transparent");
+        assert_eq!(input(&prepared, "RDFlow64Generate", "palette"), "");
+        // the seed wraps into the nodes' range, and stays as it is where no range is known
+        assert_eq!(input(&prepared, "RDFlow64Generate", "seed"), 5_000_000_007_u64 % 2_147_483_648);
+        assert_eq!(input(&prepared, "ResizeAndPadImage", "target_width"), 64);
+        assert_eq!(prepared.outputs.len(), 1);
+        assert_eq!(prepared.outputs[0].name, "Pixel art");
+    }
+
+    #[test]
+    fn seeds_fit_a_node_s_range() {
+        let spec = json!(["INT", {"min": 10, "max": 19}]);
+        assert_eq!(fit_seed(15, Some(&spec)), 15);
+        assert_eq!(fit_seed(25, Some(&spec)), 15);
+        assert_eq!(fit_seed(26, Some(&spec)), 16);
+        assert_eq!(fit_seed(u64::MAX, None), u64::MAX);
+        assert_eq!(fit_seed(3_000_000_000, Some(&json!(["INT", {"max": 1.8446744073709552e19}]))), 3_000_000_000);
     }
 
     #[test]
@@ -701,7 +776,7 @@ mod tests {
         let w = Workflow::parse("Twice", text).unwrap();
         let params = w.parameters(&Map::new());
         assert_eq!(params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), vec!["Strength", "Strength (2)"]);
-        let prepared = w.prepare(&params, &inputs(&[("Strength (2)", ParamValue::Number(0.25))])).unwrap();
+        let prepared = w.prepare(&params, &inputs(&[("Strength (2)", ParamValue::Number(0.25))]), &Map::new()).unwrap();
         assert_eq!(input(&prepared, "Use", "a"), 0.5);
         assert_eq!(input(&prepared, "Use", "b"), 0.25);
     }

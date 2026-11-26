@@ -117,10 +117,77 @@ def minimax(edit: bool):
     return nodes
 
 
+def rd_flow():
+    """RD Flow 64: 64 x 64 pixel art (Retro Diffusion's node pack, rd-flow-64 in custom_nodes; its
+    weights download on the first run). The model wants a long description, so Qwen3-VL 4B writes
+    one from the prompt with the pack's own instructions. The sprite is scaled up with hard edges and
+    padded to the canvas, transparent round it."""
+    nodes = []
+
+    def node(nid, cls, widgets, links, outputs, widget_links=(), api_widgets=None, title=None, pos=(0, 0)):
+        nodes.append(dict(id=nid, cls=cls, widgets=widgets, links=links, outputs=outputs,
+                          widget_links=set(widget_links), api=api_widgets or {}, title=title, pos=pos))
+
+    node(1, "ETN_KritaCanvas", [], {}, [("image", "IMAGE"), ("width", "INT"), ("height", "INT"), ("seed", "INT"), ("mask", "MASK")],
+         title="Canvas (from the app)", pos=(0, 600))
+    node(2, "ETN_Parameter", ["Prompt", "prompt (positive)", "", -1e10, 1e10], {}, [("value", "*")],
+         api_widgets={"name": "Prompt", "type": "prompt (positive)", "default": "", "min": -1e10, "max": 1e10},
+         title="Prompt (from the app)", pos=(0, 0))
+    node(3, "ETN_Parameter", ["Background", "choice", "transparent", -1e10, 1e10], {}, [("value", "*")],
+         api_widgets={"name": "Background", "type": "choice", "default": "transparent", "min": -1e10, "max": 1e10},
+         title="Background (from the app)", pos=(0, 200))
+    node(4, "ETN_Parameter", ["Palette", "text", "", -1e10, 1e10], {}, [("value", "*")],
+         api_widgets={"name": "Palette", "type": "text", "default": "", "min": -1e10, "max": 1e10},
+         title="Palette: hex colours, or empty (from the app)", pos=(0, 400))
+    node(5, "RDFlow64SystemPrompt", ["", "transparent", 0, ""],
+         {"request": (2, 0), "background": (3, 0), "seed": (1, 3), "palette": (4, 0)},
+         [("system_prompt", "STRING"), ("user_message", "STRING")],
+         widget_links=["request", "background", "seed", "palette"], pos=(380, 0))
+    node(6, "CLIPLoader", ["qwen3vl_4b_fp8_scaled.safetensors", "krea2", "default"], {}, [("CLIP", "CLIP")],
+         api_widgets={"clip_name": "qwen3vl_4b_fp8_scaled.safetensors", "type": "krea2", "device": "default"},
+         pos=(380, 260))
+    node(7, "TextGenerateV2", ["", 700, "on", 0.6, 20, 0.95, 0, 1.05, 0, 0, False, True, "auto"],
+         {"clip": (6, 0), "system_prompt": (5, 0), "prompt": (5, 1)},
+         [("generated_text", "STRING"), ("thinking", "STRING")], widget_links=["prompt"],
+         api_widgets={"max_length": 700, "sampling_mode": "on", "sampling_mode.temperature": 0.6,
+                      "sampling_mode.top_k": 20, "sampling_mode.top_p": 0.95, "sampling_mode.min_p": 0,
+                      "sampling_mode.repetition_penalty": 1.05, "sampling_mode.presence_penalty": 0,
+                      "sampling_mode.seed": 0, "thinking": False, "use_default_template": True, "mtp": "auto"},
+         title="Writes the long description", pos=(760, 0))
+    node(8, "RDFlow64CleanCaption", ["transparent"], {"llm_output": (7, 0), "background": (3, 0)},
+         [("caption", "STRING")], widget_links=["background"], pos=(1140, 0))
+    node(9, "RDFlow64Loader", ["cpu", "auto", "auto", ""], {}, [("rd_flow_64", "RDFLOW64")],
+         api_widgets={"text_device": "cpu", "model_device": "auto", "precision": "auto", "weights_path": ""},
+         title="RD Flow 64 (its prompt reader on the CPU, leaving the GPU to ComfyUI)", pos=(1140, 260))
+    node(10, "RDFlow64Generate", ["", 0, "fixed", 1, "transparent", 16, 4.0, 1, ""],
+         {"rd_flow_64": (9, 0), "caption": (8, 0), "seed": (1, 3), "background": (3, 0), "palette": (4, 0)},
+         [("image", "IMAGE"), ("mask", "MASK"), ("palette", "STRING"), ("rgba", "IMAGE")],
+         widget_links=["caption", "seed", "background", "palette"],
+         api_widgets={"batch_size": 1, "steps": 16, "guidance": 4.0, "scale": 1}, pos=(1500, 0))
+    pad = {"padding_color": "black", "interpolation": "nearest-exact"}
+    node(11, "ResizeAndPadImage", [512, 512, "black", "nearest-exact"],
+         {"image": (10, 0), "target_width": (1, 1), "target_height": (1, 2)}, [("IMAGE", "IMAGE")],
+         widget_links=["target_width", "target_height"], api_widgets=pad, title="Sharp pixels, fitted to the canvas",
+         pos=(1880, 0))
+    node(12, "MaskToImage", [], {"mask": (10, 1)}, [("IMAGE", "IMAGE")], pos=(1880, 260))
+    node(13, "ResizeAndPadImage", [512, 512, "white", "nearest-exact"],
+         {"image": (12, 0), "target_width": (1, 1), "target_height": (1, 2)}, [("IMAGE", "IMAGE")],
+         widget_links=["target_width", "target_height"], api_widgets=dict(pad, padding_color="white"),
+         title="Transparent round it", pos=(2200, 260))
+    node(14, "ImageToMask", ["red"], {"image": (13, 0)}, [("MASK", "MASK")], api_widgets={"channel": "red"},
+         pos=(2520, 260))
+    node(15, "JoinImageWithAlpha", [], {"image": (11, 0), "alpha": (14, 0)}, [("IMAGE", "IMAGE")], pos=(2520, 0))
+    node(16, "ETN_KritaOutput", [0, 0, "Pixel art", "default", False], {"images": (15, 0)}, [],
+         api_widgets={"x": 0, "y": 0, "name": "Pixel art", "batch_mode": "default", "resize_canvas": False},
+         title="Back to the app", pos=(2840, 0))
+    return nodes
+
+
 def widget_inputs(n):
     # the inputs that are widgets given a link
     types = {"text": "STRING", "seed": "INT", "denoise": "FLOAT", "prompt": "STRING", "width": "INT",
-             "height": "INT", "string_b": "STRING"}
+             "height": "INT", "string_b": "STRING", "request": "STRING", "background": "COMBO",
+             "palette": "STRING", "caption": "STRING", "target_width": "INT", "target_height": "INT"}
     return [(w, types.get(w, "*")) for w in n["widget_links"]]
 
 
@@ -189,6 +256,7 @@ if __name__ == "__main__":
         (starter(True), "ProCraft - Z-Image paint over"),
         (minimax(False), "ProCraft - MiniMax new picture"),
         (minimax(True), "ProCraft - MiniMax edit"),
+        (rd_flow(), "ProCraft - Pixel art (RD Flow 64)"),
     ]
     for nodes, name in made:
         json.dump(to_ui(nodes, name), open(f"{where}/{name}.json", "w"), indent=2)
