@@ -135,12 +135,18 @@ impl Workflow {
   a link was).
 - **Krita Selection** → `ETN_LoadMaskBase64` (the mask cut to the node's context and padding);
   `active`, `x`, `y` become values the same way.
-- **Parameter** → its `default` input set to the value (the node then outputs it itself, typed by
-  its `type`), so nothing else in the graph changes.
+- **Parameter** → its value, typed as the parameter's kind (a number, `true`/`false`, text), written
+  straight into every input linked to it; the node is left with nothing to feed and doesn't run.
+  (The add-on's own Parameter node passes a switch on as the text "true", which a BOOLEAN input
+  can't take, so it can't be left to do it.)
 - **Image Layer** → `ETN_LoadImageBase64` + `ETN_LoadMaskBase64` (its alpha); **Mask Layer** →
   `ETN_LoadMaskBase64`.
 - **Krita Output** → `ETN_SendImageWebSocket` (PNG) on the same images input.
-- A node id the app adds never collides: new ids continue after the highest numeric one.
+- A workflow is numbered again from 1 when read (`Graph::from_api`, links renumbered with it), so
+  the nodes the app adds take the next ids and never collide.
+- With a selection and a Krita Selection node not set to "entire image", the workflow's canvas is
+  the selection's bounds plus the node's padding (Canvas's picture, width and height are that
+  part), and results are placed there.
 
 ## B4. Runs with several pictures
 
@@ -178,7 +184,7 @@ the same way; a result carries its layer name and offset.
 
 | | What | Checked by |
 |---|---|---|
-| W1 | `workflow.rs`: parse, parameters, prepare, outputs | Unit tests on fixtures (a Z-Image text-to-image graph, an inpaint graph with Selection, one with each parameter type) |
+| W1 | `workflow.rs`: parse, parameters, prepare, outputs (**built 2026-11-26**) | Unit tests on fixtures (a Z-Image text-to-image graph, an inpaint graph with Selection, one with each parameter type) |
 | W2 | Worker: subscribe, the live workflow, runs with several pictures | Unit tests on recorded socket messages; the user's server |
 | W3 | Core API, kept files, the live workflow kept between starts | Core tests |
 | W4 | Desktop popover | The desktop app on the user's PC |
@@ -200,5 +206,5 @@ the same way; a result carries its layer name and offset.
 | 2026-11-26 | Live link first; saved-workflow list later (proposal) |
 | 2026-11-26 | Krita's marker nodes, file import and layer nodes, so Krita workflows run as they are |
 | 2026-11-26 | Kept workflows are files in the styles folder's Workflows folder, beside the styles |
-| 2026-11-26 | Parameter values are set on the Parameter node itself, not spliced into its consumers |
+| 2026-11-26 | Parameter values are written into the inputs a Parameter feeds, typed (its node passes switches on as text) |
 | 2026-11-26 | Only the prompt in view; the rest folded under More; starter workflows included (the user: maximum functionality, few options) |

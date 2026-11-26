@@ -26,6 +26,7 @@ pub mod style_edit;
 pub mod styles;
 pub mod tags;
 mod worker;
+pub mod workflow;
 
 pub use comfy::{Address, Comfy, ServerModels, SystemStats};
 pub use error::Error;
@@ -38,3 +39,4 @@ pub use request::{Control, ControlKind, ControlStep, Request, Selection, Selecti
 pub use requirements::{Feature, Missing, Readiness};
 pub use styles::{Kind as StyleKind, LoraUse, Style, StyleFile, StyleSettings, styles_for};
 pub use worker::{Connection, Extraction, RunId, RunResult, RunState, ServerState, Worker};
+pub use workflow::{OutputPlace, Param, ParamKind, ParamValue, Prepared, Workflow, WorkflowInputs};

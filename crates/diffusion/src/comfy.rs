@@ -255,7 +255,7 @@ fn read_json(mut answer: ureq::http::Response<ureq::Body>) -> Result<Value, Erro
 
 /// The choices a loader's input offers: `[[a, b, ...]]` in older servers, `["COMBO", {"options":
 /// [...]}]` in newer ones.
-fn input_choices(info: &Value, input: &str) -> Vec<String> {
+pub(crate) fn input_choices(info: &Value, input: &str) -> Vec<String> {
     let Some(spec) = info.pointer(&format!("/input/required/{input}")) else { return Vec::new() };
     let list = match spec.get(0) {
         Some(Value::Array(list)) => Some(list),
