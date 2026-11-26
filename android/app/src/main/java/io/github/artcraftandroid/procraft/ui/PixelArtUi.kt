@@ -136,7 +136,7 @@ fun PixelContiguous(vm: io.github.artcraftandroid.procraft.canvas.CanvasViewMode
         Modifier.height(20.dp).clip(RoundedCornerShape(10.dp))
             .background(if (on) blue else androidx.compose.ui.graphics.Color.Transparent)
             .then(if (on) Modifier else Modifier.border(1.dp, ink, RoundedCornerShape(10.dp)))
-            .clickable { vm.setPixelContiguous(!on) }
+            .clickable { vm.choosePixelContiguous(!on) }
             .padding(horizontal = 10.dp),
         contentAlignment = Alignment.Center,
     ) {

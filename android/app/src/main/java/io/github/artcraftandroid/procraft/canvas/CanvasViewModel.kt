@@ -8929,7 +8929,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         private set
 
     /** Turns [pixelContiguous] on or off, for the fills from now on. */
-    fun setPixelContiguous(on: Boolean) {
+    fun choosePixelContiguous(on: Boolean) {
         pixelContiguous = on
         session?.setPixelFillContiguous(on)
     }
