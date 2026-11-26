@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
@@ -148,11 +149,15 @@ fun PixelContiguous(vm: io.github.artcraftandroid.procraft.canvas.CanvasViewMode
     }
 }
 
+/** Whether the screen is upright (portrait): the palette then unfolds under the top bar, else beside the side bar. */
+@Composable
+private fun upright(): Boolean =
+    androidx.compose.ui.platform.LocalConfiguration.current.orientation != android.content.res.Configuration.ORIENTATION_LANDSCAPE
+
 /**
  * The side bar with, on a pixel art canvas, its palette square under it: tapped, the palette
- * unfolds beside the bar (toward the canvas, [right] for a right-handed bar), a column of swatches
- * to paint with, + adding the current colour and ⋯ offering Paste hex codes, From the picture and
- * Clear. Elsewhere it is the side bar alone.
+ * unfolds, beside the bar (toward the canvas, [right] for a right-handed bar) with the screen on its
+ * side, or under the top bar with it upright ([PaletteBand]). Elsewhere it is the side bar alone.
  */
 @Composable
 fun SideBarWithPalette(vm: io.github.artcraftandroid.procraft.canvas.CanvasViewModel, right: Boolean, sideBar: @Composable () -> Unit) {
@@ -160,15 +165,46 @@ fun SideBarWithPalette(vm: io.github.artcraftandroid.procraft.canvas.CanvasViewM
         sideBar()
         return
     }
+    val beside = vm.paletteOpen && !upright()
     androidx.compose.foundation.layout.Row(verticalAlignment = Alignment.Top) {
-        if (right && vm.paletteOpen) PaletteStrip(vm, Modifier.padding(end = 8.dp))
+        if (right && beside) PaletteStrip(vm, Modifier.padding(end = 8.dp))
         Column(horizontalAlignment = if (right) Alignment.End else Alignment.Start) {
             sideBar()
             PaletteSquare(vm, Modifier.padding(top = 8.dp, start = if (right) 0.dp else 5.dp, end = if (right) 5.dp else 0.dp))
         }
-        if (!right && vm.paletteOpen) PaletteStrip(vm, Modifier.padding(start = 8.dp))
+        if (!right && beside) PaletteStrip(vm, Modifier.padding(start = 8.dp))
     }
 }
+
+/**
+ * The palette unfolded under the top bar with the screen upright: two rows of swatches across the
+ * screen, scrolling sideways, then + and ⋯, so it covers the canvas no more than it must.
+ */
+@Composable
+fun PaletteBand(vm: io.github.artcraftandroid.procraft.canvas.CanvasViewModel) {
+    if (!vm.pixelArtOpen || !vm.paletteOpen || vm.barsHidden || !upright()) return
+    val current = vm.colorRgb()
+    Row(
+        Modifier.offset(y = Pc.barShown).fillMaxWidth().background(Pc.SideBar).padding(horizontal = 8.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        androidx.compose.foundation.lazy.grid.LazyHorizontalGrid(
+            rows = androidx.compose.foundation.lazy.grid.GridCells.Fixed(2),
+            modifier = Modifier.weight(1f).height(SwatchSide * 2 + SwatchGap),
+            horizontalArrangement = Arrangement.spacedBy(SwatchGap),
+            verticalArrangement = Arrangement.spacedBy(SwatchGap),
+        ) {
+            items(vm.pixelPalette.size) { i -> vm.pixelPalette.getOrNull(i)?.let { PaletteSwatch(vm, it, current) } }
+        }
+        Column(Modifier.padding(start = 8.dp), verticalArrangement = Arrangement.spacedBy(SwatchGap)) {
+            PaletteButtons(vm, current)
+        }
+    }
+}
+
+/** A palette swatch's side and the gap between swatches. */
+private val SwatchSide = 31.dp
+private val SwatchGap = 6.dp
 
 /** The palette's square under the side bar: its first four colours; a tap unfolds or folds the palette. */
 @Composable
@@ -195,60 +231,66 @@ private fun PaletteSquare(vm: io.github.artcraftandroid.procraft.canvas.CanvasVi
     }
 }
 
-/** The palette unfolded: two columns of swatches (the current colour ringed), scrolling, then + and ⋯. */
+/** The palette unfolded beside the side bar: two columns of swatches, scrolling, then + and ⋯. */
 @Composable
 private fun PaletteStrip(vm: io.github.artcraftandroid.procraft.canvas.CanvasViewModel, modifier: Modifier) {
     val current = vm.colorRgb()
-    var menu by remember { mutableStateOf(false) }
-    var held by remember { mutableStateOf<Int?>(null) }
     Column(
-        modifier.width(80.dp).heightIn(max = Pc.SideBarHeight + 48.dp).clip(RoundedCornerShape(14.dp)).background(Pc.SideBar).padding(6.dp),
+        modifier.width(SwatchSide * 2 + SwatchGap + 12.dp).heightIn(max = Pc.SideBarHeight + 48.dp).clip(RoundedCornerShape(14.dp))
+            .background(Pc.SideBar).padding(6.dp),
     ) {
         val rows = vm.pixelPalette.chunked(2)
-        androidx.compose.foundation.lazy.LazyColumn(Modifier.weight(1f, fill = false), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        androidx.compose.foundation.lazy.LazyColumn(Modifier.weight(1f, fill = false), verticalArrangement = Arrangement.spacedBy(SwatchGap)) {
             items(rows.size) { r ->
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    rows[r].forEach { c ->
-                        Box {
-                            Swatch(c, chosen = c == current, onTap = { vm.setRgb(c) }, onHold = { held = c })
-                            androidx.compose.material3.DropdownMenu(expanded = held == c, onDismissRequest = { held = null }) {
-                                androidx.compose.material3.DropdownMenuItem(text = { Text("Remove") }, onClick = {
-                                    held = null
-                                    vm.choosePixelPalette(vm.pixelPalette - c)
-                                })
-                            }
-                        }
-                    }
+                Row(horizontalArrangement = Arrangement.spacedBy(SwatchGap)) {
+                    rows[r].forEach { PaletteSwatch(vm, it, current) }
                 }
             }
         }
-        Row(Modifier.padding(top = 6.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            StripButton("+") { vm.choosePixelPalette(vm.pixelPalette + current) }
-            Box {
-                StripButton("⋯") { menu = true }
-                androidx.compose.material3.DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                    androidx.compose.material3.DropdownMenuItem(text = { Text("Paste hex codes") }, onClick = { menu = false; vm.pastePixelPalette() })
-                    androidx.compose.material3.DropdownMenuItem(text = { Text("From the picture") }, onClick = { menu = false; vm.pixelPaletteFromPicture() })
-                    androidx.compose.material3.DropdownMenuItem(text = { Text("Clear") }, onClick = { menu = false; vm.choosePixelPalette(emptyList()) })
-                }
-            }
+        Row(Modifier.padding(top = SwatchGap), horizontalArrangement = Arrangement.spacedBy(SwatchGap)) {
+            PaletteButtons(vm, current)
+        }
+    }
+}
+
+/** A swatch of the palette: tapped, its colour is painted with; held, it offers Remove. */
+@Composable
+private fun PaletteSwatch(vm: io.github.artcraftandroid.procraft.canvas.CanvasViewModel, colour: Int, current: Int) {
+    var held by remember { mutableStateOf(false) }
+    Box {
+        Box(
+            Modifier.size(SwatchSide).clip(RoundedCornerShape(6.dp))
+                .background(androidx.compose.ui.graphics.Color(0xFF000000.toInt() or colour))
+                .then(if (colour == current) Modifier.border(2.dp, androidx.compose.ui.graphics.Color.White, RoundedCornerShape(6.dp)) else Modifier)
+                .pointerInput(colour) { detectTapGestures(onTap = { vm.setRgb(colour) }, onLongPress = { held = true }) },
+        )
+        androidx.compose.material3.DropdownMenu(expanded = held, onDismissRequest = { held = false }) {
+            androidx.compose.material3.DropdownMenuItem(text = { Text("Remove") }, onClick = {
+                held = false
+                vm.choosePixelPalette(vm.pixelPalette - colour)
+            })
+        }
+    }
+}
+
+/** + (the current colour added) and ⋯ (Paste hex codes, From the picture, Clear). */
+@Composable
+private fun PaletteButtons(vm: io.github.artcraftandroid.procraft.canvas.CanvasViewModel, current: Int) {
+    var menu by remember { mutableStateOf(false) }
+    StripButton("+") { vm.choosePixelPalette(vm.pixelPalette + current) }
+    Box {
+        StripButton("⋯") { menu = true }
+        androidx.compose.material3.DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+            androidx.compose.material3.DropdownMenuItem(text = { Text("Paste hex codes") }, onClick = { menu = false; vm.pastePixelPalette() })
+            androidx.compose.material3.DropdownMenuItem(text = { Text("From the picture") }, onClick = { menu = false; vm.pixelPaletteFromPicture() })
+            androidx.compose.material3.DropdownMenuItem(text = { Text("Clear") }, onClick = { menu = false; vm.choosePixelPalette(emptyList()) })
         }
     }
 }
 
 @Composable
-private fun Swatch(colour: Int, chosen: Boolean, onTap: () -> Unit, onHold: () -> Unit) {
-    Box(
-        Modifier.size(31.dp).clip(RoundedCornerShape(6.dp))
-            .background(androidx.compose.ui.graphics.Color(0xFF000000.toInt() or colour))
-            .then(if (chosen) Modifier.border(2.dp, androidx.compose.ui.graphics.Color.White, RoundedCornerShape(6.dp)) else Modifier)
-            .pointerInput(colour) { detectTapGestures(onTap = { onTap() }, onLongPress = { onHold() }) },
-    )
-}
-
-@Composable
 private fun StripButton(label: String, onClick: () -> Unit) {
-    Box(Modifier.size(31.dp).clip(RoundedCornerShape(6.dp)).background(Pc.SideGlyph.copy(alpha = 0.18f)).clickable(onClick = onClick), contentAlignment = Alignment.Center) {
+    Box(Modifier.size(SwatchSide).clip(RoundedCornerShape(6.dp)).background(Pc.SideGlyph.copy(alpha = 0.18f)).clickable(onClick = onClick), contentAlignment = Alignment.Center) {
         Text(label, color = Pc.SideGlyph, fontSize = 18.sp, maxLines = 1)
     }
 }
