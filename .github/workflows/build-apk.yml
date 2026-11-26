@@ -57,7 +57,7 @@ jobs:
         run: |
           ./gradlew --no-daemon :app:assembleRelease -Pprocraft.abis=arm64-v8a || {
             sleep 60
-            ./gradlew --no-daemon :app:assembleRelease -Pprocraft.abis=arm64-v8a
+            ./gradlew --no-daemon --refresh-dependencies :app:assembleRelease -Pprocraft.abis=arm64-v8a
           }
       - uses: actions/upload-artifact@v4
         with:
