@@ -30,6 +30,75 @@ pub const DRAG_IMAGE_FORMATS: [&str; 3] = ["JPEG", "PNG", "TIFF"];
 pub const RAPID_UNDO_MIN_S: f32 = 0.1;
 pub const RAPID_UNDO_MAX_S: f32 = 1.5;
 
+/// The most recent prompts the Generate popover keeps.
+const MOST_RECENT: usize = 20;
+
+/// The recent prompts as the Generate popover last saw them, kept for [`Prefs::keep`]: the app's
+/// one generation object is the authority while it runs, and [`Prefs::kept`] fills this in first.
+#[cfg(feature = "generation")]
+static GENERATION_RECENT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Sets the recent prompts to keep; whether they changed.
+#[cfg(feature = "generation")]
+pub fn set_generation_recent(prompts: Vec<String>) -> bool {
+    let mut recent = match GENERATION_RECENT.lock() {
+        Ok(recent) => recent,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if *recent == prompts {
+        false
+    } else {
+        *recent = prompts;
+        true
+    }
+}
+
+/// The recent prompts to keep.
+#[cfg(feature = "generation")]
+pub fn generation_recent() -> Vec<String> {
+    match GENERATION_RECENT.lock() {
+        Ok(recent) => recent.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+/// A prompt as one preference line: newlines and backslashes escaped.
+fn escape(prompt: &str) -> String {
+    let mut text = String::with_capacity(prompt.len());
+    for c in prompt.chars() {
+        match c {
+            '\\' => text.push_str("\\\\"),
+            '\n' => text.push_str("\\n"),
+            '\r' => text.push_str("\\r"),
+            _ => text.push(c),
+        }
+    }
+    text
+}
+
+/// A [`escape`]d prompt back.
+fn unescape(text: &str) -> String {
+    let mut prompt = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            prompt.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => prompt.push('\n'),
+            Some('r') => prompt.push('\r'),
+            Some('\\') => prompt.push('\\'),
+            Some(other) => {
+                prompt.push('\\');
+                prompt.push(other);
+            }
+            None => prompt.push('\\'),
+        }
+    }
+    prompt
+}
+
 #[derive(Clone, Debug)]
 pub struct Prefs {
     /// Panels and bars light grey with dark text.
@@ -88,6 +157,22 @@ pub struct Prefs {
     pub drag_image_format: usize,
     /// Recolor's Flood, kept from one time to the next.
     pub recolor_threshold: f32,
+    /// Image generation's server, as `host:port` (empty: none), NSFW allowed, the resolution
+    /// choice (Draft, Normal, Quality) and the largest picture in megapixels (0: from the GPU).
+    pub generation_address: String,
+    pub generation_nsfw: bool,
+    pub generation_resolution: usize,
+    pub generation_largest: f32,
+    /// The recent prompts the Generate popover offers when its field is empty, newest first.
+    pub generation_recent: Vec<String>,
+    /// The styles folder chosen in Generate's server view (empty: the app's own) and the Style
+    /// Studio's preview prompt (empty: its safe scene).
+    pub generation_styles_folder: String,
+    pub generation_preview: String,
+    /// The Generate popover as it was left: its prompt, style and how many pictures.
+    pub generation_prompt: String,
+    pub generation_style: String,
+    pub generation_count: u32,
 }
 
 impl Default for Prefs {
@@ -126,6 +211,16 @@ impl Default for Prefs {
             drag_format: 0,
             drag_image_format: 0,
             recolor_threshold: 0.0,
+            generation_address: String::new(),
+            generation_nsfw: false,
+            generation_resolution: 2,
+            generation_largest: 0.0,
+            generation_recent: Vec::new(),
+            generation_styles_folder: String::new(),
+            generation_preview: String::new(),
+            generation_prompt: String::new(),
+            generation_style: String::new(),
+            generation_count: 1,
         }
     }
 }
@@ -188,6 +283,29 @@ impl Prefs {
                     p.drag_image_format = value.parse::<usize>().map_or(0, |t| t.min(DRAG_IMAGE_FORMATS.len() - 1))
                 }
                 "recolor_threshold" => p.recolor_threshold = unit.unwrap_or(0.0),
+                "generation_address" => p.generation_address = value.trim().to_owned(),
+                "generation_nsfw" => p.generation_nsfw = on,
+                "generation_resolution" => {
+                    p.generation_resolution = value.parse::<usize>().map_or(2, |r| r.min(2));
+                }
+                "generation_largest" => {
+                    p.generation_largest = number.map_or(0.0, |v| if v <= 0.0 { 0.0 } else { v.clamp(1.0, 16.0) });
+                }
+                "generation_styles_folder" => p.generation_styles_folder = value.trim().to_owned(),
+                "generation_preview" => p.generation_preview = unescape(value).trim().to_owned(),
+                "generation_prompt" => p.generation_prompt = unescape(value),
+                "generation_style" => p.generation_style = value.trim().to_owned(),
+                "generation_count" => p.generation_count = value.trim().parse::<u32>().map_or(1, |c| c.clamp(1, 4)),
+                "generation_recent" => {
+                    let prompt = unescape(value);
+                    let prompt = prompt.trim();
+                    if !prompt.is_empty()
+                        && p.generation_recent.len() < MOST_RECENT
+                        && !p.generation_recent.iter().any(|kept| kept == prompt)
+                    {
+                        p.generation_recent.push(prompt.to_owned());
+                    }
+                }
                 "actions_tab" => p.actions_tab = value.parse::<usize>().map_or(0, |t| t.min(5)),
                 "curve" => {
                     let numbers: Vec<f32> = value.split(',').filter_map(|v| v.parse().ok()).collect();
@@ -201,6 +319,8 @@ impl Prefs {
         }
         // the interface shows as it was left
         crate::look::set_light(p.light_interface);
+        #[cfg(feature = "generation")]
+        set_generation_recent(p.generation_recent.clone());
         p
     }
 
@@ -239,9 +359,27 @@ impl Prefs {
             format!("drag_format {}", self.drag_format),
             format!("drag_image_format {}", self.drag_image_format),
             format!("recolor_threshold {}", self.recolor_threshold),
+            format!("generation_address {}", self.generation_address),
+            format!("generation_nsfw {}", self.generation_nsfw),
+            format!("generation_resolution {}", self.generation_resolution),
+            format!("generation_largest {}", self.generation_largest),
+            format!("generation_styles_folder {}", self.generation_styles_folder),
+            format!("generation_preview {}", escape(&self.generation_preview)),
+            format!("generation_prompt {}", escape(&self.generation_prompt)),
+            format!("generation_style {}", self.generation_style),
+            format!("generation_count {}", self.generation_count),
         ];
-        let lines: Vec<String> = lines.into_iter().chain(self.plugins.kept_lines()).collect();
-        crate::files::keep_text("interface", &(lines.join("\n") + "\n"));
+        let mut text = lines.into_iter().chain(self.plugins.kept_lines()).collect::<Vec<String>>().join("\n");
+        #[cfg(feature = "generation")]
+        let recent = generation_recent();
+        #[cfg(not(feature = "generation"))]
+        let recent = self.generation_recent.clone();
+        for prompt in recent.iter().take(MOST_RECENT) {
+            text.push_str("\ngeneration_recent ");
+            text.push_str(&escape(prompt));
+        }
+        text.push('\n');
+        crate::files::keep_text("interface", &text);
     }
 
     /// The artwork follows them.

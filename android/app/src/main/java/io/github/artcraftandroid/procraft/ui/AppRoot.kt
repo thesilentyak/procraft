@@ -203,9 +203,10 @@ fun AppRoot(vm: CanvasViewModel) {
                         }
                         Panel.ACTIONS -> 390.dp to 0
                         Panel.ADJUSTMENTS -> 330.dp to 1
+                        Panel.GENERATE -> 400.dp to 4
                         Panel.NONE -> 0.dp to 0
                     }
-                    val fromLeft = shown == Panel.ACTIONS || shown == Panel.ADJUSTMENTS
+                    val fromLeft = shown == Panel.ACTIONS || shown == Panel.ADJUSTMENTS || shown == Panel.GENERATE
                     val buttonX = if (fromLeft) Pc.actionCentre(button, maxWidth) else maxWidth - Pc.toolCentreFromRight(button, maxWidth)
                     // panels keep clear of the side bar, on whichever side it is
                     val clear = if (vm.showSideBar) Pc.SideBarWidth + Pc.PopoverGap else Pc.PopoverGap
@@ -233,12 +234,17 @@ fun AppRoot(vm: CanvasViewModel) {
                             // ending 25 above the screen's edge, their rows scrolling (as measured)
                             Panel.ACTIONS -> ActionsPanel(vm, place.arrowX, at.heightIn(max = maxHeight - Pc.BarHeight - 25.dp))
                             Panel.ADJUSTMENTS -> AdjustmentsPanel(vm, place.arrowX, at.heightIn(max = maxHeight - Pc.BarHeight - 25.dp))
+                            Panel.GENERATE -> io.github.artcraftandroid.procraft.generation.GenerationUi.Panel(vm, place.arrowX, at.heightIn(max = maxHeight - Pc.BarHeight - 25.dp))
                             Panel.NONE -> Unit
                         }
                     }
                 }
                 // the colour panel dragged out by its grabber: a window over the canvas until closed
                 FloatingColors(vm, maxWidth, maxHeight)
+                // image generation's results tray, out of the way of the modes' own bars
+                if (!vm.transforming && !vm.selecting && vm.adjustment == null && !vm.barsHidden) {
+                    io.github.artcraftandroid.procraft.generation.GenerationUi.ResultsTray(vm, Modifier.align(Alignment.BottomCenter))
+                }
                 if (vm.transforming && !vm.barsHidden) {
                     TransformPopover(vm, maxWidth, maxHeight)
                     TransformNumeric(vm)
@@ -358,6 +364,7 @@ fun AppRoot(vm: CanvasViewModel) {
                 GuideEditor(vm)
                 LightingStudio(vm)
                 BrushStudio(vm)
+                io.github.artcraftandroid.procraft.generation.GenerationUi.StyleStudio(vm)
                 PadMenu(vm, maxWidth)
                 // a colour dragged out goes over everything
                 DropDot(vm)

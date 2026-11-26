@@ -14,7 +14,8 @@ use std::time::Instant;
 use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat, TextWrapping};
 use egui::{Align2, Color32, Pos2, Rect, ScrollArea, Sense, TextureHandle, TextureOptions, Ui, UiBuilder, pos2, vec2};
 use procraft_core::{
-    BlendModeInfo, CanvasSession, LayerInfo, LayerOption, LayerOptionRow, LayerType, ModelInfo, ThumbnailImage,
+    BlendModeInfo, CanvasSession, LayerControl, LayerInfo, LayerOption, LayerOptionRow, LayerType, ModelInfo,
+    ThumbnailImage,
 };
 use resvg::tiny_skia;
 
@@ -137,6 +138,12 @@ pub struct Layers {
     /// The current layer's options: whose (kept while they fade), and their coming and going.
     options: Option<u64>,
     options_menu: Menu,
+    /// The control layer choices (None, Line art, Scribble): whose, where from, and their coming
+    /// and going.
+    control_for: Option<u64>,
+    control_rect: Option<Rect>,
+    control_pending: bool,
+    control_menu: Menu,
     /// The title's menu, and Delete's question.
     title_menu: Menu,
     /// The +'s menu, while plugins add kinds of layer: a plain layer or one of each kind.
@@ -270,6 +277,9 @@ impl Layers {
         self.thumbnails.clear();
         self.options = None;
         self.options_menu.close();
+        self.control_menu.close();
+        self.control_for = None;
+        self.control_pending = false;
         self.title_menu.close();
         self.add_menu.close();
         self.renaming = None;
@@ -571,16 +581,22 @@ impl Layers {
             } else if any_picked || !l.current {
                 session.select_layer(l.id);
                 self.options_menu.close();
+                self.control_menu.close();
+                self.control_for = None;
             } else if self.options_menu.is_open() {
                 self.options_menu.close();
             } else {
                 self.options = Some(l.id);
                 self.options_menu.open();
+                self.control_menu.close();
+                self.control_for = None;
                 self.blend = None;
             }
         }
         if let Some(id) = blend_tapped {
             self.options_menu.close();
+            self.control_menu.close();
+            self.control_for = None;
             let open = self.blend.as_ref().is_some_and(|b| b.id == id);
             self.blend = (!open).then(|| {
                 let at = layers
@@ -594,6 +610,7 @@ impl Layers {
             let row_y = row_rects.get(&l.id).map_or(rect.center().y, |r| r.center().y);
             self.layer_options(ctx, look, session, l, rect, row_y, backdrops);
         }
+        self.control_options(ctx, look, session, backdrops);
         self.title_menu(ctx, look, session, title, any_picked, backdrops);
         self.add_menu(ctx, look, session, plus, backdrops);
         // the title menu's Delete asks first
@@ -1394,6 +1411,11 @@ impl Layers {
             LayerOption::ClippingMask => _ = session.set_layer_clipped(l.id, !l.clipped),
             LayerOption::DrawingAssist => _ = session.set_guide_assisted(!l.assisted),
             LayerOption::Reference => _ = session.set_layer_reference(l.id, !l.reference),
+            LayerOption::ControlLayer => {
+                self.control_for = Some(l.id);
+                self.control_rect = Some(rect);
+                self.control_pending = true;
+            }
             LayerOption::EditText => self.edit_text = Some(l.id),
             LayerOption::Rasterize => {
                 session.rasterize_layer(l.id);
@@ -1409,6 +1431,67 @@ impl Layers {
             LayerOption::CombineDown => _ = session.combine_down(l.id),
             LayerOption::MergeMask => _ = session.merge_mask(l.id),
         }
+    }
+
+    /// The Control layer choices, beside the options: None, Line art, Scribble. Chosen, layer `id`
+    /// guides generation as that (or no longer does).
+    fn control_options(
+        &mut self,
+        ctx: &egui::Context,
+        look: &mut Look,
+        session: &CanvasSession,
+        backdrops: &mut Vec<f32>,
+    ) {
+        if self.control_pending {
+            self.control_pending = false;
+            if self.control_for.is_some() {
+                self.control_menu.open();
+            }
+        }
+        if !self.control_menu.is_open() {
+            self.control_for = None;
+            return;
+        }
+        let Some(id) = self.control_for else { return };
+        let Some(from) = self.control_rect else { return };
+        let Some(l) = session.layers().into_iter().find(|l| l.id == id) else {
+            self.control_for = None;
+            return;
+        };
+        let choices = [
+            (None, "None"),
+            (Some(LayerControl::LineArt), "Line art"),
+            (Some(LayerControl::Scribble), "Scribble"),
+            (Some(LayerControl::Depth), "Depth"),
+        ];
+        let size = vec2(238.0, 7.0 * 2.0 + menu::OPTION_HEIGHT * choices.len() as f32);
+        let screen = ctx.content_rect();
+        let left = (from.left() - size.x - 6.0)
+            .clamp(screen.left() + 6.0, (screen.right() - size.x - 6.0).max(screen.left() + 6.0));
+        let top =
+            from.top().clamp(screen.top() + OPTIONS_TOP, (screen.bottom() - size.y).max(screen.top() + OPTIONS_TOP));
+        let rect = Rect::from_min_size(pos2(left, top), size);
+        let mut chosen = None;
+        self.control_menu.show(
+            ctx,
+            "control layer options",
+            rect,
+            pos2(rect.right(), rect.center().y),
+            menu::FROSTED,
+            backdrops,
+            |ui| {
+                let places = menu::option_rows(rect.left(), rect.top() + 7.0, rect.width(), choices.len());
+                for (row, (kind, label)) in places.zip(choices) {
+                    if menu::option(ui, look, row, label, l.control == kind, true, false) {
+                        chosen = Some(kind);
+                    }
+                }
+            },
+        );
+        let Some(kind) = chosen else { return };
+        self.control_menu.close();
+        self.control_for = None;
+        session.set_layer_control(id, kind);
     }
 
     /// The blend editor under a layer's row: its opacity, read and slid, then its blend modes, the
@@ -1566,7 +1649,7 @@ impl Layers {
         let name_right = match cube {
             Some((c, _)) => c.center().x - 6.0 - 10.0,
             None if mask => visibility.left() - 36.0,
-            None => blend.left() - 8.0,
+            None => blend.left() - 8.0 - if l.control.is_some() { 20.0 } else { 0.0 },
         };
         // what the layer is, under its name (which stays in the middle): a reference layer, one
         // drawing assist is on for, a private one, a model's layer its texture set's meshes share
@@ -1597,6 +1680,9 @@ impl Layers {
             }
         }
         if !mask {
+            if let Some(kind) = l.control {
+                control_badge(ui.painter(), pos2(blend.left() - 10.0, row.center().y), kind, ink);
+            }
             // a locked layer's mode is greyed
             let letter = if l.locked && !l.current && !l.picked { argb(LOCKED_LETTER) } else { ink };
             let code = blend_code(modes, l.blend);
@@ -1789,6 +1875,34 @@ fn set_header(ui: &mut Ui, name: &str, first: bool) {
     let ink = argb(PANEL_TITLE);
     let g = galley(ui, name, 14.0, Weight::SemiBold, ink, row.width() - 32.0);
     ui.painter().galley(row.min + vec2(16.0, 12.0), g, ink);
+}
+
+/// A control layer's badge, left of its blend letter: a pair of clean strokes for line art, a
+/// loose zigzag for scribble, three level lines each shorter than the one below for depth (ground
+/// going into the distance).
+fn control_badge(painter: &egui::Painter, at: Pos2, kind: LayerControl, ink: Color32) {
+    let stroke = egui::Stroke::new(1.6, ink);
+    match kind {
+        LayerControl::LineArt => {
+            painter.line_segment([pos2(at.x - 6.0, at.y + 5.0), pos2(at.x + 2.0, at.y - 6.0)], stroke);
+            painter.line_segment([pos2(at.x - 2.0, at.y + 6.0), pos2(at.x + 6.0, at.y - 3.0)], stroke);
+        }
+        LayerControl::Scribble => {
+            let points = (0..=6)
+                .map(|i| {
+                    let x = at.x - 6.0 + i as f32 * 2.0;
+                    let y = at.y + if i % 2 == 0 { -4.0 } else { 4.0 };
+                    pos2(x, y)
+                })
+                .collect();
+            painter.add(egui::Shape::line(points, stroke));
+        }
+        LayerControl::Depth => {
+            for (half, y) in [(6.0, 5.0), (4.0, 0.0), (2.0, -5.0)] {
+                painter.line_segment([pos2(at.x - half, at.y + y), pos2(at.x + half, at.y + y)], stroke);
+            }
+        }
+    }
 }
 
 /// `texture` fitted in `rect`, centred.

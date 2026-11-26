@@ -47,6 +47,8 @@ import kotlin.math.roundToInt
 private val SelectionButtonRoomy = 83.dp
 private val SelectionIcon = 44.dp
 private val SelectionPill = 524.dp
+/** Its buttons: eight, and Generate when the app has it. */
+private val SelectionButtons = 8 + if (io.github.artcraftandroid.procraft.generation.GenerationUi.enabled) 1 else 0
 private val FeatherWidth = 250.dp
 private val StartDot = Color(0xFFC7C7C7)
 private val SavedThumb = Color(0xFF000000)
@@ -57,7 +59,7 @@ fun SelectionToolbar(vm: CanvasViewModel, screenWidth: Dp, modifier: Modifier = 
     val has = vm.hasSelection
     val drawing = vm.freehand.isNotEmpty()
     FloatingToolbar(
-        toolbarLayout(screenWidth, 8, SelectionButtonRoomy, SelectionIcon, SelectionPill),
+        toolbarLayout(screenWidth, SelectionButtons, SelectionButtonRoomy, SelectionIcon, SelectionPill),
         onBackground = { vm.selectionPopup = SelectionPopup.NONE },
         modifier = modifier,
         segments = {
@@ -92,6 +94,7 @@ fun SelectionToolbar(vm: CanvasViewModel, screenWidth: Dp, modifier: Modifier = 
         ToolbarButton(PcIcons.ColorFill, "Color Fill", active = vm.colorFill, width = w, iconSize = 37.dp) { vm.toggleColorFill() }
         // on a model: a selection reaches every surface under it
         if (vm.modelOpen) ToolbarButton(PcIcons.XRay, "X-Ray", active = vm.selectionXRay, width = w, iconSize = 44.dp) { vm.toggleSelectionXRay() }
+        io.github.artcraftandroid.procraft.generation.GenerationUi.SelectionButton(vm, w)
         ToolbarButton(PcIcons.ClearSelection, "Clear", enabled = has || drawing, width = w, iconSize = 44.dp) { vm.clearSelection() }
     }
 }
@@ -102,7 +105,7 @@ fun SelectionPopover(vm: CanvasViewModel, screenWidth: Dp, screenHeight: Dp) {
     val popup = vm.selectionPopup
     if (popup == SelectionPopup.NONE) return
     val width = if (popup == SelectionPopup.FEATHER) FeatherWidth else MenuWidth
-    val layout = toolbarLayout(screenWidth, 8, SelectionButtonRoomy, SelectionIcon, SelectionPill)
+    val layout = toolbarLayout(screenWidth, SelectionButtons, SelectionButtonRoomy, SelectionIcon, SelectionPill)
     val centre = toolbarButtonCentre(screenWidth, layout, if (popup == SelectionPopup.FEATHER) 4 else 5, 8)
     val left = (centre - width / 2).coerceIn(0.dp, screenWidth - width)
     MenuPopover(centre - left, left, toolbarButtonsTop(screenHeight), width) {

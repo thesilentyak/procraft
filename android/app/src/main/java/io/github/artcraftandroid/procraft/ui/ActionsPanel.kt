@@ -305,6 +305,11 @@ fun ActionsPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier)
                 Act("Pressure and Smoothing") { page = ActionsPage.PRESSURE },
                 Act("Gesture controls") { vm.gestureControlsOpen = true },
                 Act("Plugins") { page = ActionsPage.PLUGINS },
+            ) + listOfNotNull(
+                Act("Image generation") {
+                    io.github.artcraftandroid.procraft.generation.GenerationUi.openServer()
+                    vm.toggle(io.github.artcraftandroid.procraft.canvas.Panel.GENERATE)
+                }.takeIf { io.github.artcraftandroid.procraft.generation.GenerationUi.enabled },
             ),
             listOf(
                 Slide(

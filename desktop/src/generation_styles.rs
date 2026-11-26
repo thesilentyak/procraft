@@ -1,0 +1,287 @@
+//! The person's styles on the desktop: their folder (beside `brushes/` in the app's data folder),
+//! read again every little while the Generate popover is open, so a style written or edited in a
+//! text editor shows without a restart; and the popover's strip of style cards, each with its
+//! family's badge and, when it can't run, why in short.
+
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use egui::{Align2, Rect, Sense, Ui, UiBuilder, pos2, vec2};
+use procraft_core::{StyleFileText, StyleInfo};
+
+use crate::look::{Themed, Weight, argb, pc, text, text_width};
+
+/// A file bigger than this isn't a style.
+const MOST_BYTES: u64 = 256 * 1024;
+/// How often the folder is read again while the popover is open.
+const READ_EVERY: Duration = Duration::from_secs(2);
+pub const CARD_WIDTH: f32 = 116.0;
+pub const CARD_HEIGHT: f32 = 76.0;
+
+const CARD: Themed = Themed(0x2E5B5B5B, 0xFFD7D7D7);
+const INK: Themed = Themed(0xFFFFFFFF, 0xFF222222);
+const DIM: Themed = Themed(0x99FFFFFF, 0x99000000);
+const WARN: u32 = 0xFFF2B440;
+
+/// The folder chosen in the server view, when one was.
+static CHOSEN: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// The styles folder: the one chosen, else `styles/` in the app's data folder.
+pub fn styles_dir() -> PathBuf {
+    chosen_styles_dir().unwrap_or_else(|| crate::files::app_dir().join("styles"))
+}
+
+/// The folder chosen in the server view; none: the app's own.
+pub fn chosen_styles_dir() -> Option<PathBuf> {
+    match CHOSEN.lock() {
+        Ok(chosen) => chosen.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+/// Chooses the styles folder (none: the app's own).
+pub fn set_styles_dir(dir: Option<PathBuf>) {
+    match CHOSEN.lock() {
+        Ok(mut chosen) => *chosen = dir,
+        Err(poisoned) => *poisoned.into_inner() = dir,
+    }
+}
+
+/// Copies style file `from` (a `.toml` chosen to import) into the styles folder, after checking
+/// it reads as a style, with " 2" added to its name when one is already called that; its new
+/// name, or why it couldn't.
+pub fn import_style(generation: &procraft_core::Generation, from: &std::path::Path) -> Result<String, String> {
+    let too_big = std::fs::metadata(from).map_err(|e| e.to_string())?.len() > MOST_BYTES;
+    if too_big {
+        return Err("it's too big to be a style".to_owned());
+    }
+    let text = std::fs::read_to_string(from).map_err(|e| e.to_string())?;
+    if let Some(problem) = generation.style_file_problem(text.clone()) {
+        return Err(problem);
+    }
+    generation.set_style_files(read_style_files());
+    let stem = from.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = generation.style_file_name(stem, None);
+    let dir = styles_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join(&name), text).map_err(|e| e.to_string())?;
+    Ok(name)
+}
+
+/// The folder's style files, by name; the folder is made if it isn't there, so there's a place to
+/// put them.
+pub fn read_style_files() -> Vec<StyleFileText> {
+    let dir = styles_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        log::warn!("the styles folder {} couldn't be made: {e}", dir.display());
+    }
+    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let mut files: Vec<StyleFileText> = entries
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("toml")))
+        .filter(|e| e.metadata().is_ok_and(|m| m.is_file() && m.len() <= MOST_BYTES))
+        .filter_map(|e| {
+            let text = std::fs::read_to_string(e.path()).ok()?;
+            Some(StyleFileText { name: e.file_name().to_string_lossy().into_owned(), text })
+        })
+        .collect();
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    files
+}
+
+/// When the folder was last read, so the popover reads it again only every little while.
+#[derive(Default)]
+pub struct StylesFolder {
+    read_at: Option<Instant>,
+}
+
+impl StylesFolder {
+    /// Reads the folder into `generation` when it hasn't been read for a while.
+    pub fn refresh(&mut self, generation: &procraft_core::Generation) {
+        if self.read_at.is_some_and(|at| at.elapsed() < READ_EVERY) {
+            return;
+        }
+        self.read_at = Some(Instant::now());
+        generation.set_style_files(read_style_files());
+    }
+}
+
+/// Opens the styles folder in the system's file manager.
+pub fn open_styles_folder() {
+    let dir = styles_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        log::warn!("the styles folder {} couldn't be made: {e}", dir.display());
+    }
+    let opener = if cfg!(windows) {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    if let Err(e) = std::process::Command::new(opener).arg(&dir).spawn() {
+        log::warn!("the styles folder couldn't be opened with {opener}: {e}");
+    }
+}
+
+/// What happened in the strip of style cards.
+pub enum StripAction {
+    /// A card was tapped.
+    Pick(String),
+    /// A card was held or right-clicked: its menu, under it.
+    Hold(String, Rect),
+    /// The + card was tapped: its menu (New style, Import…), under it.
+    Plus(Rect),
+}
+
+/// How long a card is held, in seconds, before its menu shows.
+const HOLD: f64 = 0.5;
+/// The + card's width.
+const PLUS_WIDTH: f32 = 56.0;
+
+/// A family's badge colours: its ink and its pill's fill.
+fn badge_colours(family: &str) -> (Themed, Themed) {
+    if family == "Anima" {
+        // a soft violet
+        (Themed(0xFFC3B2FF, 0xFF5B3FC4), Themed(0x338E6CEF, 0x268E6CEF))
+    } else {
+        (Themed(0xFFCFCFCF, 0xFF4A4A4A), Themed(0x33FFFFFF, 0x1F000000))
+    }
+}
+
+/// The strip of style cards at `at`, `width` across, scrolling sideways when they don't fit; the
+/// chosen one ringed, the + card at the end. Returns what happened, if anything.
+pub fn strip(ui: &mut Ui, at: egui::Pos2, width: f32, styles: &[StyleInfo], chosen: &str) -> Option<StripAction> {
+    let row = Rect::from_min_size(at, vec2(width, CARD_HEIGHT));
+    let mut row_ui =
+        ui.new_child(UiBuilder::new().max_rect(row).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    row_ui.style_mut().always_scroll_the_only_direction = true;
+    let mut clicked = None;
+    egui::ScrollArea::horizontal()
+        .id_salt("style cards")
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+        .show(&mut row_ui, |ui| {
+            ui.spacing_mut().item_spacing = vec2(6.0, 0.0);
+            for s in styles {
+                let (card, response) = ui.allocate_exact_size(vec2(CARD_WIDTH, CARD_HEIGHT), Sense::click());
+                card_at(ui, card, s, s.id == chosen);
+                // held (half a second) or right-clicked: its menu
+                let held = response.is_pointer_button_down_on()
+                    && ui.input(|i| i.pointer.press_start_time().is_some_and(|t| i.time - t > HOLD));
+                if response.is_pointer_button_down_on() && !held {
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+                }
+                if held || response.secondary_clicked() || response.long_touched() {
+                    clicked = Some(StripAction::Hold(s.id.clone(), card));
+                } else if response.clicked() {
+                    clicked = Some(StripAction::Pick(s.id.clone()));
+                }
+            }
+            let (plus, response) = ui.allocate_exact_size(vec2(PLUS_WIDTH, CARD_HEIGHT), Sense::click());
+            ui.painter().rect_filled(plus, 12.0, argb(CARD));
+            text(ui.painter(), plus.center(), Align2::CENTER_CENTER, "+", 26.0, Weight::Regular, argb(DIM));
+            if response.on_hover_text("New style or Import").clicked() {
+                clicked = Some(StripAction::Plus(plus));
+            }
+        });
+    clicked
+}
+
+/// One card: the name (two lines at most) beside the family's badge, and the settings line, or
+/// in amber why it can't run.
+fn card_at(ui: &Ui, card: Rect, s: &StyleInfo, on: bool) {
+    let painter = ui.painter();
+    painter.rect_filled(card, 12.0, argb(CARD));
+    if on {
+        painter.rect_stroke(card, 12.0, egui::Stroke::new(2.0, argb(pc::ACCENT)), egui::StrokeKind::Inside);
+    }
+    let (ink, fill) = badge_colours(&s.family);
+    let badge_width = text_width(painter, &s.family, 10.0, Weight::SemiBold) + 12.0;
+    let badge = Rect::from_min_size(pos2(card.right() - 8.0 - badge_width, card.top() + 8.0), vec2(badge_width, 16.0));
+    painter.rect_filled(badge, 8.0, argb(fill));
+    text(painter, badge.center(), Align2::CENTER_CENTER, &s.family, 10.0, Weight::SemiBold, argb(ink));
+    // the name, two lines at most, drawn rather than added as a widget: a widget would move the
+    // row's cursor, and the next card would start over this one
+    // a word too long for the room beside the badge makes the name smaller, rather than broken inside
+    // the word ("Importe" / "d test")
+    let room = badge.left() - 4.0 - (card.left() + 10.0);
+    let longest = s.name.split_whitespace().map(|w| text_width(painter, w, 14.0, Weight::SemiBold)).fold(0.0, f32::max);
+    let size = if longest > room { 12.0 } else { 14.0 };
+    let mut job = egui::text::LayoutJob::default();
+    let format = egui::TextFormat { font_id: Weight::SemiBold.font(size), color: argb(INK), ..Default::default() };
+    job.append(&s.name, 0.0, format);
+    job.wrap.max_width = room;
+    job.wrap.max_rows = 2;
+    job.wrap.overflow_character = Some('…');
+    let name = painter.layout_job(job);
+    painter.galley(card.min + vec2(10.0, 9.0), name, argb(INK));
+    let (line, colour) = match &s.note {
+        Some(note) => (note.clone(), argb(WARN)),
+        None => (format!("{} steps · CFG {}", s.steps, s.cfg), argb(DIM)),
+    };
+    text(
+        painter,
+        pos2(card.left() + 10.0, card.bottom() - 10.0),
+        Align2::LEFT_BOTTOM,
+        &line,
+        11.0,
+        Weight::Regular,
+        colour,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use procraft_core::StyleKind;
+
+    fn style(id: &str, name: &str) -> StyleInfo {
+        StyleInfo {
+            id: id.into(),
+            name: name.into(),
+            steps: 30,
+            cfg: 4.0,
+            family: "Anima".into(),
+            kind: StyleKind::Yours,
+            file: None,
+            note: None,
+            reason: None,
+        }
+    }
+
+    /// The strip drawn once at the window's corner, with `events`; the style clicked, if any.
+    fn frame(ctx: &egui::Context, styles: &[StyleInfo], events: Vec<egui::Event>) -> Option<StripAction> {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
+            events,
+            ..Default::default()
+        };
+        let mut clicked = None;
+        let mut out = ctx.run_ui(input, |root| {
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(root, |ui| {
+                clicked = strip(ui, pos2(0.0, 0.0), 400.0, styles, "a");
+            });
+        });
+        out.textures_delta.clear();
+        clicked
+    }
+
+    #[test]
+    fn each_card_takes_its_own_place_in_the_strip() {
+        let ctx = egui::Context::default();
+        let styles = [style("a", "Gone LoRA"), style("b", "Moonlit with a long name"), style("c", "Typo")];
+        frame(&ctx, &styles, vec![]);
+        // the middle of the second card: one card and one gap along
+        let p = pos2(CARD_WIDTH + 6.0 + CARD_WIDTH / 2.0, CARD_HEIGHT / 2.0);
+        let button = |pressed| egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        frame(&ctx, &styles, vec![egui::Event::PointerMoved(p)]);
+        frame(&ctx, &styles, vec![button(true)]);
+        let clicked = frame(&ctx, &styles, vec![button(false)]);
+        assert!(matches!(clicked, Some(StripAction::Pick(id)) if id == "b"));
+    }
+}

@@ -25,6 +25,9 @@ pub struct LayerInfo {
     pub private: bool,
     /// Strokes on it follow the drawing guide.
     pub assisted: bool,
+    /// Its pixels guide generation (and are left out of the picture sent).
+    #[uniffi(default = None)]
+    pub control: Option<LayerControl>,
     pub kind: LayerType,
     /// A mask's layer, or the group a layer is in.
     pub parent: Option<u64>,
@@ -65,6 +68,37 @@ pub enum LayerType {
     Mask,
 }
 
+/// What a layer's pixels guide generation as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum LayerControl {
+    /// Clean lines, followed closely.
+    LineArt,
+    /// Rough strokes, followed loosely.
+    Scribble,
+    /// Greys for how near things are: white nearest, black (or nothing) furthest.
+    Depth,
+}
+
+impl From<procraft_engine::document::ControlKind> for LayerControl {
+    fn from(kind: procraft_engine::document::ControlKind) -> LayerControl {
+        match kind {
+            procraft_engine::document::ControlKind::LineArt => LayerControl::LineArt,
+            procraft_engine::document::ControlKind::Scribble => LayerControl::Scribble,
+            procraft_engine::document::ControlKind::Depth => LayerControl::Depth,
+        }
+    }
+}
+
+impl From<LayerControl> for procraft_engine::document::ControlKind {
+    fn from(kind: LayerControl) -> procraft_engine::document::ControlKind {
+        match kind {
+            LayerControl::LineArt => procraft_engine::document::ControlKind::LineArt,
+            LayerControl::Scribble => procraft_engine::document::ControlKind::Scribble,
+            LayerControl::Depth => procraft_engine::document::ControlKind::Depth,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
 pub struct BlendModeInfo {
     pub id: u32,
@@ -103,6 +137,7 @@ pub enum LayerOption {
     DrawingAssist,
     Invert,
     Reference,
+    ControlLayer,
     EditText,
     Rasterize,
     /// A plugin's layer: the strokes the selection takes (every one with nothing selected) given
@@ -206,6 +241,8 @@ fn layer_options(l: &LayerInfo, masked: bool, guided: bool) -> Vec<LayerOptionRo
                 if guided || l.assisted {
                     row(O::DrawingAssist, "Drawing Assist", Some(l.assisted));
                 }
+                #[cfg(feature = "generation")]
+                row(O::ControlLayer, "Control layer", Some(l.control.is_some()));
                 if unlocked {
                     row(O::Invert, "Invert", None);
                 }
@@ -391,6 +428,7 @@ impl CanvasSession {
                 reference: l.reference,
                 private: l.private,
                 assisted: st.doc.is_assisted(l.id),
+                control: l.control.map(|c| c.kind.into()),
                 kind: match l.kind {
                     LayerKind::Paint => LayerType::Paint,
                     LayerKind::Group => LayerType::Group,

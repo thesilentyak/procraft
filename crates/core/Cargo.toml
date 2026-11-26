@@ -16,10 +16,15 @@ crate-type = ["cdylib", "lib"]
 [lints]
 workspace = true
 
+[features]
+# image generation on a ComfyUI server (procraft-diffusion): networking, off by default
+generation = ["dep:procraft-diffusion"]
+
 [dependencies]
 # a plugin's own artwork's draw list, drawn smooth on the CPU
 tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd"] }
 procraft-engine = { workspace = true }
+procraft-diffusion = { path = "../diffusion", optional = true }
 procraft-gpu = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }

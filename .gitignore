@@ -12,3 +12,6 @@ replay_pid*.log
 /ios/ProCraft.xcodeproj/
 # Python bytecode from the tools
 __pycache__/
+
+# personal details of the machine, devices and paths this is developed on: never in git
+/dev/local.md

@@ -12,6 +12,10 @@ val cargoWorkspaceDir: File = rootDir.parentFile
 val rustAbis: List<String> =
     providers.gradleProperty("procraft.abis").getOrElse("arm64-v8a,x86_64").split(',').map { it.trim() }.filter { it.isNotEmpty() }
 val minApi = 28
+// Image generation on a ComfyUI server (procraft-core's `generation` feature, src/generation/):
+// on unless -Pprocraft.generation=false. Off, the app builds without it, its networking or the
+// INTERNET permission.
+val generation: Boolean = providers.gradleProperty("procraft.generation").getOrElse("true") == "true"
 
 // The app's version: gradle.properties' procraft.version, or the version tag's when the release
 // workflow builds a release. The version code follows from it (0.0.1-beta → 101, 0.0.1-beta.2 →
@@ -64,6 +68,7 @@ abstract class CargoNdkBuild : DefaultTask() {
     @get:Input abstract val ndkDir: Property<String>
     @get:Input abstract val abis: ListProperty<String>
     @get:Input abstract val apiLevel: Property<Int>
+    @get:Input abstract val features: ListProperty<String>
     @get:OutputDirectory abstract val outputDir: DirectoryProperty
 
     @TaskAction
@@ -82,7 +87,8 @@ abstract class CargoNdkBuild : DefaultTask() {
             environment("CARGO_ENCODED_RUSTFLAGS", remap.joinToString("\u001f"))
             commandLine(
                 listOf(cargo.get(), "ndk") + targets +
-                    listOf("--platform", apiLevel.get().toString(), "-o", out, "build", "--release", "-p", "procraft-core", "--lib"),
+                    listOf("--platform", apiLevel.get().toString(), "-o", out, "build", "--release", "-p", "procraft-core", "--lib") +
+                    features.get().flatMap { listOf("--features", it) },
             )
         }
         // only the app's library ships (cargo-ndk copies any other shared library cargo left)
@@ -119,12 +125,18 @@ android {
     ndkVersion = "29.0.14206865"
 
     defaultConfig {
-        applicationId = "io.github.artcraftandroid.procraft"
+        // ProCraft Diffusion: its own app beside ProCraft, with its own artworks
+        applicationId = "io.github.hekel1989.procraftdiffusion"
         minSdk = minApi
         targetSdk = 36
         versionCode = appVersionCode
         versionName = appVersion
         ndk { abiFilters.addAll(rustAbis) }
+        // with generation: the network, and plain HTTP to the server the user names (a LAN
+        // address typed at run time, which no allow-list can name ahead)
+        manifestPlaceholders["networkPermission"] =
+            if (generation) "android.permission.INTERNET" else "io.github.artcraftandroid.procraft.permission.NO_NETWORK"
+        manifestPlaceholders["cleartext"] = generation.toString()
     }
 
     signingConfigs {
@@ -174,6 +186,7 @@ androidComponents {
             ndkDir.set(androidComponents.sdkComponents.ndkDirectory.map { it.asFile.absolutePath })
             abis.set(rustAbis)
             apiLevel.set(minApi)
+            features.set(if (generation) listOf("generation") else emptyList())
             // cargo knows what changed
             outputs.upToDateWhen { false }
         }
@@ -186,6 +199,8 @@ androidComponents {
         }
         variant.sources.jniLibs?.addGeneratedSourceDirectory(cargoBuild, CargoNdkBuild::outputDir)
         variant.sources.java?.addGeneratedSourceDirectory(bindgen, UniffiBindgen::outputDir)
+        // image generation's UI, or the stand-in that draws nothing
+        variant.sources.java?.addStaticSourceDirectory(if (generation) "src/generation/java" else "src/noGeneration/java")
     }
 }
 

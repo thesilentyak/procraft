@@ -1,0 +1,685 @@
+//! Anima: a 2B Cosmos-Predict2 derivative for anime and illustration, prompted with booru tags or
+//! plain words. Its text encoder is Qwen3 0.6B (loaded as ComfyUI's `omnigen2` type) and its VAE
+//! Qwen-Image's. It works best near 1 MP; its control and inpaint models are LLLite, applied with
+//! the tooling add-on's control nodes.
+
+use serde_json::json;
+
+use super::ModelKind;
+use crate::comfy::ServerModels;
+use crate::plan::Plan;
+use crate::{ControlKind, ControlStep, Error, Family, Graph, Out, Picture, Request, SelectionMode};
+
+pub(super) const NATIVE_PIXELS: u32 = 1024 * 1024;
+/// How much the second pass of a two-pass picture changes it: enough to add detail, too little to
+/// invent a new composition.
+pub(super) const SECOND_PASS_DENOISE: f64 = 0.3;
+/// The most pixels a picture is made at, in one pass, in megapixels: krita-ai-diffusion's limit for
+/// Anima (2048 × 2048, about 4.2 MP), where the user finds it clean (1632 × 2048 often); bigger
+/// targets are scaled up the rest. (A 5.6 MP second pass over a 1 MP picture went soft with a grid.)
+pub(super) const MOST_MEGAPIXELS: f32 = 4.2;
+/// The inpaint control's strength: the LLLite layer follows the mask whole.
+pub(super) const INPAINT_CONTROL_STRENGTH: f64 = 1.0;
+/// How closely a control layer is followed, as (strength, how far through sampling it applies):
+/// Loose only shapes the start, so the model can drift; Strict holds the lines to the end.
+pub(super) const LOOSE: (f32, f32) = (0.5, 0.4);
+pub(super) const BALANCED: (f32, f32) = (0.6, 0.6);
+pub(super) const CLOSE: (f32, f32) = (0.7, 0.8);
+pub(super) const STRICT: (f32, f32) = (1.0, 1.0);
+/// The same for a depth layer: line art's numbers, which already moved a tower and a boulder to
+/// where a depth map put them at Balanced (2026-11-15), kept apart to be tuned on their own.
+pub(super) const DEPTH_LOOSE: (f32, f32) = (0.5, 0.4);
+pub(super) const DEPTH_BALANCED: (f32, f32) = (0.6, 0.6);
+pub(super) const DEPTH_CLOSE: (f32, f32) = (0.7, 0.8);
+pub(super) const DEPTH_STRICT: (f32, f32) = (1.0, 1.0);
+/// How much the last colour match pulls a selection's result towards the original: enough to blend
+/// it in, not enough to undo the generated colours.
+pub(super) const COLOR_MATCH: f64 = 0.5;
+/// A selection's mask grows by this share of the context box's longer side, and blurs by this
+/// share of the growth.
+const INPAINT_GROW: f32 = 0.02;
+const INPAINT_GROW_MIN: u32 = 8;
+const INPAINT_BLUR_SHARE: u32 = 2;
+
+/// Its checkpoints: anything with "anima" in the name in `diffusion_models`.
+pub(super) fn recognises(file: &str) -> bool {
+    super::matches("*anima*", file)
+}
+
+/// How closely a step follows a control layer of `kind`: its strength and how far through
+/// sampling that applies.
+pub(super) fn control_settings(kind: ControlKind, step: ControlStep) -> (f32, f32) {
+    match (kind, step) {
+        (ControlKind::Depth, ControlStep::Loose) => DEPTH_LOOSE,
+        (ControlKind::Depth, ControlStep::Balanced) => DEPTH_BALANCED,
+        (ControlKind::Depth, ControlStep::Close) => DEPTH_CLOSE,
+        (ControlKind::Depth, ControlStep::Strict) => DEPTH_STRICT,
+        (_, ControlStep::Loose) => LOOSE,
+        (_, ControlStep::Balanced) => BALANCED,
+        (_, ControlStep::Close) => CLOSE,
+        (_, ControlStep::Strict) => STRICT,
+    }
+}
+
+/// The files for each kind, best first.
+pub(super) fn patterns(kind: ModelKind) -> &'static [&'static str] {
+    match kind {
+        ModelKind::Checkpoint => &["*anima*"],
+        ModelKind::TextEncoder => &["qwen_3_06b*"],
+        ModelKind::Vae => &["qwen_image_vae*"],
+        ModelKind::InpaintControl => &["anima*lllite*inpaint*", "anima*inpaint*lllite*"],
+        ModelKind::LineControl => &["anima*lllite*any*"],
+        ModelKind::DepthControl => &["anima*lllite*depth*"],
+    }
+}
+
+pub(super) fn describe(kind: ModelKind) -> &'static str {
+    match kind {
+        ModelKind::Checkpoint => "an Anima model (anima-base-v1.0.safetensors)",
+        ModelKind::TextEncoder => "qwen_3_06b_base.safetensors",
+        ModelKind::Vae => "qwen_image_vae.safetensors",
+        ModelKind::InpaintControl => "anima-lllite-inpainting-v2.safetensors",
+        ModelKind::LineControl => "anima-lllite-any-test-like-v2.safetensors",
+        ModelKind::DepthControl => "anima-lllite-depth-1.safetensors",
+    }
+}
+
+/// One picture: from an empty latent at full strength, or from the picture sent (scaled to the
+/// plan) below it. A two-pass plan composes at the first size, scales that up and samples it again
+/// at the second. A selection goes through the inpaint structure instead: one pass at the plan's
+/// size, prefilled from its surroundings, with the LLLite inpaint control.
+pub(super) fn graph(request: &Request, plan: Plan, seed: u64, models: &ServerModels) -> Result<Graph, Error> {
+    let family = Family::Anima;
+    let file = |kind| family.pick(kind, models).ok_or_else(|| missing(kind));
+    let style = &request.style;
+    let mut g = Graph::new();
+    if !style.missing.is_empty() {
+        return Err(Error::Missing(style.missing_files()));
+    }
+    let own = |kind, chosen: &Option<String>| chosen.clone().map_or_else(|| file(kind), Ok);
+    let checkpoint = g.add("UNETLoader", [("unet_name", json!(style.checkpoint)), ("weight_dtype", json!("default"))]);
+    let clip = g.add(
+        "CLIPLoader",
+        [("clip_name", json!(own(ModelKind::TextEncoder, &style.text_encoder)?)), ("type", json!("omnigen2"))],
+    );
+    let vae = g.add("VAELoader", [("vae_name", json!(own(ModelKind::Vae, &style.vae)?))]);
+    // the style's LoRAs on the model and the text encoder alike (most change only the model),
+    // then its CFG rescale
+    let (mut model, mut encoder): (Out, Out) = (checkpoint.out(0), clip.out(0));
+    for lora in &style.loras {
+        let loaded = g.add(
+            "LoraLoader",
+            [
+                ("model", model.into()),
+                ("clip", encoder.into()),
+                ("lora_name", json!(lora.file)),
+                ("strength_model", json!(lora.strength)),
+                ("strength_clip", json!(lora.strength)),
+            ],
+        );
+        (model, encoder) = (loaded.out(0), loaded.out(1));
+    }
+    if let Some(multiplier) = style.rescale_cfg {
+        model =
+            g.add("RescaleCFG", [("model", model.into()), ("multiplier", json!(multiplier.clamp(0.0, 1.0)))]).out(0);
+    }
+    // each control layer's lines on the model before sampling, its picture at `width × height`
+    let with_controls = |g: &mut Graph, mut model: Out, width: u32, height: u32| -> Result<Out, Error> {
+        for control in &request.controls {
+            let png = control.picture.resized(width, height)?.to_png()?;
+            let image = g.add("ETN_LoadImageBase64", [("image", json!(procraft_engine::base64::encode(&png)))]);
+            let weights = match control.kind {
+                ControlKind::Depth => file(ModelKind::DepthControl)?,
+                ControlKind::LineArt | ControlKind::Scribble => file(ModelKind::LineControl)?,
+            };
+            let load = g.add("ETN_control_load", [("model", model.into()), ("weights", json!(weights))]);
+            let apply = g.add(
+                "ETN_control_apply",
+                [
+                    ("model", load.out(0).into()),
+                    ("control_net", load.out(1).into()),
+                    ("image", image.out(0).into()),
+                    ("strength", json!(control.strength.clamp(0.0, 1.0))),
+                    ("start_percent", json!(0.0)),
+                    ("end_percent", json!(control.end_percent.clamp(0.0, 1.0))),
+                ],
+            );
+            model = apply.out(0);
+        }
+        Ok(model)
+    };
+    let text = |g: &mut Graph, text: String| g.add("CLIPTextEncode", [("clip", encoder.into()), ("text", json!(text))]);
+    let selection = request.selection.as_ref();
+    let removing = selection.is_some_and(|s| s.mode == SelectionMode::Remove);
+    let prompt = if removing { "" } else { request.prompt.as_str() };
+    let positive = text(&mut g, style.positive(prompt));
+    let negative = if removing {
+        text(&mut g, format!("{}, object, person, text", style.negative))
+    } else {
+        text(&mut g, style.negative.clone())
+    };
+    let base: Out = model;
+    let sampler = |g: &mut Graph, model: Out, latent: Out, denoise: f64| {
+        g.add(
+            "KSampler",
+            [
+                ("model", model.into()),
+                ("seed", json!(seed)),
+                ("steps", json!(style.steps)),
+                ("cfg", json!(style.cfg)),
+                ("sampler_name", json!(style.sampler)),
+                ("scheduler", json!(style.scheduler)),
+                ("positive", positive.out(0).into()),
+                ("negative", negative.out(0).into()),
+                ("latent_image", latent.into()),
+                ("denoise", json!(denoise)),
+            ],
+        )
+    };
+
+    if let Some(selection) = selection {
+        let Some(picture) = &request.picture else {
+            return Err(Error::Request { reason: "a selection needs the picture there is".to_owned() });
+        };
+        let expected = u64::from(request.size.0) * u64::from(request.size.1);
+        if selection.mask.len() as u64 != expected {
+            return Err(Error::Request {
+                reason: format!("{} bytes aren't the selection's {expected} pixels", selection.mask.len()),
+            });
+        }
+        let (width, height) = (plan.first.width, plan.first.height);
+        let model = with_controls(&mut g, base, width, height)?;
+        let original = picture.flattened([255, 255, 255]).resized(width, height)?.to_png()?;
+        let original = g.add("ETN_LoadImageBase64", [("image", json!(procraft_engine::base64::encode(&original)))]);
+        let mask = Picture::resized_mask(request.size.0, request.size.1, &selection.mask, width, height)?;
+        let mask = Picture::mask_png(width, height, &mask)?;
+        let mask = g.add("ETN_LoadMaskBase64", [("mask", json!(procraft_engine::base64::encode(&mask)))]);
+        let longer = width.max(height);
+        let grow = ((longer as f32 * INPAINT_GROW).round() as u32).max(INPAINT_GROW_MIN);
+        let blur = (grow / INPAINT_BLUR_SHARE).max(1);
+        let grown = g.add(
+            "INPAINT_ExpandMask",
+            [
+                ("mask", mask.out(0).into()),
+                ("grow", json!(grow)),
+                ("blur", json!(blur)),
+                ("blur_type", json!("gaussian")),
+            ],
+        );
+        let fill = match selection.mode {
+            SelectionMode::Fill | SelectionMode::Add => "neutral",
+            SelectionMode::Remove => "telea",
+            SelectionMode::Expand => "navier-stokes",
+        };
+        let filled = g.add(
+            "INPAINT_MaskedFill",
+            [
+                ("image", original.out(0).into()),
+                ("mask", grown.out(0).into()),
+                ("fill", json!(fill)),
+                ("falloff", json!(0)),
+            ],
+        );
+        let control =
+            g.add("ETN_control_load", [("model", model.into()), ("weights", json!(file(ModelKind::InpaintControl)?))]);
+        let controlled = g.add(
+            "ETN_control_apply",
+            [
+                ("model", control.out(0).into()),
+                ("control_net", control.out(1).into()),
+                ("image", filled.out(0).into()),
+                ("mask", grown.out(0).into()),
+                ("strength", json!(INPAINT_CONTROL_STRENGTH)),
+                ("start_percent", json!(0.0)),
+                ("end_percent", json!(1.0)),
+            ],
+        );
+        let model = controlled.out(0);
+        let encoded = g.add("VAEEncode", [("pixels", filled.out(0).into()), ("vae", vae.out(0).into())]);
+        let latent = g.add("SetLatentNoiseMask", [("samples", encoded.out(0).into()), ("mask", grown.out(0).into())]);
+        let sampled = sampler(&mut g, model, latent.into(), f64::from(request.strength.clamp(0.01, 1.0)));
+        let decoded = g.add("VAEDecode", [("samples", sampled.out(0).into()), ("vae", vae.out(0).into())]);
+        let composited = g.add(
+            "ImageCompositeMasked",
+            [
+                ("destination", original.out(0).into()),
+                ("source", decoded.out(0).into()),
+                ("x", json!(0)),
+                ("y", json!(0)),
+                ("resize_source", json!(false)),
+                ("mask", grown.out(0).into()),
+            ],
+        );
+        let matched = g.add(
+            "INPAINT_ColorMatch",
+            [
+                ("target", composited.out(0).into()),
+                ("reference", original.out(0).into()),
+                ("exclude_mask", grown.out(0).into()),
+                ("strength", json!(COLOR_MATCH)),
+            ],
+        );
+        g.add("ETN_SendImageWebSocket", [("images", matched.out(0).into()), ("format", json!("PNG"))]);
+        return Ok(g);
+    }
+
+    let refine = request.strength < 1.0;
+    let latent: Out = if refine {
+        let Some(picture) = &request.picture else {
+            return Err(Error::Request { reason: "refining needs the picture there is".to_owned() });
+        };
+        let png = picture.flattened([255, 255, 255]).resized(plan.first.width, plan.first.height)?.to_png()?;
+        let image = g.add("ETN_LoadImageBase64", [("image", json!(procraft_engine::base64::encode(&png)))]);
+        g.add("VAEEncode", [("pixels", image.out(0).into()), ("vae", vae.out(0).into())]).into()
+    } else {
+        g.add(
+            "EmptyLatentImage",
+            [("width", json!(plan.first.width)), ("height", json!(plan.first.height)), ("batch_size", json!(1))],
+        )
+        .into()
+    };
+    let first_model = with_controls(&mut g, base, plan.first.width, plan.first.height)?;
+    let sampled =
+        sampler(&mut g, first_model, latent, if refine { f64::from(request.strength.clamp(0.01, 1.0)) } else { 1.0 });
+    let mut image = g.add("VAEDecode", [("samples", sampled.out(0).into()), ("vae", vae.out(0).into())]);
+    if let Some(second) = plan.second.filter(|_| !refine) {
+        let scaled = g.add(
+            "ImageScale",
+            [
+                ("image", image.out(0).into()),
+                ("upscale_method", json!("lanczos")),
+                ("width", json!(second.width)),
+                ("height", json!(second.height)),
+                ("crop", json!("disabled")),
+            ],
+        );
+        let encoded = g.add("VAEEncode", [("pixels", scaled.out(0).into()), ("vae", vae.out(0).into())]);
+        let second_model = with_controls(&mut g, base, second.width, second.height)?;
+        let refined = sampler(&mut g, second_model, encoded.into(), SECOND_PASS_DENOISE);
+        image = g.add("VAEDecode", [("samples", refined.out(0).into()), ("vae", vae.out(0).into())]);
+    }
+    g.add("ETN_SendImageWebSocket", [("images", image.out(0).into()), ("format", json!("PNG"))]);
+    Ok(g)
+}
+
+fn missing(kind: ModelKind) -> Error {
+    Error::Missing(vec![crate::Missing::Model { what: describe(kind).to_owned(), folder: kind.folder() }])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ControlKind, Picture, Style};
+
+    fn models() -> ServerModels {
+        ServerModels {
+            diffusion_models: vec!["anima_baseV10.safetensors".into()],
+            text_encoders: vec!["qwen_3_06b_base.safetensors".into()],
+            vaes: vec!["qwen_image_vae.safetensors".into()],
+            controls: vec![
+                "anima-lllite-inpainting-v2.safetensors".into(),
+                "anima-lllite-any-test-like-v2.safetensors".into(),
+                "anima-lllite-depth-1.safetensors".into(),
+            ],
+            ..ServerModels::default()
+        }
+    }
+
+    fn request(strength: f32) -> Request {
+        let style = Style::built_in("anima", &models()).unwrap();
+        Request {
+            prompt: "1girl, night sky".into(),
+            style,
+            strength,
+            seed: 7,
+            count: 1,
+            picture: Some(Picture::new(2, 2, vec![200; 16]).unwrap()),
+            selection: None,
+            controls: Vec::new(),
+            size: (2, 2),
+            resolution: crate::Resolution::Quality,
+            largest: None,
+            nsfw: false,
+        }
+    }
+
+    fn selection(mode: SelectionMode) -> Request {
+        let mut r = request(0.75);
+        r.size = (64, 64);
+        r.picture = Some(Picture::new(64, 64, vec![200; 64 * 64 * 4]).unwrap());
+        r.selection = Some(crate::Selection { mask: vec![255; 64 * 64], mode });
+        r
+    }
+
+    fn one_pass(width: u32, height: u32) -> Plan {
+        let size = crate::Size::new(width, height);
+        Plan { first: size, second: None, size, target: size, capped: false }
+    }
+
+    fn two_pass(first: (u32, u32), second: (u32, u32)) -> Plan {
+        let first = crate::Size::new(first.0, first.1);
+        let second = crate::Size::new(second.0, second.1);
+        Plan { first, second: Some(second), size: second, target: second, capped: false }
+    }
+
+    #[test]
+    fn a_new_picture_starts_from_an_empty_latent() {
+        let g = graph(&request(1.0), one_pass(1024, 768), 42, &models()).unwrap().to_json();
+        assert_eq!(g["1"]["inputs"]["unet_name"], "anima_baseV10.safetensors");
+        assert_eq!(g["2"]["inputs"]["type"], "omnigen2");
+        assert_eq!(g["4"]["inputs"]["text"], "masterpiece, best quality, 1girl, night sky");
+        assert_eq!(g["6"]["class_type"], "EmptyLatentImage");
+        assert_eq!((g["6"]["inputs"]["width"].clone(), g["6"]["inputs"]["height"].clone()), (json!(1024), json!(768)));
+        assert_eq!(g["7"]["inputs"]["seed"], 42);
+        assert_eq!(g["7"]["inputs"]["denoise"], 1.0);
+        assert_eq!(g["9"]["class_type"], "ETN_SendImageWebSocket");
+    }
+
+    #[test]
+    fn a_two_pass_picture_scales_up_then_samples_again() {
+        let g = graph(&request(1.0), two_pass((1024, 768), (2048, 1536)), 42, &models()).unwrap();
+        let json = g.to_json();
+        assert_eq!(g.nodes_of("KSampler").len(), 2);
+        assert_eq!(g.nodes_of("ImageScale").len(), 1);
+        let empty = &g.nodes_of("EmptyLatentImage")[0];
+        assert_eq!(
+            (json[empty]["inputs"]["width"].clone(), json[empty]["inputs"]["height"].clone()),
+            (json!(1024), json!(768))
+        );
+        let scale = &g.nodes_of("ImageScale")[0];
+        assert_eq!(json[scale]["inputs"]["upscale_method"], "lanczos");
+        assert_eq!(json[scale]["inputs"]["crop"], "disabled");
+        assert_eq!(
+            (json[scale]["inputs"]["width"].clone(), json[scale]["inputs"]["height"].clone()),
+            (json!(2048), json!(1536))
+        );
+        let samplers = g.nodes_of("KSampler");
+        assert_eq!(json[&samplers[0]]["inputs"]["denoise"], 1.0);
+        assert_eq!(json[&samplers[1]]["inputs"]["denoise"], SECOND_PASS_DENOISE);
+        assert_eq!(json[&samplers[1]]["inputs"]["seed"], 42);
+    }
+
+    #[test]
+    fn refining_sends_the_picture_at_the_plans_size() {
+        let g = graph(&request(0.5), one_pass(64, 32), 1, &models()).unwrap();
+        let json = g.to_json();
+        assert_eq!(g.nodes_of("KSampler").len(), 1, "refining is one pass");
+        assert_eq!(g.nodes_of("ImageScale").len(), 0);
+        assert_eq!(g.nodes_of("ETN_LoadImageBase64").len(), 1);
+        assert_eq!(json["8"]["inputs"]["denoise"], 0.5);
+        let png = procraft_engine::base64::decode(json["6"]["inputs"]["image"].as_str().unwrap()).unwrap();
+        let sent = Picture::decode(&png).unwrap();
+        assert_eq!((sent.width, sent.height), (64, 32));
+    }
+
+    #[test]
+    fn each_selection_mode_prefills_as_designed() {
+        for (mode, fill) in [
+            (SelectionMode::Fill, "neutral"),
+            (SelectionMode::Add, "neutral"),
+            (SelectionMode::Remove, "telea"),
+            (SelectionMode::Expand, "navier-stokes"),
+        ] {
+            let built = graph(&selection(mode), one_pass(64, 64), 42, &models()).unwrap();
+            let g = built.to_json();
+            let fills = built.nodes_of("INPAINT_MaskedFill");
+            let node = &g[&fills[0]]["inputs"];
+            assert_eq!(node["fill"], fill, "{mode:?}");
+            assert_eq!(node["falloff"], 0);
+        }
+    }
+
+    #[test]
+    fn a_selection_goes_through_the_inpaint_control_and_back_through_the_mask() {
+        let built = graph(&selection(SelectionMode::Fill), one_pass(64, 64), 42, &models()).unwrap();
+        let g = built.to_json();
+        assert_eq!(built.nodes_of("EmptyLatentImage").len(), 0);
+        let samplers = built.nodes_of("KSampler");
+        assert_eq!(samplers.len(), 1);
+        assert_eq!(g[&samplers[0]]["inputs"]["denoise"], 0.75);
+        let expand = built.nodes_of("INPAINT_ExpandMask");
+        assert_eq!(expand.len(), 1);
+        assert_eq!(g[&expand[0]]["inputs"]["grow"], 8, "2% of 64, at least 8");
+        assert_eq!(g[&expand[0]]["inputs"]["blur"], 4, "half the growth");
+        assert_eq!(g[&expand[0]]["inputs"]["blur_type"], "gaussian");
+        let filled = built.nodes_of("INPAINT_MaskedFill");
+        assert_eq!(filled.len(), 1);
+        assert_eq!(g[&filled[0]]["inputs"]["mask"], json!([&expand[0], 0]));
+        let control = built.nodes_of("ETN_control_load");
+        assert_eq!(control.len(), 1);
+        assert_eq!(g[&control[0]]["inputs"]["weights"], "anima-lllite-inpainting-v2.safetensors");
+        let apply = built.nodes_of("ETN_control_apply");
+        assert_eq!(apply.len(), 1);
+        assert_eq!(g[&apply[0]]["inputs"]["strength"], INPAINT_CONTROL_STRENGTH);
+        assert_eq!(g[&apply[0]]["inputs"]["mask"], json!([&expand[0], 0]));
+        let noise = built.nodes_of("SetLatentNoiseMask");
+        assert_eq!(noise.len(), 1);
+        assert_eq!(g[&noise[0]]["inputs"]["mask"], json!([&expand[0], 0]));
+        let composite = built.nodes_of("ImageCompositeMasked");
+        assert_eq!(composite.len(), 1);
+        assert_eq!(g[&composite[0]]["inputs"]["mask"], json!([&expand[0], 0]));
+        let match_colours = built.nodes_of("INPAINT_ColorMatch");
+        assert_eq!(match_colours.len(), 1);
+        assert_eq!(g[&match_colours[0]]["inputs"]["strength"], COLOR_MATCH);
+        assert_eq!(g[&match_colours[0]]["inputs"]["exclude_mask"], json!([&expand[0], 0]));
+        let sent = built.nodes_of("ETN_SendImageWebSocket");
+        assert_eq!(g[&sent[0]]["inputs"]["images"], json!([&match_colours[0], 0]));
+    }
+
+    #[test]
+    fn removing_drops_the_prompt_and_keeps_objects_out() {
+        let built = graph(&selection(SelectionMode::Remove), one_pass(64, 64), 42, &models()).unwrap();
+        let g = built.to_json();
+        let texts = built.nodes_of("CLIPTextEncode");
+        assert_eq!(g[&texts[0]]["inputs"]["text"], "masterpiece, best quality");
+        assert_eq!(
+            g[&texts[1]]["inputs"]["text"],
+            "worst quality, low quality, blurry, jpeg artifacts, watermark, signature, object, person, text"
+        );
+    }
+
+    fn controlled(mut request: Request, kind: ControlKind, step: ControlStep) -> Request {
+        let (strength, end_percent) = control_settings(kind, step);
+        request.controls = vec![crate::Control {
+            kind,
+            strength,
+            end_percent,
+            picture: Picture::new(4, 4, [0u8, 0, 0, 255].repeat(16)).unwrap(),
+        }];
+        request
+    }
+
+    #[test]
+    fn the_four_steps_are_tuned_as_designed() {
+        for kind in [ControlKind::LineArt, ControlKind::Scribble, ControlKind::Depth] {
+            assert_eq!(control_settings(kind, ControlStep::Loose), (0.5, 0.4));
+            assert_eq!(control_settings(kind, ControlStep::Balanced), (0.6, 0.6));
+            assert_eq!(control_settings(kind, ControlStep::Close), (0.7, 0.8));
+            assert_eq!(control_settings(kind, ControlStep::Strict), (1.0, 1.0));
+        }
+        assert_eq!(ControlStep::default(), ControlStep::Balanced);
+    }
+
+    #[test]
+    fn a_depth_layer_is_followed_with_the_depth_model() {
+        let request = controlled(request(1.0), ControlKind::Depth, ControlStep::Balanced);
+        let built = graph(&request, one_pass(64, 32), 42, &models()).unwrap();
+        let json = built.to_json();
+        let loads = built.nodes_of("ETN_control_load");
+        assert_eq!(loads.len(), 1);
+        assert_eq!(json[&loads[0]]["inputs"]["weights"], "anima-lllite-depth-1.safetensors");
+        let applies = built.nodes_of("ETN_control_apply");
+        assert_eq!(json[&applies[0]]["inputs"]["strength"], json!(0.6f32));
+        // without the depth file, the depth layer can't be followed: the file is named
+        let mut without = models();
+        without.controls.retain(|f| !f.contains("depth"));
+        let Err(Error::Missing(missing)) = graph(&request, one_pass(64, 32), 42, &without) else {
+            panic!("a depth layer without the depth model should say what's missing")
+        };
+        assert!(format!("{missing:?}").contains("anima-lllite-depth-1.safetensors"));
+    }
+
+    #[test]
+    fn control_layers_are_chained_on_the_model_before_sampling() {
+        let mut request = controlled(request(1.0), ControlKind::LineArt, ControlStep::Close);
+        let (strength, end_percent) = control_settings(ControlKind::Scribble, ControlStep::Loose);
+        request.controls.push(crate::Control {
+            kind: ControlKind::Scribble,
+            strength,
+            end_percent,
+            picture: Picture::new(4, 4, [0u8, 0, 0, 255].repeat(16)).unwrap(),
+        });
+        let built = graph(&request, one_pass(64, 32), 42, &models()).unwrap();
+        let json = built.to_json();
+        let loads = built.nodes_of("ETN_control_load");
+        let applies = built.nodes_of("ETN_control_apply");
+        assert_eq!((loads.len(), applies.len()), (2, 2));
+        for load in &loads {
+            assert_eq!(json[load]["inputs"]["weights"], "anima-lllite-any-test-like-v2.safetensors");
+        }
+        assert_eq!(json[&applies[0]]["inputs"]["strength"], json!(0.7f32));
+        assert_eq!(json[&applies[0]]["inputs"]["end_percent"], json!(0.8f32));
+        assert_eq!(json[&applies[1]]["inputs"]["strength"], json!(0.5f32));
+        assert_eq!(json[&applies[1]]["inputs"]["end_percent"], json!(0.4f32));
+        for apply in &applies {
+            assert_eq!(json[apply]["inputs"]["start_percent"], 0.0);
+            assert!(json[apply]["inputs"].get("mask").is_none(), "a control image needs no mask");
+        }
+        // the sampler follows the last control's model
+        let samplers = built.nodes_of("KSampler");
+        assert_eq!(json[&samplers[0]]["inputs"]["model"], json!([&applies[1], 0]));
+        // each control was sent as a picture at the generation size
+        let images = built.nodes_of("ETN_LoadImageBase64");
+        assert_eq!(images.len(), 2);
+        for image in &images {
+            let png = procraft_engine::base64::decode(json[image]["inputs"]["image"].as_str().unwrap()).unwrap();
+            let sent = Picture::decode(&png).unwrap();
+            assert_eq!((sent.width, sent.height), (64, 32));
+        }
+    }
+
+    #[test]
+    fn a_refined_picture_follows_its_control_layers_too() {
+        let built = graph(
+            &controlled(request(0.5), ControlKind::LineArt, ControlStep::Balanced),
+            one_pass(64, 32),
+            1,
+            &models(),
+        )
+        .unwrap();
+        let json = built.to_json();
+        assert_eq!(built.nodes_of("ETN_control_apply").len(), 1);
+        let samplers = built.nodes_of("KSampler");
+        assert_eq!(json[&samplers[0]]["inputs"]["model"], json!([&built.nodes_of("ETN_control_apply")[0], 0]));
+        assert_eq!(json[&samplers[0]]["inputs"]["denoise"], 0.5);
+    }
+
+    #[test]
+    fn both_passes_of_a_picture_follow_their_control_layers() {
+        let built = graph(
+            &controlled(request(1.0), ControlKind::Scribble, ControlStep::Strict),
+            two_pass((1024, 768), (2048, 1536)),
+            42,
+            &models(),
+        )
+        .unwrap();
+        let json = built.to_json();
+        assert_eq!(built.nodes_of("ETN_control_load").len(), 2, "one for each pass");
+        assert_eq!(built.nodes_of("ETN_control_apply").len(), 2);
+        let images = built.nodes_of("ETN_LoadImageBase64");
+        let sizes: Vec<(u32, u32)> = images
+            .iter()
+            .map(|image| {
+                let png = procraft_engine::base64::decode(json[image]["inputs"]["image"].as_str().unwrap()).unwrap();
+                let sent = Picture::decode(&png).unwrap();
+                (sent.width, sent.height)
+            })
+            .collect();
+        assert_eq!(sizes, vec![(1024, 768), (2048, 1536)]);
+        let samplers = built.nodes_of("KSampler");
+        let applies = built.nodes_of("ETN_control_apply");
+        assert_eq!(json[&samplers[0]]["inputs"]["model"], json!([&applies[0], 0]));
+        assert_eq!(json[&samplers[1]]["inputs"]["model"], json!([&applies[1], 0]));
+    }
+
+    #[test]
+    fn a_selection_chains_its_control_layers_with_the_inpaint_control() {
+        let built = graph(
+            &controlled(selection(SelectionMode::Fill), ControlKind::LineArt, ControlStep::Balanced),
+            one_pass(64, 64),
+            42,
+            &models(),
+        )
+        .unwrap();
+        let json = built.to_json();
+        let loads = built.nodes_of("ETN_control_load");
+        let applies = built.nodes_of("ETN_control_apply");
+        assert_eq!((loads.len(), applies.len()), (2, 2));
+        let (line_apply, inpaint_load, inpaint_apply) = loads
+            .iter()
+            .zip(&applies)
+            .find(|(load, _)| json[load]["inputs"]["weights"] == "anima-lllite-any-test-like-v2.safetensors")
+            .map(|(load, apply)| (apply.clone(), load.clone()))
+            .and_then(|(line_apply, line_load)| {
+                loads
+                    .iter()
+                    .zip(&applies)
+                    .find(|(load, _)| json[load]["inputs"]["weights"] == "anima-lllite-inpainting-v2.safetensors")
+                    .map(|(load, apply)| (line_apply, load.clone(), apply.clone()))
+                    .inspect(|_| {
+                        assert_eq!(json[&line_load]["inputs"]["model"], json!(["1", 0]), "on the checkpoint");
+                    })
+            })
+            .expect("both controls");
+        assert!(json[&line_apply]["inputs"].get("mask").is_none());
+        assert!(json[&inpaint_apply]["inputs"].get("mask").is_some());
+        // the inpaint control is loaded on top of the line control, then applied
+        assert_eq!(json[&inpaint_load]["inputs"]["model"], json!([&line_apply, 0]));
+        assert_eq!(json[&inpaint_apply]["inputs"]["model"], json!([&inpaint_load, 0]));
+        let samplers = built.nodes_of("KSampler");
+        assert_eq!(json[&samplers[0]]["inputs"]["model"], json!([&inpaint_apply, 0]));
+    }
+
+    #[test]
+    fn loras_and_the_rescale_go_between_the_loaders_and_everything_else() {
+        let mut r = request(1.0);
+        r.style.loras = vec![
+            crate::styles::LoraUse { file: "anima/a.safetensors".into(), strength: 0.7, trigger: String::new() },
+            crate::styles::LoraUse { file: "anima/b.safetensors".into(), strength: 1.2, trigger: String::new() },
+        ];
+        r.style.rescale_cfg = Some(0.7);
+        r.style.vae = Some("other_vae.safetensors".into());
+        let built = graph(&r, one_pass(1024, 1024), 1, &models()).unwrap();
+        let json = built.to_json();
+        let loras = built.nodes_of("LoraLoader");
+        assert_eq!(loras.len(), 2);
+        assert_eq!(json[&loras[0]]["inputs"]["model"], json!(["1", 0]));
+        assert_eq!(json[&loras[0]]["inputs"]["clip"], json!(["2", 0]));
+        assert_eq!(json[&loras[0]]["inputs"]["strength_model"], json!(0.7_f32));
+        assert_eq!(json[&loras[1]]["inputs"]["model"], json!([&loras[0], 0]));
+        let rescale = built.nodes_of("RescaleCFG");
+        assert_eq!(json[&rescale[0]]["inputs"]["model"], json!([&loras[1], 0]));
+        let samplers = built.nodes_of("KSampler");
+        assert_eq!(json[&samplers[0]]["inputs"]["model"], json!([&rescale[0], 0]));
+        for encode in built.nodes_of("CLIPTextEncode") {
+            assert_eq!(json[&encode]["inputs"]["clip"], json!([&loras[1], 1]));
+        }
+        assert_eq!(json["3"]["inputs"]["vae_name"], "other_vae.safetensors");
+    }
+
+    #[test]
+    fn a_style_missing_a_lora_stops_before_anything_is_queued() {
+        let mut r = request(1.0);
+        r.style.missing = vec![(crate::styles::Part::Lora, "anima/gone.safetensors".into())];
+        let err = graph(&r, one_pass(64, 64), 1, &models()).unwrap_err();
+        assert_eq!(err.to_string(), "the server is missing anima/gone.safetensors in models/loras");
+    }
+
+    #[test]
+    fn a_missing_vae_is_named() {
+        let mut m = models();
+        m.vaes.clear();
+        let err = graph(&request(1.0), one_pass(64, 64), 1, &m).unwrap_err();
+        assert_eq!(err.to_string(), "the server is missing qwen_image_vae.safetensors in models/vae");
+    }
+}

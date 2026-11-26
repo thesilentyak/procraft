@@ -1,0 +1,121 @@
+name: Upstream sync
+
+# ProCraft Diffusion follows ProCraft's releases (artcraft-android/procraft). Daily at 08:00 London
+# time, and by hand (Actions > Upstream sync > Run workflow), this looks for ProCraft's latest
+# release. If main-diffusion already has it, the run passes with nothing to do. If not, it merges
+# that release into main-diffusion on the runner, then runs ProCraft's own checks and ours. It
+# only checks: nothing is pushed anywhere.
+# - merged and passing: the run passes, and its summary says which release is ready to take in
+#   (ask the agent, or see CLAUDE.md's "Taking in ProCraft's changes");
+# - a conflict or a failing check: the run fails (GitHub emails), and its summary says what.
+# (A release in ProCraft's repository can't start a run here, so it checks daily instead. Pushing
+# the merge from here isn't possible: GitHub refuses pushes from a workflow's own token that carry
+# workflow files, and a personal token would be a secret to look after.)
+on:
+  # 08:00 in London is 08:00 UTC in winter and 07:00 UTC in summer: both are scheduled, and the
+  # one for the other season stops at once. It goes by which schedule fired, not the clock, since
+  # GitHub often starts scheduled runs late (an hour or more around the top of the hour)
+  schedule:
+    - cron: "0 7 * * *"
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: "1.99.0"
+  NDK_VERSION: "29.0.14206865"
+  BRANCH: main-diffusion
+
+jobs:
+  sync:
+    name: Merge ProCraft's latest release and check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+      - name: Merge upstream
+        id: merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/artcraft-android/procraft.git
+          # summer time (+0100) keeps the 07:00 UTC schedule, winter the 08:00 one
+          if [ "$(TZ=Europe/London date +%z)" = +0100 ]; then season="0 7 * * *"; else season="0 8 * * *"; fi
+          if [ "${{ github.event_name }}" = schedule ] && [ "${{ github.event.schedule }}" != "$season" ]; then
+            echo "new=0" >> "$GITHUB_OUTPUT"
+            echo "The other season's schedule: the one for 08:00 in London does it." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # the release ProCraft marks Latest (drafts and pre-releases are left out)
+          tag=$(gh api repos/artcraft-android/procraft/releases/latest --jq .tag_name)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          git fetch --quiet --no-tags upstream "refs/tags/$tag:refs/tags/$tag"
+          new=$(git rev-list --count "HEAD..$tag")
+          echo "new=$new" >> "$GITHUB_OUTPUT"
+          if [ "$new" = 0 ]; then
+            echo "Up to date with ProCraft's latest release, $tag." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if ! git merge --no-ff --no-edit -m "chore: merge ProCraft's $tag ($new commits)" "$tag"; then
+            {
+              echo "## ProCraft's $tag ($new new commits) conflicts with ours"
+              echo
+              echo "Files to resolve by hand:"
+              git diff --name-only --diff-filter=U | sed 's/^/- /'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Merged ProCraft's $tag ($new commits); checking." >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/setup-java@v4
+        if: steps.merge.outputs.new != '0'
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: dtolnay/rust-toolchain@master
+        if: steps.merge.outputs.new != '0'
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: aarch64-linux-android
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        if: steps.merge.outputs.new != '0'
+      # ProCraft's checks, then ours (generation is off in procraft-core by default)
+      - name: Rust
+        if: steps.merge.outputs.new != '0'
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy -p procraft-core --features generation --all-targets -- -D warnings
+          cargo test --workspace
+          cargo test -p procraft-core --features generation --lib
+      - name: NDK and cargo-ndk
+        if: steps.merge.outputs.new != '0'
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          cargo install cargo-ndk --version "^4" --locked
+      - uses: gradle/actions/setup-gradle@v4
+        if: steps.merge.outputs.new != '0'
+      - name: Android
+        if: steps.merge.outputs.new != '0'
+        working-directory: android
+        run: ./gradlew --no-daemon :app:assembleDebug -Pprocraft.abis=arm64-v8a
+      - name: Report
+        if: steps.merge.outputs.new != '0'
+        run: |
+          {
+            echo "## Ready: ProCraft's ${{ steps.merge.outputs.tag }} (${{ steps.merge.outputs.new }} commits) merges cleanly and passes"
+            echo
+            echo "Take it in by asking the agent (the steps are in CLAUDE.md, under Following upstream)."
+          } >> "$GITHUB_STEP_SUMMARY"

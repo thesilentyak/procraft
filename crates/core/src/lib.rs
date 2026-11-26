@@ -32,6 +32,14 @@ mod crop_edit;
 mod device;
 mod frame;
 mod gallery;
+#[cfg(feature = "generation")]
+mod generation;
+#[cfg(feature = "generation")]
+mod generation_studio;
+#[cfg(feature = "generation")]
+mod generation_styles;
+#[cfg(feature = "generation")]
+mod generation_tags;
 mod gestures;
 mod gradients;
 mod grain_store;
@@ -138,6 +146,18 @@ pub use crop_edit::CropShown;
 pub use device::keep_device;
 pub use frame::{configure, screen_profile};
 pub use gallery::{ArtworkStore, GalleryArtwork, GalleryEntry, ZipKind, zip_file_kind};
+#[cfg(feature = "generation")]
+pub use generation::{
+    ControlLayerInfo, ControlSetting, ControlStep, FeatureStatus, Generation, GenerationError, GenerationFeature,
+    GenerationMode, GenerationResolution, GenerationSettings, GenerationState, ResultInfo, RunInfo, RunSettings,
+    SelectionInfo, ServerConnection, ServerStatus, SizeInfo, generation_address,
+};
+#[cfg(feature = "generation")]
+pub use generation_studio::{LoraSetting, LoraSuggestion, ServerLists, StudioPicture, StudioState, StyleEdit};
+#[cfg(feature = "generation")]
+pub use generation_styles::{StyleFileText, StyleInfo, StyleKind};
+#[cfg(feature = "generation")]
+pub use generation_tags::{TagCompletion, TagKind, TagSuggestion};
 pub use gestures::{
     GestureOption, GesturePurpose, GestureSettings, KeptGestures, MAX_DELAY_S, MIN_DELAY_S, Trigger, gesture_options,
     gesture_purpose_heading, gesture_purpose_title, gesture_purposes, gesture_trigger_label,
@@ -148,8 +168,9 @@ pub use history::ColourHistory;
 pub use hues::{HueControl, RING_HUES, SLIDER_HUES, hue_at, hue_position, hue_stops};
 pub use keys::{KeyCombo, KeyDrag, KeyShortcut, ShortcutGroup, ShortcutRow, key_shortcut, key_shortcut_list};
 pub use layers::{
-    BlendModeInfo, Blocked, HiddenBy, LayerInfo, LayerOption, LayerOptionRow, LayerType, ThumbnailImage, blend_modes,
-    brush_blend_modes, combine_blend_modes, grain_blend_modes, layers_for, set_layer_budget, set_resident_budget,
+    BlendModeInfo, Blocked, HiddenBy, LayerControl, LayerInfo, LayerOption, LayerOptionRow, LayerType, ThumbnailImage,
+    blend_modes, brush_blend_modes, combine_blend_modes, grain_blend_modes, layers_for, set_layer_budget,
+    set_resident_budget,
 };
 pub use liquify::liquify_reach;
 pub use modes::{ModeButton, ModeSwitch, Modes, mode_switch};
@@ -1173,6 +1194,8 @@ pub(crate) struct Shared {
     projection: Mutex<Option<JoinHandle<()>>>,
     /// Held while the artwork is saved: one save at a time, so two never write the same files.
     pub(crate) saving: Mutex<project::Saved>,
+    /// How many strokes have started: generation's shown preview hides when this changes.
+    pub(crate) preview_strokes: Arc<std::sync::atomic::AtomicU64>,
     /// The artwork's edits as the last save that worked found them, [`project::NOT_SAVED`]
     /// before one (read without waiting on a save).
     pub(crate) edits_saved: std::sync::atomic::AtomicU64,
@@ -1588,6 +1611,7 @@ impl CanvasSession {
                 thread: Mutex::new(None),
                 projection: Mutex::new(None),
                 saving: Mutex::new(project::Saved::default()),
+                preview_strokes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 edits_saved: std::sync::atomic::AtomicU64::new(project::NOT_SAVED),
                 export_progress: std::sync::atomic::AtomicU32::new(0),
                 save_failure: Mutex::new((None, false)),
@@ -1692,6 +1716,14 @@ impl CanvasSession {
         }
         if let Some(kept) = st.pad_strokes.as_mut() {
             kept.push((pointer, samples.clone()));
+        }
+        // a stroke starting hides the generation result shown over the canvas (the bar's results
+        // stay): its counter says so to generation, and the overlay comes off now
+        self.shared.preview_strokes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref())
+            && canvas.has_overlay()
+        {
+            let _ = canvas.set_overlay(gpu, None);
         }
         // a layer being transformed or adjusted takes no paint, unless the adjustment is painted on
         if st.transform.is_some() || (st.adjusting && !st.pencil) {

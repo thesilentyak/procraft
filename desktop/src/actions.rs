@@ -67,6 +67,9 @@ const TAB_IN_S: f32 = 0.2;
 /// [`Act::Prefs`] tells it a setting changed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Act {
+    /// Image generation's server view, in the Generate popover.
+    #[cfg(feature = "generation")]
+    GenerationSettings,
     TipAttachment,
     InsertFile,
     InsertPhoto,
@@ -392,6 +395,8 @@ fn groups(tab: usize, showing: &Showing, prefs: &Prefs) -> Vec<Vec<Row>> {
                 vec![
                     Button("Pressure and Smoothing", None, Some(Act::Page(Page::Pressure))),
                     Button("Gesture controls", None, Some(Act::GestureControls)),
+                    #[cfg(feature = "generation")]
+                    Button("Image generation", None, Some(Act::GenerationSettings)),
                     Button("Plugins", None, Some(Act::Page(Page::Plugins))),
                 ],
                 vec![
@@ -414,7 +419,10 @@ fn groups(tab: usize, showing: &Showing, prefs: &Prefs) -> Vec<Vec<Row>> {
             ]
         }
         _ => vec![
-            vec![Button("About ProCraft", None, Some(Act::About)), Button("Licences", None, Some(Act::Licences))],
+            vec![
+                Button("About ProCraft Diffusion", None, Some(Act::About)),
+                Button("Licences", None, Some(Act::Licences)),
+            ],
             vec![
                 Button("Keyboard shortcuts", None, Some(Act::Shortcuts)),
                 Button("Advanced settings", None, Some(Act::AdvancedSettings)),

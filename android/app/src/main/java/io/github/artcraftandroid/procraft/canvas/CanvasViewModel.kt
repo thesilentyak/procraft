@@ -105,7 +105,7 @@ internal fun placeAfterSetMove(set: Int, from: Int, to: Int): Int = when (set) {
     else -> set
 }
 
-enum class Panel { NONE, LAYERS, COLOR, BRUSHES, ACTIONS, ADJUSTMENTS }
+enum class Panel { NONE, LAYERS, COLOR, BRUSHES, ACTIONS, ADJUSTMENTS, GENERATE }
 
 /** The eyedropper while it is open: the window point (pixels), what is shown around it, the colour it would pick. */
 class PickState(val x: Float, val y: Float, val image: ImageBitmap?, val rgb: Int?, val fromReference: Boolean = false)
@@ -2441,6 +2441,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         endLayerOpacity()
         endTransform(true)
         endAdjustment(true)
+        io.github.artcraftandroid.procraft.generation.GenerationUi.leave(this)
         val s = session ?: return
         noteTime()
         keepChoices(s)
@@ -2780,6 +2781,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         // kept saved by the core, a few seconds after it changes, once nothing is under way that
         // saving would cut short (only the layers that changed are written); a failure told
         s.startAutosave(dir.path)
+        // image generation's results for this artwork are kept in its folder too
+        io.github.artcraftandroid.procraft.generation.GenerationUi.opened(s, dir.path)
         viewModelScope.launch(Dispatchers.IO) {
             while (session === s) {
                 kotlinx.coroutines.delay(SAVE_FAILURE_POLL_MS)
@@ -7739,6 +7742,10 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     fun invertLayer(l: LayerInfo) = layerChange { it.invertLayer(l.id) }
 
     fun toggleReference(l: LayerInfo) = layerChange(thumbs = false) { it.setLayerReference(l.id, !l.reference) }
+
+    /** Makes [l] a control layer of `kind` for image generation, or (null) a plain layer again. */
+    fun setLayerControl(l: LayerInfo, kind: io.github.artcraftandroid.procraft.core.LayerControl?) =
+        layerChange(thumbs = false) { it.setLayerControl(l.id, kind) }
 
     fun toggleClipped(l: LayerInfo) = layerChange(thumbs = false) { it.setLayerClipped(l.id, !l.clipped) }
 

@@ -636,6 +636,7 @@ fn add_item(
                 text: None,
                 private: false,
                 assisted: false,
+                control: None,
                 plugin: None,
             });
         }
@@ -668,6 +669,7 @@ fn add_item(
                 text,
                 private: item.bool("private").unwrap_or(false),
                 assisted: item.bool("perspectiveAssisted").unwrap_or(false),
+                control: None,
                 plugin: None,
             });
             if !uuid.is_empty() {
@@ -692,6 +694,7 @@ fn add_item(
                     text: None,
                     private: false,
                     assisted: false,
+                    control: None,
                     plugin: None,
                 });
                 if let Some(m) = mask.string("UUID") {
