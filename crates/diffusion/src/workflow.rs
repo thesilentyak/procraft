@@ -644,6 +644,36 @@ mod tests {
     }
 
     #[test]
+    fn the_starter_workflows_read_and_prepare() {
+        let new_picture = Workflow::parse("New", include_str!("../tests/workflows/z-image-new-picture.json")).unwrap();
+        let params = new_picture.parameters(&Map::new());
+        assert_eq!(params, vec![Param { name: "Prompt".into(), kind: ParamKind::Prompt, default: String::new() }]);
+        let prepared = new_picture
+            .prepare(&params, &inputs(&[("Prompt", ParamValue::Text("koi pond, scenery, no humans".into()))]))
+            .unwrap();
+        assert_eq!(input(&prepared, "KSampler", "seed"), 7);
+        assert_eq!(input(&prepared, "CLIPTextEncode", "text"), "koi pond, scenery, no humans");
+        let scaled = input(&prepared, "ImageScaleToTotalPixels", "image");
+        assert_eq!(prepared.graph.class(scaled[0].as_str().unwrap()), Some("ETN_LoadImageBase64"));
+        assert_eq!(prepared.graph.nodes_of("ETN_SendImageWebSocket").len(), 1);
+
+        let paint_over = Workflow::parse("Paint", include_str!("../tests/workflows/z-image-paint-over.json")).unwrap();
+        let params = paint_over.parameters(&Map::new());
+        assert_eq!(params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), vec!["Prompt", "Strength"]);
+        assert_eq!(params[1].kind, ParamKind::Number { min: Some(0.05), max: Some(1.0), integer: false });
+        let mut run = inputs(&[]);
+        let mut mask = vec![0u8; 64 * 48];
+        mask[20 * 64 + 20] = 255;
+        run.selection = Some(mask);
+        let prepared = paint_over.prepare(&params, &run).unwrap();
+        assert_eq!(input(&prepared, "KSampler", "denoise"), 0.6);
+        // the selection's point and its 32 pixels' padding, kept on the canvas
+        assert_eq!(prepared.area, [0, 0, 53, 48]);
+        let noise = input(&prepared, "SetLatentNoiseMask", "mask");
+        assert_eq!(prepared.graph.class(noise[0].as_str().unwrap()), Some("ETN_LoadMaskBase64"));
+    }
+
+    #[test]
     fn repeated_names_are_numbered() {
         let text = r#"{
             "1": {"class_type": "ETN_Parameter", "inputs": {"name": "Strength", "type": "number", "default": "0.5"}},

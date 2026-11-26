@@ -188,9 +188,9 @@ the same way; a result carries its layer name and offset.
 | W2 | Worker: subscribe, the live workflow, runs with several pictures (**built 2026-11-26**) | Unit tests on recorded socket messages; the user's server |
 | W3 | Core API, kept files, the live workflow kept between starts (**built 2026-11-26**) | Core tests |
 | W4 | Desktop popover | The desktop app on the user's PC |
-| W5 | Android popover | The APK from GitHub Actions on the user's phone |
-| W6 | Import and Export, layer pickers | Both apps |
-| W7 | Starter workflows for the user's own models (text to image, refine, selection fill), with only a prompt in view | The user's server and phone |
+| W5 | Android popover (**built 2026-11-26**; kept workflows are `.json` files in the styles folder itself, beside the styles, not a Workflows folder below it; the popover's prompt field is the workflow's first prompt) | The APK from GitHub Actions on the user's phone |
+| W6 | Import and Export, layer pickers (**built on Android 2026-11-26**) | Both apps |
+| W7 | Starter workflows for the user's own models (text to image, refine, selection fill), with only a prompt in view (**first two 2026-11-26**: Z-Image Turbo "new picture" and "paint over", in `dev/starters/`, made by `make_starters.py` at about 1 MP, the app scaling the result to the canvas) | The user's server and phone |
 
 ## C2. Testing
 
