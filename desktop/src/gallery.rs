@@ -145,6 +145,8 @@ pub enum Asked {
     ScreenSize(Option<String>),
     /// A new artwork of a plugin's kind (`<id>.<key>`), the screen's size, in this folder.
     PluginKind(String, Option<String>),
+    /// A new pixel art artwork this wide and high, in this folder.
+    PixelArt(u32, u32, Option<String>),
     Import(Option<String>),
     Photo(Option<String>),
     /// These artworks written as this format, where the user picks.
@@ -285,6 +287,8 @@ pub struct Gallery {
     custom: Option<crate::custom_canvas::CustomCanvas>,
     /// The preset row swiped open, and the one being dragged (and how far it is).
     preset_open: Option<usize>,
+    /// New canvas's Pixel art row open, its sizes showing.
+    pixel_open: bool,
     preset_drag: Option<(usize, f32)>,
     /// What the app is, over the gallery, and its mark's picture once read.
     about: bool,
@@ -424,6 +428,7 @@ impl Gallery {
             rest: DragRest::default(),
             custom: None,
             preset_open: None,
+            pixel_open: false,
             preset_drag: None,
             about: false,
             mark: None,
@@ -2130,7 +2135,9 @@ impl Gallery {
         let list_height = (45.0 + 45.0 * self.presets.len().saturating_sub(1) as f32).min(PRESETS_MOST);
         // a row more for each kind of artwork a plugin makes
         let kinds_height = self.kinds.len() as f32 * (9.5 + 38.0);
-        let height = panel::ARROW_HEIGHT + NEW_HEADER + 38.0 + 9.5 + list_height + kinds_height + 30.0;
+        // the Pixel art row, and its sizes while it's open
+        let pixel_height = 9.5 + 38.0 + if self.pixel_open { 38.0 } else { 0.0 };
+        let height = panel::ARROW_HEIGHT + NEW_HEADER + 38.0 + pixel_height + 9.5 + list_height + kinds_height + 30.0;
         let rect = Rect::from_min_size(pos2(left, screen.top() + 56.5), vec2(NEW_WIDTH, height));
         let mut asked = None;
         let mut close = false;
@@ -2168,7 +2175,12 @@ impl Gallery {
             if ui.interact(row, ui.scope_id().with("screen size"), Sense::click()).clicked() {
                 asked = Some(Asked::ScreenSize(self.folder()));
             }
-            let list = Rect::from_min_size(pos2(row.left(), row.bottom() + 9.5), vec2(row.width(), list_height));
+            let pixel =
+                Rect::from_min_size(pos2(row.left(), row.bottom() + 9.5), vec2(row.width(), pixel_height - 9.5));
+            if let Some((w, h)) = pixel_art_rows(ui, pixel, &mut self.pixel_open) {
+                asked = Some(Asked::PixelArt(w, h, self.folder()));
+            }
+            let list = Rect::from_min_size(pos2(row.left(), pixel.bottom() + 9.5), vec2(row.width(), list_height));
             ui.painter().rect_filled(list, 24.0, argb(LIGHT_ROW));
             // the plugins' kinds of artwork under the presets, each the screen's size
             for (k, kind) in self.kinds.iter().enumerate() {
@@ -2302,6 +2314,37 @@ fn preset_row(ui: &Ui, row: Rect, name: &str, size: &str, profile: &str) {
     }
     let galley = one_line(ui, name, 17.0, Weight::Regular, ink, x - 8.0 - (row.left() + 17.0));
     ui.painter().galley(pos2(row.left() + 17.0, row.center().y - galley.size().y / 2.0), galley, ink);
+}
+
+/// New canvas's Pixel art row in `rect` (38 tall, and 38 more of sizes while `open`): a click on it
+/// opens or closes the sizes, and a size clicked is the canvas asked for.
+fn pixel_art_rows(ui: &Ui, rect: Rect, open: &mut bool) -> Option<(u32, u32)> {
+    let ink = argb(LIGHT_TEXT);
+    ui.painter().rect_filled(rect, 19.0, argb(LIGHT_ROW_STRONG));
+    let head = Rect::from_min_size(rect.min, vec2(rect.width(), 38.0));
+    let sizes = procraft_core::pixel_art_sizes();
+    let range = format!("{}\u{2013}{}px", sizes.first().copied().unwrap_or(0), sizes.last().copied().unwrap_or(0));
+    preset_row(ui, head, "Pixel art", &range, P3);
+    if ui.interact(head, ui.scope_id().with("pixel art"), Sense::click()).clicked() {
+        *open = !*open;
+    }
+    if !*open || sizes.is_empty() {
+        return None;
+    }
+    let mut picked = None;
+    let gap = 6.0;
+    let width = (rect.width() - 24.0 - gap * (sizes.len() as f32 - 1.0)) / sizes.len() as f32;
+    for (i, &n) in sizes.iter().enumerate() {
+        let chip =
+            Rect::from_min_size(pos2(rect.left() + 12.0 + i as f32 * (width + gap), head.bottom()), vec2(width, 28.0));
+        let response = ui.interact(chip, ui.scope_id().with(("pixel size", n)), Sense::click());
+        ui.painter().rect_filled(chip, 14.0, argb(if response.hovered() { LIGHT_CHIP } else { LIGHT_ROW }));
+        text(ui.painter(), chip.center(), Align2::CENTER_CENTER, &n.to_string(), 15.0, Weight::Regular, ink);
+        if response.clicked() {
+            picked = Some((n, n));
+        }
+    }
+    picked
 }
 
 /// `text` on one line at most `max_width` wide, ending in "…" when cut.

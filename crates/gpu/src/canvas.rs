@@ -1774,6 +1774,21 @@ struct SurroundUniform {
     v2: [f32; 4],
 }
 
+/// The pixel grid's: target pixels to canvas pixels, the canvas's size, the scale and line width,
+/// and the lines' premultiplied colour (see `pixel_grid.wgsl`).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct PixelGridUniform {
+    m0: [f32; 4],
+    m1: [f32; 4],
+    v0: [f32; 4],
+    colour: [f32; 4],
+}
+
+/// The pixel grid's lines: a mid grey, seen on dark pixels and light, at this alpha at full strength.
+const PIXEL_GRID_GREY: f32 = 0.5;
+const PIXEL_GRID_ALPHA: f32 = 0.45;
+
 /// Where the surround picture lies (target pixels), the surround's colour (sRGB) and whether the
 /// target encodes sRGB itself.
 #[repr(C)]
@@ -3238,6 +3253,8 @@ pub(crate) struct Pipelines {
     surround_pipeline_layout: wgpu::PipelineLayout,
     /// A picture round the canvas in place of the grid (drawn with the display's layout).
     surround_picture_module: wgpu::ShaderModule,
+    /// A pixel art canvas's pixel grid (drawn with the surround's layout).
+    pixel_grid_module: wgpu::ShaderModule,
     stamp_layout: wgpu::PipelineLayout,
     overlay_module: wgpu::ShaderModule,
     /// Frosted panels: the blur passes and the regions drawn.
@@ -3265,6 +3282,7 @@ struct ScreenPipelines {
     blur: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     frost: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     veil: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
+    pixel_grid: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
 }
 
 pub struct Canvas {
@@ -3399,6 +3417,9 @@ pub struct Canvas {
     crisp_bind: wgpu::BindGroup,
     /// A picture shown over the canvas in the window only (see [`Canvas::set_overlay`]).
     overlay: Option<Overlay>,
+    /// How strongly a pixel art canvas's pixel grid shows in the window (see
+    /// [`Canvas::set_pixel_grid`]); 0 none.
+    pixel_grid: f32,
     /// How much the layers but the current one are dimmed on the screen (0 to 1; 0 not at all, see
     /// [`Canvas::set_dim_others`]), and what the screen shows while they are.
     dim_others: f32,
@@ -3896,6 +3917,7 @@ impl Canvas {
             display_bind,
             crisp_bind,
             overlay: None,
+            pixel_grid: 0.0,
             dim_others: 0.0,
             trace: None,
             identity_lut,
@@ -6634,6 +6656,12 @@ impl Canvas {
 
     pub fn has_selection(&self) -> bool {
         self.selection.is_some()
+    }
+
+    /// Shows a line along every pixel's edge over the canvas, in the window only, `strength` (0 to
+    /// 1) strong; 0 none. A pixel art canvas's grid, shown when zoomed in close.
+    pub fn set_pixel_grid(&mut self, strength: f32) {
+        self.pixel_grid = if strength.is_finite() { strength.clamp(0.0, 1.0) } else { 0.0 };
     }
 
     /// Shows `rgba` (premultiplied RGBA8 in the canvas's colours, `rect`'s size) over the canvas
@@ -11577,6 +11605,7 @@ impl Canvas {
             surround_module,
             surround_pipeline_layout,
             surround_picture_module,
+            pixel_grid_module,
             overlay_module,
             stamp_layout,
             selection_module,
@@ -11595,6 +11624,7 @@ impl Canvas {
             selection: selection_pipelines,
             frost,
             veil: veil_pipelines,
+            pixel_grid: pixel_grid_pipelines,
             ..
         } = &mut self.screen;
         let pipeline = display.entry(target.format).or_insert_with(|| {
@@ -11766,6 +11796,33 @@ impl Canvas {
             pass.set_bind_group(1, &self.uniform_bind, &[offset]);
             pass.set_bind_group(2, target.lut.map_or(&self.identity_lut, |l| &l.bind), &[]);
             pass.draw(0..6, 0..1);
+        }
+
+        // a pixel art canvas's pixel grid, over the pixels and under the selection's look
+        if let Some(inv) = target.to_screen.inverse().filter(|_| self.pixel_grid > 0.0) {
+            let pipeline = pixel_grid_pipelines.entry(target.format).or_insert_with(|| {
+                blended_pipeline(
+                    device,
+                    kept,
+                    surround_pipeline_layout,
+                    pixel_grid_module,
+                    "pixel grid",
+                    ("vs_pixel_grid", "fs_pixel_grid"),
+                    target.format,
+                    Some(PREMULTIPLIED_OVER),
+                )
+            });
+            let alpha = PIXEL_GRID_ALPHA * self.pixel_grid;
+            let grey = if srgb { srgb_to_linear(PIXEL_GRID_GREY) } else { PIXEL_GRID_GREY } * alpha;
+            let offset = uniforms.push(&PixelGridUniform {
+                m0: [inv.a, inv.b, inv.c, inv.d],
+                m1: [inv.e, inv.f, self.width as f32, self.height as f32],
+                v0: [target.to_screen.scale_factor(), 1.0, 0.0, 0.0],
+                colour: [grey, grey, grey, alpha],
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &self.uniform_bind, &[offset]);
+            pass.draw(0..3, 0..1);
         }
 
         // the selection: bands over what is not selected, or what is selected tinted or covered
@@ -13180,6 +13237,7 @@ impl Pipelines {
         let display_module = module("display", include_str!("shaders/display.wgsl"));
         let surround_module = module("surround", include_str!("shaders/surround.wgsl"));
         let surround_picture_module = module("surround picture", include_str!("shaders/surround_picture.wgsl"));
+        let pixel_grid_module = module("pixel grid", include_str!("shaders/pixel_grid.wgsl"));
         let backdrop_module = module("backdrop", include_str!("shaders/backdrop.wgsl"));
         let transform_module = module("transform", include_str!("shaders/transform.wgsl"));
         let selection_module = module("selection", include_str!("shaders/selection.wgsl"));
@@ -13727,6 +13785,7 @@ impl Pipelines {
             surround_module,
             surround_pipeline_layout,
             surround_picture_module,
+            pixel_grid_module,
 
             stamp_layout,
             overlay_module,

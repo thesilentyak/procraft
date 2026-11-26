@@ -39,6 +39,8 @@ pub enum Format {
     ModelArtwork,
     /// A plugin's artwork, its shapes kept.
     Svg,
+    /// A pixel art canvas's picture as a PNG, each pixel a square this many across.
+    PngScaled(u32),
 }
 
 impl Format {
@@ -48,9 +50,12 @@ impl Format {
             Format::Package => "Procreate",
             Format::Psd => "PSD",
             Format::Pdf | Format::LayersPdf => "PDF",
-            Format::Png | Format::LayerPngs | Format::ChosenLayerPngs | Format::ModelRender | Format::ModelTextures => {
-                "PNG"
-            }
+            Format::Png
+            | Format::PngScaled(_)
+            | Format::LayerPngs
+            | Format::ChosenLayerPngs
+            | Format::ModelRender
+            | Format::ModelTextures => "PNG",
             Format::Tiff | Format::ModelTiff => "TIFF",
             Format::Jpeg | Format::ModelJpeg => "JPEG",
             Format::ModelObj => "OBJ",
@@ -70,9 +75,12 @@ impl Format {
             Format::Package => "procreate",
             Format::Psd => "psd",
             Format::Pdf | Format::LayersPdf => "pdf",
-            Format::Png | Format::LayerPngs | Format::ChosenLayerPngs | Format::ModelRender | Format::ModelTextures => {
-                "png"
-            }
+            Format::Png
+            | Format::PngScaled(_)
+            | Format::LayerPngs
+            | Format::ChosenLayerPngs
+            | Format::ModelRender
+            | Format::ModelTextures => "png",
             Format::Tiff | Format::ModelTiff => "tiff",
             Format::Jpeg | Format::ModelJpeg => "jpg",
             Format::ModelObj => "zip",
@@ -872,6 +880,7 @@ pub fn export(
             Format::Pdf => session.export_pdf(at, false, pdf_quality),
             Format::LayersPdf => session.export_pdf(at, true, pdf_quality),
             Format::Png => session.export_png(at),
+            Format::PngScaled(scale) => session.export_png_scaled(at, scale),
             Format::Tiff => session.export_tiff(at),
             Format::Jpeg => session.export_jpeg(at),
             Format::ModelJpeg => session.export_model_jpeg(at),

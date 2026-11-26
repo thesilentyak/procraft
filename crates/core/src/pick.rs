@@ -33,6 +33,7 @@ impl CanvasSession {
         let corner = Vec2::new(x - side as f32 / 2.0, y - side as f32 / 2.0);
         let grid = st.surround_grid(Vec2::ZERO - corner);
         let surround = st.surround();
+        let crisp_from = crate::pixel_art::crisp_from(&st.doc, st.display_scale);
         let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else { return None };
         crate::surround::put_on(canvas, gpu, st.surround_picture.as_deref());
         let format = wgpu::TextureFormat::Rgba8Unorm;
@@ -62,7 +63,7 @@ impl CanvasSession {
                 backdrop: None,
                 convert: None,
                 lut: None,
-                crisp_from: st.display_scale,
+                crisp_from,
                 look: None,
                 traced: false,
             }),

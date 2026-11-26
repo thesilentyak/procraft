@@ -283,6 +283,8 @@ pub struct Showing {
     pub paint_through: bool,
     /// The artwork is a plugin's: Share Image offers SVG too.
     pub svg: bool,
+    /// A pixel art canvas: Share Image offers PNGs scaled up too.
+    pub pixel_art: bool,
     /// What Share Image calls the files plugins make of the artwork's layers of kinds they add.
     pub plugin_exports: Vec<String>,
     /// The controls and actions plugins put in the Canvas tab, after its own rows.
@@ -412,6 +414,13 @@ fn groups(tab: usize, showing: &Showing, prefs: &Prefs) -> Vec<Vec<Row>> {
             ]
             .into_iter()
             .chain(showing.svg.then_some(Button("SVG", None, Some(Act::Share(Format::Svg)))))
+            // a pixel art canvas's picture scaled up, each pixel a square
+            .chain(
+                [(2, "PNG \u{d7}2"), (4, "PNG \u{d7}4"), (8, "PNG \u{d7}8"), (16, "PNG \u{d7}16")]
+                    .into_iter()
+                    .filter(|_| showing.pixel_art)
+                    .map(|(n, label)| Button(label, None, Some(Act::Share(Format::PngScaled(n))))),
+            )
             // files plugins make of the artwork's layers, under their own names
             .chain(
                 showing

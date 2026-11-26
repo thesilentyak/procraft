@@ -754,6 +754,10 @@ pub struct Document {
     /// that upright screen has them, turned with it (see `StrokeBuilder::on_canvas_made_turned`).
     #[serde(default, deserialize_with = "or_default", skip_serializing_if = "is_upright")]
     pub made_turns: u8,
+    /// A pixel art canvas: its tools set whole pixels with hard edges, and it shows its pixels as
+    /// squares at every zoom (see `crate::pixel`). A file without it is a plain artwork.
+    #[serde(default, deserialize_with = "or_default", skip_serializing_if = "std::ops::Not::not")]
+    pub pixel_art: bool,
 }
 
 /// Whether a canvas was made with the screen upright (see [`Document::made_turns`]).
@@ -843,6 +847,7 @@ impl Document {
             solo: None,
             text_style: None,
             made_turns: 0,
+            pixel_art: false,
         };
         doc.add_layer();
         doc

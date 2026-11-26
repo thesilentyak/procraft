@@ -202,6 +202,9 @@ impl State {
                 windows: &self.backdrop_windows,
                 sigma: BACKDROP_SIGMA_PT * s,
             });
+            // a pixel art canvas's grid, as close as it's zoomed in
+            canvas.set_pixel_grid(crate::pixel_art::grid_for(&self.doc, to_screen, self.display_scale));
+            let crisp_from = crate::pixel_art::crisp_from(&self.doc, self.display_scale);
             // a dropped colour's fill spreading in: the canvas as it was over it, but for a hole
             match self.reveal.as_mut().map(|r| r.hole_at(Instant::now())) {
                 Some(Some(hole)) => {
@@ -228,7 +231,7 @@ impl State {
                     backdrop,
                     convert,
                     lut,
-                    crisp_from: self.display_scale,
+                    crisp_from,
                     look: shown_look,
                     traced: true,
                 }),

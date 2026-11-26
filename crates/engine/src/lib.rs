@@ -38,6 +38,7 @@ pub mod native;
 pub mod outline;
 pub mod palette;
 pub mod par;
+pub mod pixel;
 pub mod plist;
 pub mod preview;
 pub mod profile;

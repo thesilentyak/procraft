@@ -394,7 +394,8 @@ fn an_overlay_shows_over_the_canvas_in_the_window_only() {
                 convert: None,
                 lut: None,
                 crisp_from: f32::INFINITY,
-                grey: false,
+                look: None,
+                traced: false,
             }),
         );
         read(&gpu, &target, 100, 100)

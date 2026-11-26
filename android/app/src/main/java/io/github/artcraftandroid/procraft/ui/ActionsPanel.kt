@@ -188,9 +188,9 @@ fun ActionsPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier)
             vm.exportPackageFile(extension)?.let { runCatching { shareFile(context, it, "application/octet-stream") } }
         }
     }
-    fun share(jpeg: Boolean) {
+    fun share(jpeg: Boolean, scale: Int = 1) {
         vm.viewModelScope.launch {
-            vm.exportImage(jpeg)?.let { runCatching { shareFile(context, it, if (jpeg) "image/jpeg" else "image/png") } }
+            vm.exportImage(jpeg, scale)?.let { runCatching { shareFile(context, it, if (jpeg) "image/jpeg" else "image/png") } }
         }
     }
     // a file a plugin makes of the artwork's layers of a kind it adds
@@ -278,6 +278,8 @@ fun ActionsPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier)
                 Act("PDF") { pdfAsking = CanvasViewModel.Export.PDF },
                 Act("JPEG") { share(jpeg = true) },
                 Act("PNG") { share(jpeg = false) },
+                // a pixel art canvas's picture scaled up, each pixel a square
+                *pixelArtScales(vm).map { n -> Act("PNG ×$n") { share(jpeg = false, scale = n) } }.toTypedArray(),
                 Act("TIFF") { share(CanvasViewModel.Export.TIFF) },
                 // a plugin's artwork, its shapes kept
                 Act("SVG") { share(CanvasViewModel.Export.SVG) }.takeIf { vm.session?.exportsSvg() == true },

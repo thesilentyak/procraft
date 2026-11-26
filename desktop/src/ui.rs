@@ -3309,6 +3309,7 @@ impl Interface {
             model_flat: self.model && session.model_flat(),
             paint_through: self.model && session.paint_through(),
             svg: session.exports_svg(),
+            pixel_art: session.is_pixel_art(),
             plugin_exports: session.plugin_exports().into_iter().map(|e| e.label).collect(),
             plugin_controls: self.prefs.plugins.controls_in(procraft_core::PluginPlace::Canvas),
             plugin_actions: self.prefs.plugins.actions_in(procraft_core::PluginPlace::Canvas),

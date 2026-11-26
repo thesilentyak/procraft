@@ -20,6 +20,7 @@ const SHADERS: &[(&str, &str)] = &[
     ("display", include_str!("shaders/display.wgsl")),
     ("surround", include_str!("shaders/surround.wgsl")),
     ("surround picture", include_str!("shaders/surround_picture.wgsl")),
+    ("pixel grid", include_str!("shaders/pixel_grid.wgsl")),
     ("backdrop", include_str!("shaders/backdrop.wgsl")),
     ("transform", include_str!("shaders/transform.wgsl")),
     ("selection", include_str!("shaders/selection.wgsl")),

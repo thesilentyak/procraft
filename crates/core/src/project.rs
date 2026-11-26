@@ -2709,7 +2709,7 @@ fn decode_png_into(
 impl CanvasSession {
     /// The flattened picture as it is exported, full size: its width, height, pixels (straight
     /// RGBA8; a CMYK canvas's as its press prints them) and the colour profile they are in.
-    fn finished_picture(&self) -> Result<(u32, u32, Vec<u8>, Vec<u8>), MobileError> {
+    pub(crate) fn finished_picture(&self) -> Result<(u32, u32, Vec<u8>, Vec<u8>), MobileError> {
         self.exported(0.0);
         let (w, h, rgba, icc) = {
             let mut guard = self.shared.lock_finished();

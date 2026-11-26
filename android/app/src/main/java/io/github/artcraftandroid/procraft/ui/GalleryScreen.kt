@@ -600,6 +600,10 @@ fun GalleryScreen(vm: CanvasViewModel) {
                     newCanvas = false
                     vm.newArtwork(w, h, kind.key)
                 },
+                onPixelArt = { w, h ->
+                    newCanvas = false
+                    vm.newArtwork(w, h, pixelArt = true)
+                },
             ) { w, h ->
                 newCanvas = false
                 vm.newArtwork(w, h)
@@ -1879,6 +1883,7 @@ private fun NewCanvasPanel(
     onPick: (CanvasPreset) -> Unit,
     kinds: List<io.github.artcraftandroid.procraft.core.PluginKind> = emptyList(),
     onKind: (io.github.artcraftandroid.procraft.core.PluginKind, Int, Int) -> Unit = { _, _, _ -> },
+    onPixelArt: (Int, Int) -> Unit = { _, _ -> },
     onScreenSize: (Int, Int) -> Unit,
 ) {
     // the screen as it is turned now (2560 x 1600 in landscape, 1600 x 2560 upright)
@@ -1913,6 +1918,7 @@ private fun NewCanvasPanel(
             }
         }
         PresetRow("Screen Size", "$sw × ${sh}px", CanvasPreset.P3, Modifier.padding(horizontal = 9.dp).height(38.dp).clip(CircleShape).background(Pc.LightRowStrong)) { onScreenSize(sw, sh) }
+        PixelArtNewRow(Modifier.padding(start = 9.dp, end = 9.dp, top = 9.5.dp), onPixelArt)
         // the presets scroll past 376 tall
         Column(
             Modifier.padding(start = 9.dp, end = 9.dp, top = 9.5.dp, bottom = if (kinds.isEmpty()) 30.dp else 0.dp).heightIn(max = 376.dp).clip(RoundedCornerShape(24.dp)).background(Pc.LightRow)

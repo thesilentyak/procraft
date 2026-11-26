@@ -2471,7 +2471,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             .coerceAtMost(Int.MAX_VALUE.toUInt()).toInt()
 
     /** A new artwork of `width` × `height` pixels (the screen's size), in Display P3, opened on the canvas; of a plugin's [kind] (`<id>.<key>`), its plugin keeping it. */
-    fun newArtwork(width: Int, height: Int, kind: String? = null) {
+    fun newArtwork(width: Int, height: Int, kind: String? = null, pixelArt: Boolean = false) {
         if (opening || session != null) return
         opening = true
         viewModelScope.launch {
@@ -2479,6 +2479,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                 val made = CanvasSession(width.coerceAtLeast(1).toUInt(), height.coerceAtLeast(1).toUInt()).also {
                     it.madeWithScreenTurned(screenTurns().toUInt())
                     it.setNewProfile(io.github.artcraftandroid.procraft.gallery.CanvasPreset.P3)
+                    if (pixelArt) it.makePixelArt()
                     loadBrushes(it)
                 }
                 if (kind == null) {
@@ -7976,13 +7977,14 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** The flattened picture as a JPEG or PNG in the cache, to share, with the export card. */
-    suspend fun exportImage(jpeg: Boolean): File? = withExportCard("The picture couldn't be exported.") { s ->
+    suspend fun exportImage(jpeg: Boolean, scale: Int = 1): File? = withExportCard("The picture couldn't be exported.") { s ->
         withContext(Dispatchers.IO) {
             val dir = File(getApplication<Application>().cacheDir, "exports").apply { mkdirs() }
             val base = io.github.artcraftandroid.procraft.core.exportFileName(s.name(), false)
-            val file = File(dir, if (jpeg) "$base.jpg" else "$base.png")
+            // a pixel art canvas's picture scaled up, each pixel a square: named for its scale
+            val file = File(dir, if (jpeg) "$base.jpg" else if (scale > 1) "$base ×$scale.png" else "$base.png")
             try {
-                if (jpeg) s.exportJpeg(file.path) else s.exportPng(file.path)
+                if (jpeg) s.exportJpeg(file.path) else if (scale > 1) s.exportPngScaled(file.path, scale.toUInt()) else s.exportPng(file.path)
             } catch (e: MobileException) {
                 AppLog.e(TAG, "exporting", e)
                 return@withContext null

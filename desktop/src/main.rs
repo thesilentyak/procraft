@@ -1224,6 +1224,16 @@ impl App {
                     self.ui.started_new();
                 }
             }
+            Some(gallery::Asked::PixelArt(w, h, folder)) => {
+                if !busy {
+                    let session = CanvasSession::new(w, h);
+                    session.set_new_profile(procraft_core::P3.into());
+                    session.make_pixel_art();
+                    let dir = self.gallery.store.new_folder(folder);
+                    self.open_artwork(session, dir);
+                    self.ui.started_new();
+                }
+            }
             // a plugin's kind of artwork, the screen's size, its plugin keeping it
             Some(gallery::Asked::PluginKind(kind, folder)) => {
                 let (w, h) = self.gallery.screen_px;

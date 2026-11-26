@@ -145,7 +145,7 @@ impl State {
     /// `size` through `to_screen`: taken away as anything changes, made again once things settle
     /// (a frame asked for then), a slice a frame.
     pub(crate) fn keep_sharp(&mut self, size: (u32, u32), to_screen: Affine) {
-        let crisp = to_screen.scale_factor() >= self.display_scale * 0.999;
+        let crisp = to_screen.scale_factor() >= crate::pixel_art::crisp_from(&self.doc, self.display_scale) * 0.999;
         let wanted = self.sharp_wanted(to_screen);
         let Some(canvas) = self.canvas.as_ref() else { return };
         let quiet = !canvas.changes_queued() && !canvas.busy();
