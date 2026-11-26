@@ -64,9 +64,63 @@ def starter(paint_over: bool):
     return nodes
 
 
+def minimax(edit: bool):
+    """MiniMax H3 Image: a new picture at about 4 MP in the canvas's shape (the model is tuned for
+    2048 x 2048 of area), or an edit of the canvas (Picture 1, its selection's part when there is
+    one), the prompt an instruction. As ComfyUI's own templates, without their prompt upsampler."""
+    unet = "minimax_h3_image_pruned_int8_convrot.safetensors"
+    te = "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
+    vae = "minimax_h3_image_vae_fp16.safetensors"
+    nodes = []
+
+    def node(nid, cls, widgets, links, outputs, widget_links=(), api_widgets=None, title=None, pos=(0, 0)):
+        nodes.append(dict(id=nid, cls=cls, widgets=widgets, links=links, outputs=outputs,
+                          widget_links=set(widget_links), api=api_widgets or {}, title=title, pos=pos))
+
+    node(1, "UNETLoader", [unet, "default"], {}, [("MODEL", "MODEL")],
+         api_widgets={"unet_name": unet, "weight_dtype": "default"}, pos=(0, 0))
+    node(2, "CLIPLoader", [te, "minimax", "default"], {}, [("CLIP", "CLIP")],
+         api_widgets={"clip_name": te, "type": "minimax", "device": "default"}, pos=(0, 140))
+    node(3, "VAELoader", [vae], {}, [("VAE", "VAE")], api_widgets={"vae_name": vae}, pos=(0, 300))
+    node(4, "ETN_Parameter", ["Prompt", "prompt (positive)", "", -1e10, 1e10], {}, [("value", "*")],
+         api_widgets={"name": "Prompt", "type": "prompt (positive)", "default": "", "min": -1e10, "max": 1e10},
+         title="Prompt (from the app)", pos=(0, 420))
+    node(5, "ETN_KritaCanvas", [], {}, [("image", "IMAGE"), ("width", "INT"), ("height", "INT"), ("seed", "INT"), ("mask", "MASK")],
+         title="Canvas (from the app)", pos=(0, 600))
+    links = {"clip": (2, 0), "vae": (3, 0)}
+    widget_links = ["prompt"]
+    if edit:
+        node(6, "ETN_KritaSelection", ["automatic", 64], {}, [("mask", "MASK"), ("active", "BOOLEAN"), ("offset x", "INT"), ("offset y", "INT")],
+             api_widgets={"context": "automatic", "padding": 64}, title="Selection (from the app)", pos=(0, 780))
+        node(7, "StringConcatenate", ["Edit <Picture 1>: ", "", ""], {"string_b": (4, 0)}, [("STRING", "STRING")],
+             widget_links=["string_b"], api_widgets={"string_a": "Edit <Picture 1>: ", "delimiter": ""}, pos=(340, 420))
+        links.update({"prompt": (7, 0), "images.image_1": (5, 0)})
+        api = {"width": 0, "height": 0}
+    else:
+        node(7, "ImageScaleToTotalPixels", ["lanczos", 4.0, 32], {"image": (5, 0)}, [("IMAGE", "IMAGE")],
+             api_widgets={"upscale_method": "lanczos", "megapixels": 4.0, "resolution_steps": 32}, pos=(340, 600))
+        node(8, "GetImageSize", [], {"image": (7, 0)}, [("width", "INT"), ("height", "INT"), ("batch_size", "INT")], pos=(700, 600))
+        links.update({"prompt": (4, 0), "width": (8, 0), "height": (8, 1)})
+        widget_links += ["width", "height"]
+        api = {}
+    node(9, "MiniMaxH3ImageConditioning", ["", 0, 0], links, [("positive", "CONDITIONING"), ("LATENT", "LATENT")],
+         widget_links=widget_links, api_widgets=api, pos=(700, 140))
+    node(10, "ConditioningZeroOut", [], {"conditioning": (9, 0)}, [("CONDITIONING", "CONDITIONING")], pos=(1050, 300))
+    node(11, "KSampler", [0, "fixed", 6, 1, "euler", "simple", 1],
+         {"model": (1, 0), "positive": (9, 0), "negative": (10, 0), "latent_image": (9, 1), "seed": (5, 3)},
+         [("LATENT", "LATENT")], widget_links=["seed"],
+         api_widgets={"steps": 6, "cfg": 1, "sampler_name": "euler", "scheduler": "simple", "denoise": 1}, pos=(1300, 140))
+    node(12, "VAEDecode", [], {"samples": (11, 0), "vae": (3, 0)}, [("IMAGE", "IMAGE")], pos=(1650, 140))
+    node(13, "ETN_KritaOutput", [0, 0, "", "default", False], {"images": (12, 0)}, [],
+         api_widgets={"x": 0, "y": 0, "name": "", "batch_mode": "default", "resize_canvas": False},
+         title="Back to the app", pos=(1900, 140))
+    return nodes
+
+
 def widget_inputs(n):
-    # the CLIPTextEncode's text, KSampler's seed and denoise: widgets given a link
-    types = {"text": "STRING", "seed": "INT", "denoise": "FLOAT"}
+    # the inputs that are widgets given a link
+    types = {"text": "STRING", "seed": "INT", "denoise": "FLOAT", "prompt": "STRING", "width": "INT",
+             "height": "INT", "string_b": "STRING"}
     return [(w, types.get(w, "*")) for w in n["widget_links"]]
 
 
@@ -130,8 +184,13 @@ def to_api(nodes):
 
 if __name__ == "__main__":
     where = sys.argv[1]
-    for paint_over, name in [(False, "ProCraft - Z-Image new picture"), (True, "ProCraft - Z-Image paint over")]:
-        nodes = starter(paint_over)
+    made = [
+        (starter(False), "ProCraft - Z-Image new picture"),
+        (starter(True), "ProCraft - Z-Image paint over"),
+        (minimax(False), "ProCraft - MiniMax new picture"),
+        (minimax(True), "ProCraft - MiniMax edit"),
+    ]
+    for nodes, name in made:
         json.dump(to_ui(nodes, name), open(f"{where}/{name}.json", "w"), indent=2)
         json.dump(to_api(nodes), open(f"{where}/{name} (API).json", "w"), indent=2)
         print("made", name)

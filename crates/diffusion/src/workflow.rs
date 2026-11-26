@@ -674,6 +674,23 @@ mod tests {
     }
 
     #[test]
+    fn the_minimax_starters_read_and_prepare() {
+        let new_picture = Workflow::parse("New", include_str!("../tests/workflows/minimax-new-picture.json")).unwrap();
+        let params = new_picture.parameters(&Map::new());
+        assert_eq!(params.len(), 1);
+        let prepared = new_picture.prepare(&params, &inputs(&[("Prompt", ParamValue::Text("a ring".into()))])).unwrap();
+        assert_eq!(input(&prepared, "MiniMaxH3ImageConditioning", "prompt"), "a ring");
+        assert_eq!(input(&prepared, "KSampler", "seed"), 7);
+
+        let edit = Workflow::parse("Edit", include_str!("../tests/workflows/minimax-edit.json")).unwrap();
+        let params = edit.parameters(&Map::new());
+        let prepared = edit.prepare(&params, &inputs(&[("Prompt", ParamValue::Text("make it gold".into()))])).unwrap();
+        assert_eq!(input(&prepared, "StringConcatenate", "string_b"), "make it gold");
+        let picture = input(&prepared, "MiniMaxH3ImageConditioning", "images.image_1");
+        assert_eq!(prepared.graph.class(picture[0].as_str().unwrap()), Some("ETN_LoadImageBase64"));
+    }
+
+    #[test]
     fn repeated_names_are_numbered() {
         let text = r#"{
             "1": {"class_type": "ETN_Parameter", "inputs": {"name": "Strength", "type": "number", "default": "0.5"}},
