@@ -109,6 +109,8 @@ internal object Workflows {
         val now = g.liveWorkflowRevision()
         if (now == revision || context == null) return
         revision = now
+        // the cards and rows follow it while the popover is open
+        read++
         val text = g.liveWorkflowText() ?: return
         runCatching { File(context.filesDir, LIVE_FILE).writeText(text) }
     }
