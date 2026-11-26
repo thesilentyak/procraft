@@ -116,6 +116,8 @@ pub(crate) struct PixelStroke {
     /// The shape it snapped to when held, and where the pen was then and is now: drawn in pixels
     /// in place of the line, turning and growing as the pen moves on.
     shape: Option<(Shape, Vec2, Vec2)>,
+    /// Whether it has written to its layer: only then is there a step of its to take back.
+    wrote: bool,
 }
 
 /// Points round an ellipse a pixel art selection's outline goes through.
@@ -162,12 +164,14 @@ impl State {
         match touch {
             Touch::Down(_) | Touch::Moved => self.pixel_stroke = Some(on),
             // one step undo takes back; none for a stroke that changed nothing, or was called off
+            // (a second finger made it a gesture). Only what this stroke wrote is taken back: one
+            // that wrote nothing (begun off the canvas, say) has no step, and undoing would take
+            // the stroke before it.
             Touch::Up | Touch::Off => {
                 if let Some(canvas) = self.canvas.as_mut() {
                     canvas.collapse_steps();
-                    if touch == Touch::Off || !on.stroke.any() {
+                    if on.wrote && (touch == Touch::Off || !on.stroke.any()) {
                         canvas.undo();
-                        canvas.forget_redo();
                     }
                 }
                 self.revision += 1;
@@ -210,6 +214,7 @@ impl State {
             last: None,
             drawn: Vec::new(),
             shape: None,
+            wrote: false,
         })
     }
 
@@ -217,6 +222,7 @@ impl State {
     fn pixel_write(&mut self, on: &mut PixelStroke) {
         if let Some((rect, part)) = on.stroke.take_changed() {
             self.rewrite_layer(on.layer, IRect::new(rect[0], rect[1], rect[2], rect[3]), part);
+            on.wrote = true;
         }
     }
 
