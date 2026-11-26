@@ -1,0 +1,53 @@
+name: Build APK
+
+# Builds the Android app (arm64, with image generation) on every push to main-diffusion, and by
+# hand from Actions > Build APK > Run workflow. The APK is attached to the run as an artifact:
+# open the run on GitHub (on the phone too), scroll to Artifacts, download, unzip, install.
+on:
+  push:
+    branches: [main-diffusion]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: "1.99.0"
+  NDK_VERSION: "29.0.14206865"
+
+jobs:
+  apk:
+    name: Android APK (arm64-v8a)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: NDK and cargo-ndk
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          cargo install cargo-ndk --version "^4" --locked
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build
+        working-directory: android
+        # no release keystore here, so the build is signed with the runner's debug key
+        run: ./gradlew --no-daemon :app:assembleRelease -Pprocraft.abis=arm64-v8a
+      - uses: actions/upload-artifact@v4
+        with:
+          name: procraft-diffusion-arm64-${{ github.sha }}
+          path: android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 30
