@@ -9,19 +9,27 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::{Condvar, Mutex};
-use serde_json::json;
+use serde_json::{Map, Value, json};
 
 use crate::comfy::{Comfy, Event, Socket, SystemStats};
 use crate::loras::{LoraNotes, NOTES_PATH};
 use crate::plan::{largest_for_vram, plan_at};
 use crate::requirements::{Feature, Readiness, all_nodes};
-use crate::{Address, ControlKind, Error, Family, Graph, Picture, Request, ServerModels, Style, StyleFile, styles_for};
+use crate::{
+    Address, ControlKind, Error, Family, Graph, OutputPlace, Param, Picture, Request, ServerModels, Style, StyleFile,
+    Workflow, WorkflowInputs, styles_for,
+};
 
 /// Sampling previews are kept at most this big.
 const PREVIEW_SIDE: u32 = 512;
+
+/// Between runs, how long the thread sleeps before reading the WebSocket again for workflows.
+const LISTEN_EVERY: Duration = Duration::from_millis(50);
+/// How often a dropped WebSocket is opened again between runs.
+const REOPEN_EVERY: Duration = Duration::from_secs(10);
 
 /// A run's number, unique for the worker's life.
 pub type RunId = u64;
@@ -49,6 +57,21 @@ pub struct ServerState {
     pub readiness: Vec<(Family, Readiness)>,
     /// The trigger words and default strengths kept for its LoRAs (empty when it has none yet).
     pub lora_notes: LoraNotes,
+    /// What the server knows of its nodes (`/object_info`), read on connecting: what a workflow's
+    /// parameters are described from. Empty if it couldn't be read.
+    pub node_info: Arc<Map<String, Value>>,
+    /// The server's tooling add-on sends this client the workflow open in ComfyUI's tab.
+    pub workflow_link: bool,
+    /// The newest workflow it sent (kept while the app reconnects to the same server).
+    pub live_workflow: Option<LiveWorkflow>,
+}
+
+/// A workflow ComfyUI's tab sent: the graph in its API format, and its revision, one more for
+/// each one that differs from the one before.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiveWorkflow {
+    pub revision: u64,
+    pub graph: Value,
 }
 
 impl ServerState {
@@ -76,6 +99,19 @@ pub struct RunResult {
     pub picture: Picture,
     /// The plan's final pass size.
     pub generated: (u32, u32),
+    /// For a workflow's picture, the Output node's name and where it goes on the canvas (the
+    /// picture is as the workflow made it, not scaled); none for a style's.
+    pub place: Option<OutputPlace>,
+}
+
+/// A workflow to run: its parameters (for their kinds and defaults), what the app gives it, and
+/// how many times (seeds one apart from `inputs.seed`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkflowRequest {
+    pub workflow: Workflow,
+    pub params: Vec<Param>,
+    pub inputs: WorkflowInputs,
+    pub count: u32,
 }
 
 /// How a run is going.
@@ -113,6 +149,8 @@ enum Queued {
     Pictures(Box<Request>),
     /// A picture through a line extractor, one graph.
     Extract(Box<Extraction>),
+    /// A workflow from ComfyUI, one graph per run of it.
+    Workflow(Box<WorkflowRequest>),
 }
 
 #[derive(Default)]
@@ -201,6 +239,17 @@ impl Worker {
         id
     }
 
+    /// Queues `request`: a workflow from ComfyUI, run `count` times; its run's id.
+    pub fn submit_workflow(&self, request: WorkflowRequest) -> RunId {
+        let mut inner = self.shared.inner.lock();
+        let id = inner.next;
+        inner.next += 1;
+        inner.runs.insert(id, RunState { id, count: request.count.max(1), ..RunState::default() });
+        inner.queue.push_back((id, Queued::Workflow(Box::new(request))));
+        self.shared.wake.notify_all();
+        id
+    }
+
     /// Queues `extraction`: a picture through one of the server's line extractors; its run's id.
     pub fn extract(&self, extraction: Extraction) -> RunId {
         let mut inner = self.shared.inner.lock();
@@ -261,6 +310,8 @@ fn finish(inner: &mut Inner, id: RunId, error: Option<Error>) {
 enum Job {
     Connect(Address),
     Run(RunId, Box<Queued>),
+    /// Nothing to do: read the WebSocket for workflows ComfyUI's tab sends.
+    Listen,
 }
 
 /// The thread: connects when asked, runs what's queued, sleeps otherwise.
@@ -274,6 +325,7 @@ fn work(shared: &Shared) {
     let mut comfy: Option<Comfy> = None;
     let mut socket: Option<Socket> = None;
     let mut recent = Recent::default();
+    let mut last_open: Option<Instant> = None;
     loop {
         let job = {
             let mut inner = shared.inner.lock();
@@ -290,7 +342,13 @@ fn work(shared: &Shared) {
                 if let Some((id, queued)) = inner.queue.pop_front() {
                     break Job::Run(id, Box::new(queued));
                 }
-                shared.wake.wait(&mut inner);
+                if comfy.is_some() {
+                    if shared.wake.wait_for(&mut inner, LISTEN_EVERY).timed_out() {
+                        break Job::Listen;
+                    }
+                } else {
+                    shared.wake.wait(&mut inner);
+                }
             }
         };
         match job {
@@ -304,13 +362,17 @@ fn work(shared: &Shared) {
                     continue;
                 }
                 match found {
-                    Ok((stats, models, notes)) => {
+                    Ok((stats, models, notes, node_info)) => {
                         let readiness = Family::ALL.iter().map(|&f| (f, Readiness::check(f, &models))).collect();
                         inner.server.connection = Connection::Connected;
                         inner.server.stats = Some(stats);
                         inner.server.models = Some(models);
                         inner.server.readiness = readiness;
                         inner.server.lora_notes = notes;
+                        inner.server.node_info = Arc::new(node_info);
+                        drop(inner);
+                        socket = open_socket(shared, &api, &client_id).ok();
+                        last_open = Some(Instant::now());
                         comfy = Some(api);
                     }
                     Err(e) => {
@@ -329,6 +391,7 @@ fn work(shared: &Shared) {
                             Queued::Extract(extraction) => {
                                 extract_run(&on, &mut socket, &mut recent, extraction, &models)
                             }
+                            Queued::Workflow(request) => workflow_run(&on, &mut socket, &mut recent, request, &models),
                         }
                     }
                     _ => {
@@ -344,17 +407,62 @@ fn work(shared: &Shared) {
                 }
                 finish(&mut shared.inner.lock(), id, outcome.err());
             }
+            Job::Listen => {
+                let Some(api) = &comfy else { continue };
+                if socket.is_none() {
+                    if last_open.is_some_and(|at| at.elapsed() < REOPEN_EVERY) {
+                        continue;
+                    }
+                    last_open = Some(Instant::now());
+                    socket = open_socket(shared, api, &client_id).ok();
+                }
+                let Some(ws) = socket.as_mut() else { continue };
+                // what came meanwhile, waiting a moment at most
+                loop {
+                    match ws.next_event() {
+                        Ok(Some(Event::Workflow { workflow })) => keep_workflow(shared, workflow),
+                        Ok(Some(_)) => {}
+                        Ok(None) => break,
+                        Err(_) => {
+                            socket = None;
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
+}
+
+/// Opens the WebSocket for `client_id` and signs it up for the workflows ComfyUI's tab sends.
+fn open_socket(shared: &Shared, api: &Comfy, client_id: &str) -> Result<Socket, Error> {
+    let socket = Socket::connect(api.address(), client_id)?;
+    let link = api.subscribe_workflows(client_id).unwrap_or_else(|e| {
+        log::warn!("couldn't ask for ComfyUI's workflows: {e}");
+        false
+    });
+    shared.inner.lock().server.workflow_link = link;
+    Ok(socket)
+}
+
+/// Keeps `graph` as the live workflow, a new revision if it differs from the last.
+fn keep_workflow(shared: &Shared, graph: Value) {
+    let mut inner = shared.inner.lock();
+    let server = &mut inner.server;
+    if server.live_workflow.as_ref().is_some_and(|live| live.graph == graph) {
+        return;
+    }
+    let revision = server.live_workflow.as_ref().map_or(1, |live| live.revision + 1);
+    server.live_workflow = Some(LiveWorkflow { revision, graph });
 }
 
 fn request_address(shared: &Shared) -> String {
     shared.inner.lock().server.address.as_ref().map(ToString::to_string).unwrap_or_default()
 }
 
-/// Finds out what the server is and has, and what's kept about its LoRAs. A server whose user
-/// folder can't be read (an old ComfyUI) just has no notes.
-fn connect(api: &Comfy) -> Result<(SystemStats, ServerModels, LoraNotes), Error> {
+/// Finds out what the server is and has, what's kept about its LoRAs, and what it knows of its
+/// nodes. A server whose user folder can't be read (an old ComfyUI) just has no notes.
+fn connect(api: &Comfy) -> Result<(SystemStats, ServerModels, LoraNotes, Map<String, Value>), Error> {
     let stats = api.system_stats()?;
     let models = api.models(&all_nodes())?;
     let notes = match api.user_file(NOTES_PATH) {
@@ -365,16 +473,23 @@ fn connect(api: &Comfy) -> Result<(SystemStats, ServerModels, LoraNotes), Error>
             LoraNotes::default()
         }
     };
-    Ok((stats, models, notes))
+    let node_info = api.all_node_info().unwrap_or_else(|e| {
+        log::warn!("the server's nodes couldn't be read: {e}");
+        Map::new()
+    });
+    Ok((stats, models, notes, node_info))
 }
 
 /// How many of the latest pictures the worker remembers, for runs the server answers from its
 /// cache (an identical graph: ComfyUI doesn't run it again, so sends no picture).
 const REMEMBERED: usize = 8;
 
-/// The latest pictures received, by their graph.
+/// The latest pictures received (each with the node that sent it), by their graph.
 #[derive(Default)]
-struct Recent(VecDeque<(u64, Vec<u8>)>);
+struct Recent(VecDeque<(u64, Vec<Sent>)>);
+
+/// A picture a graph sent: the sending node's id and the file.
+type Sent = (String, Vec<u8>);
 
 impl Recent {
     fn key(graph: &Graph) -> u64 {
@@ -383,16 +498,44 @@ impl Recent {
         hasher.finish()
     }
 
-    fn find(&self, graph: &Graph) -> Option<Vec<u8>> {
+    fn find(&self, graph: &Graph) -> Option<Vec<Sent>> {
         let key = Recent::key(graph);
-        self.0.iter().find(|(k, _)| *k == key).map(|(_, bytes)| bytes.clone())
+        self.0.iter().find(|(k, _)| *k == key).map(|(_, sent)| sent.clone())
     }
 
-    fn remember(&mut self, graph: &Graph, bytes: &[u8]) {
+    fn remember(&mut self, graph: &Graph, sent: &[Sent]) {
         let key = Recent::key(graph);
         self.0.retain(|(k, _)| *k != key);
-        self.0.push_front((key, bytes.to_vec()));
+        self.0.push_front((key, sent.to_vec()));
         self.0.truncate(REMEMBERED);
+    }
+
+    /// What `graph` sends: what it sent just now, else what it sent before (the server answered
+    /// from its cache), else what it sends as JPEG (only the sending nodes run again). An error if
+    /// it sends nothing even then. `follow` runs a graph.
+    fn sent(
+        &mut self,
+        graph: &Graph,
+        mut follow: impl FnMut(&Graph) -> Result<Vec<Sent>, Error>,
+    ) -> Result<Vec<Sent>, Error> {
+        let mut sent = follow(graph)?;
+        if sent.is_empty() {
+            sent = match self.find(graph) {
+                Some(found) => found,
+                None => {
+                    let mut again = graph.clone();
+                    for node in again.nodes_of("ETN_SendImageWebSocket") {
+                        again.set(&node, "format", json!("JPEG"));
+                    }
+                    follow(&again)?
+                }
+            };
+        }
+        if sent.is_empty() {
+            return Err(Error::protocol("the server finished without sending a picture"));
+        }
+        self.remember(graph, &sent);
+        Ok(sent)
     }
 }
 
@@ -444,27 +587,12 @@ fn run(
         let seed = request.seed.wrapping_add(u64::from(i));
         let graph = family.graph(request, plan, seed, models)?;
         let part = |done: f64| (f64::from(i) + done) / f64::from(count);
-        let bytes = match follow(on, socket, &graph, part, &weights)? {
-            Some(bytes) => bytes,
-            // an identical graph ran before: the picture it made, else the same graph sending
-            // as JPEG (only the sending node runs again)
-            None => match recent.find(&graph) {
-                Some(bytes) => bytes,
-                None => {
-                    let mut again = graph.clone();
-                    for node in again.nodes_of("ETN_SendImageWebSocket") {
-                        again.set(&node, "format", json!("JPEG"));
-                    }
-                    follow(on, socket, &again, part, &weights)?
-                        .ok_or_else(|| Error::protocol("the server finished without sending a picture"))?
-                }
-            },
-        };
-        recent.remember(&graph, &bytes);
-        let picture = Picture::decode(&bytes)?.resized(width, height)?;
+        let sent = recent.sent(&graph, |g| follow(on, socket, g, part, &weights))?;
+        let bytes = sent.last().map(|(_, bytes)| bytes.as_slice()).unwrap_or_default();
+        let picture = Picture::decode(bytes)?.resized(width, height)?;
         if let Some(run) = on.shared.inner.lock().runs.get_mut(&on.id) {
             let generated = (plan.size.width, plan.size.height);
-            run.results.push(crate::RunResult { seed, picture, generated });
+            run.results.push(crate::RunResult { seed, picture, generated, place: None });
             run.progress = part(1.0) as f32;
             run.preview = None;
         }
@@ -487,26 +615,55 @@ fn extract_run(
     }
     let graph = crate::extract::graph(extraction.kind, &extraction.picture)?;
     // an extraction has no sampler: its progress is the one graph's
-    let bytes = match follow(on, socket, &graph, |done| done, &[1.0])? {
-        Some(bytes) => bytes,
-        None => match recent.find(&graph) {
-            Some(bytes) => bytes,
-            None => {
-                let mut again = graph.clone();
-                for node in again.nodes_of("ETN_SendImageWebSocket") {
-                    again.set(&node, "format", json!("JPEG"));
-                }
-                follow(on, socket, &again, |done| done, &[1.0])?
-                    .ok_or_else(|| Error::protocol("the server finished without sending a picture"))?
-            }
-        },
-    };
-    recent.remember(&graph, &bytes);
-    let picture = Picture::decode(&bytes)?.resized(extraction.size.0, extraction.size.1)?;
+    let sent = recent.sent(&graph, |g| follow(on, socket, g, |done| done, &[1.0]))?;
+    let bytes = sent.last().map(|(_, bytes)| bytes.as_slice()).unwrap_or_default();
+    let picture = Picture::decode(bytes)?.resized(extraction.size.0, extraction.size.1)?;
     if let Some(run) = on.shared.inner.lock().runs.get_mut(&on.id) {
-        run.results.push(RunResult { seed: 0, picture, generated: extraction.size });
+        run.results.push(RunResult { seed: 0, picture, generated: extraction.size, place: None });
         run.progress = 1.0;
         run.preview = None;
+    }
+    Ok(())
+}
+
+/// Runs a workflow `count` times, seeds one apart: each run's pictures, as its Output nodes sent
+/// them, are results placed where those nodes say.
+fn workflow_run(
+    on: &Running<'_>,
+    socket: &mut Option<Socket>,
+    recent: &mut Recent,
+    request: &WorkflowRequest,
+    models: &ServerModels,
+) -> Result<(), Error> {
+    let info = on.shared.inner.lock().server.node_info.clone();
+    let has = |node: &str| if info.is_empty() { models.has_node(node) } else { info.contains_key(node) };
+    if !["ETN_LoadImageBase64", "ETN_LoadMaskBase64", "ETN_SendImageWebSocket"].iter().all(|n| has(n)) {
+        return Err(Error::Request { reason: "the server needs the comfyui-tooling-nodes add-on".to_owned() });
+    }
+    let count = request.count.max(1);
+    for i in 0..count {
+        if on.shared.inner.lock().cancelled.contains(&on.id) {
+            return Err(Error::Cancelled);
+        }
+        let seed = request.inputs.seed.wrapping_add(u64::from(i));
+        let inputs = WorkflowInputs { seed, ..request.inputs.clone() };
+        let prepared = request.workflow.prepare(&request.params, &inputs)?;
+        // each KSampler an equal share of the run's progress (other samplers report as they go)
+        let samplers = prepared.graph.nodes_of("KSampler").len().max(1);
+        let weights = vec![1.0 / samplers as f64; samplers];
+        let part = |done: f64| (f64::from(i) + done) / f64::from(count);
+        let sent = recent.sent(&prepared.graph, |g| follow(on, socket, g, part, &weights))?;
+        let mut results = Vec::new();
+        for (node, bytes) in sent {
+            let picture = Picture::decode(&bytes)?;
+            let place = prepared.outputs.iter().find(|o| o.node == node).or(prepared.outputs.first()).cloned();
+            results.push(RunResult { seed, generated: (picture.width, picture.height), picture, place });
+        }
+        if let Some(run) = on.shared.inner.lock().runs.get_mut(&on.id) {
+            run.results.extend(results);
+            run.progress = part(1.0) as f32;
+            run.preview = None;
+        }
     }
     Ok(())
 }
@@ -522,26 +679,27 @@ fn pass_weights(plan: &crate::Plan, steps: u32, family: Family) -> Vec<f64> {
     vec![first / (first + second), second / (first + second)]
 }
 
-/// Queues `graph` and follows it to its end: the picture its sending node sent (PNG or JPEG
-/// file), none if it sent none. `part` turns how far the graph is into how far the run is, and
-/// `weights` how much each of its samplers is worth.
+/// Queues `graph` and follows it to its end: the pictures its sending nodes sent (PNG or JPEG
+/// files, each with the node that sent it, in the order they came), none if they sent none.
+/// `part` turns how far the graph is into how far the run is, and `weights` how much each of its
+/// samplers is worth. A workflow ComfyUI's tab sends meanwhile is kept.
 fn follow(
     on: &Running<'_>,
     socket: &mut Option<Socket>,
     graph: &Graph,
     part: impl Fn(f64) -> f64,
     weights: &[f64],
-) -> Result<Option<Vec<u8>>, Error> {
+) -> Result<Vec<Sent>, Error> {
     if socket.is_none() {
-        *socket = Some(Socket::connect(on.api.address(), on.client_id)?);
+        *socket = Some(open_socket(on.shared, on.api, on.client_id)?);
     }
-    let Some(ws) = socket.as_mut() else { return Ok(None) };
+    let Some(ws) = socket.as_mut() else { return Ok(Vec::new()) };
     let sender = graph.nodes_of("ETN_SendImageWebSocket");
     let samplers = graph.nodes_of("KSampler");
     let prompt_id = on.api.queue(graph, on.client_id)?;
     let mut running: Option<String> = None;
     let mut pass = 0usize;
-    let mut made = None;
+    let mut made = Vec::new();
     loop {
         if on.shared.inner.lock().cancelled.contains(&on.id) {
             // stop it whether it's queued or running (the interrupt only stops ours: the server
@@ -570,7 +728,10 @@ fn follow(
                 }
             }
             // what the sending node sends is the picture; anything else, a sampling preview
-            Event::Picture { bytes, .. } if running.as_ref().is_some_and(|n| sender.contains(n)) => made = Some(bytes),
+            Event::Picture { bytes, .. } if running.as_ref().is_some_and(|n| sender.contains(n)) => {
+                made.push((running.clone().unwrap_or_default(), bytes));
+            }
+            Event::Workflow { workflow } => keep_workflow(on.shared, workflow),
             Event::Picture { bytes, .. } => {
                 if let Ok(preview) = Picture::decode(&bytes).and_then(|p| p.thumbnail(PREVIEW_SIDE))
                     && let Some(run) = on.shared.inner.lock().runs.get_mut(&on.id)
@@ -587,5 +748,47 @@ fn follow(
             Event::Interrupted { prompt_id: p } if p == prompt_id => return Err(Error::Cancelled),
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shared() -> Shared {
+        Shared { inner: Mutex::new(Inner::default()), wake: Condvar::new() }
+    }
+
+    #[test]
+    fn a_changed_workflow_is_a_new_revision() {
+        let s = shared();
+        keep_workflow(&s, json!({ "1": { "class_type": "A", "inputs": {} } }));
+        keep_workflow(&s, json!({ "1": { "class_type": "A", "inputs": {} } }));
+        assert_eq!(s.inner.lock().server.live_workflow.as_ref().unwrap().revision, 1);
+        keep_workflow(&s, json!({ "1": { "class_type": "B", "inputs": {} } }));
+        let live = s.inner.lock().server.live_workflow.clone().unwrap();
+        assert_eq!(live.revision, 2);
+        assert_eq!(live.graph["1"]["class_type"], "B");
+    }
+
+    #[test]
+    fn sent_pictures_come_from_the_run_the_cache_or_a_jpeg_rerun() {
+        let mut g = Graph::new();
+        let send = g.add("ETN_SendImageWebSocket", [("format", json!("PNG"))]);
+        let picture = || vec![(send.id(), b"PNG".to_vec())];
+        let mut recent = Recent::default();
+        // sent now
+        assert_eq!(recent.sent(&g, |_| Ok(picture())).unwrap(), picture());
+        // the server answers from its cache: what it sent before
+        assert_eq!(recent.sent(&g, |_| Ok(Vec::new())).unwrap(), picture());
+        // nothing before: the JPEG graph runs, and nothing at all is an error
+        let mut fresh = Recent::default();
+        let mut formats = Vec::new();
+        let none = fresh.sent(&g, |graph| {
+            formats.push(graph.to_json()["1"]["inputs"]["format"].clone());
+            Ok(Vec::new())
+        });
+        assert!(none.is_err());
+        assert_eq!(formats, vec![json!("PNG"), json!("JPEG")]);
     }
 }

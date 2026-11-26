@@ -98,6 +98,8 @@ pub struct WorkflowInputs {
 /// Where an Output node's pictures go.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OutputPlace {
+    /// The node's id in the prepared graph, to tell which pictures it sent.
+    pub node: String,
     /// The layer name it asks for (empty: the app names it).
     pub name: String,
     /// The offset from the canvas's top left.
@@ -328,6 +330,7 @@ impl Workflow {
             let Some(found) = g.inputs(&node) else { continue };
             let offset = |key: &str| found.get(key).and_then(Value::as_i64).unwrap_or(0);
             outputs.push(OutputPlace {
+                node: node.clone(),
                 name: text_input(found, "name").unwrap_or_default(),
                 x: i64::from(ax) + offset("x"),
                 y: i64::from(ay) + offset("y"),
@@ -338,10 +341,10 @@ impl Workflow {
         Ok(Prepared { graph: g, outputs, area })
     }
 
-    /// The part of the canvas the workflow works on: the whole canvas, or with a selection and a
-    /// Krita Selection node not set to "entire image", the selection's bounds and the node's
-    /// padding.
-    fn area(&self, selection: Option<&[u8]>, (width, height): (u32, u32)) -> [u32; 4] {
+    /// The part of the canvas the workflow works on, `[x, y, width, height]`: the whole canvas
+    /// (`width × height`), or with a `selection` (one byte per canvas pixel) and a Krita
+    /// Selection node not set to "entire image", the selection's bounds and the node's padding.
+    pub fn area(&self, selection: Option<&[u8]>, (width, height): (u32, u32)) -> [u32; 4] {
         let whole = [0, 0, width, height];
         let Some(mask) = selection else { return whole };
         let Some(node) = self.graph.nodes_of(SELECTION).into_iter().next() else { return whole };
@@ -575,7 +578,8 @@ mod tests {
             g.nodes_of("CLIPTextEncode").iter().map(|n| g.inputs(n).unwrap()["text"].clone()).collect();
         assert!(texts.contains(&json!("koi pond, scenery, no humans")));
         assert!(texts.contains(&json!("")));
-        assert_eq!(prepared.outputs, vec![OutputPlace { name: "Koi".into(), x: 0, y: 0 }]);
+        let sender = prepared.graph.nodes_of("ETN_SendImageWebSocket");
+        assert_eq!(prepared.outputs, vec![OutputPlace { node: sender[0].clone(), name: "Koi".into(), x: 0, y: 0 }]);
         assert_eq!(prepared.area, [0, 0, 64, 48]);
     }
 
@@ -624,7 +628,7 @@ mod tests {
         run.selection = Some(mask);
         let prepared = w.prepare(&params, &run).unwrap();
         assert_eq!(prepared.area, [28, 8, 14, 14]);
-        assert_eq!(prepared.outputs, vec![OutputPlace { name: String::new(), x: 28, y: 8 }]);
+        assert_eq!(prepared.outputs, vec![OutputPlace { node: "4".into(), name: String::new(), x: 28, y: 8 }]);
         assert_eq!(input(&prepared, "Inpaint", "w"), 14);
         assert_eq!(input(&prepared, "Inpaint", "active"), true);
         let g = &prepared.graph;

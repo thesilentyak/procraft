@@ -40,6 +40,8 @@ mod generation_studio;
 mod generation_styles;
 #[cfg(feature = "generation")]
 mod generation_tags;
+#[cfg(feature = "generation")]
+mod generation_workflows;
 mod gestures;
 mod gradients;
 mod grain_store;

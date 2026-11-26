@@ -185,8 +185,8 @@ the same way; a result carries its layer name and offset.
 | | What | Checked by |
 |---|---|---|
 | W1 | `workflow.rs`: parse, parameters, prepare, outputs (**built 2026-11-26**) | Unit tests on fixtures (a Z-Image text-to-image graph, an inpaint graph with Selection, one with each parameter type) |
-| W2 | Worker: subscribe, the live workflow, runs with several pictures | Unit tests on recorded socket messages; the user's server |
-| W3 | Core API, kept files, the live workflow kept between starts | Core tests |
+| W2 | Worker: subscribe, the live workflow, runs with several pictures (**built 2026-11-26**) | Unit tests on recorded socket messages; the user's server |
+| W3 | Core API, kept files, the live workflow kept between starts (**built 2026-11-26**) | Core tests |
 | W4 | Desktop popover | The desktop app on the user's PC |
 | W5 | Android popover | The APK from GitHub Actions on the user's phone |
 | W6 | Import and Export, layer pickers | Both apps |

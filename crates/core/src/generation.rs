@@ -523,6 +523,83 @@ pub struct Generation {
     saver: Saver,
     /// What finished saves report to; the pixels they wrote can then leave memory.
     saved: Mutex<mpsc::Receiver<SavedResults>>,
+    /// The workflows from ComfyUI: the kept files and the stored live one.
+    pub(crate) workflows: crate::generation_workflows::Workflows,
+}
+
+impl Generation {
+    /// Starts `session`'s run with `submit` (for the workflows module): the artwork must have its
+    /// results read and no run going. Its pictures go to `area`, masked by `mask` (one byte per
+    /// pixel there), their layers named `name`. Returns the run's id.
+    pub(crate) fn start_run(
+        &self,
+        session: &CanvasSession,
+        area: IRect,
+        mask: Option<Vec<u8>>,
+        name: String,
+        from_srgb: Option<Lut>,
+        submit: impl FnOnce(&Worker) -> RunId,
+    ) -> Result<u64, GenerationError> {
+        let mut artwork = self.artwork_of(session);
+        if artwork.loading {
+            return Err(GenerationError::NotReady { reason: "the artwork's results are still loading".to_owned() });
+        }
+        if artwork.running.is_some() {
+            return Err(GenerationError::NotReady { reason: "a run is going".to_owned() });
+        }
+        artwork.from_srgb = from_srgb;
+        let id = submit(&self.worker);
+        artwork.running = Some(Running { id, area, mask, name, taken: 0, previews: 0, preview: None, extract: None });
+        artwork.error = None;
+        Ok(id)
+    }
+}
+
+/// What a workflow run reads from the artwork: the picture as seen (sRGB, without control
+/// layers), the selection over the whole canvas, and the table back to the canvas's colours.
+pub(crate) struct WorkflowCanvas {
+    pub(crate) picture: Picture,
+    pub(crate) selection: Option<Vec<u8>>,
+    pub(crate) from_srgb: Option<Lut>,
+}
+
+impl CanvasSession {
+    /// The canvas as a workflow gets it.
+    pub(crate) fn workflow_canvas(&self) -> Result<WorkflowCanvas, GenerationError> {
+        let canvas = self.picture_for_generation(true)?;
+        let picture = canvas
+            .picture
+            .ok_or_else(|| GenerationError::Canvas { reason: "the canvas isn't drawn yet".to_owned() })?;
+        let whole = IRect::from_size(canvas.width, canvas.height);
+        let selection = current_selection(self).map(|s| crate::layer_ops::mask_part(&s.mask, whole));
+        Ok(WorkflowCanvas { picture, selection, from_srgb: canvas.from_srgb })
+    }
+
+    /// Layer `id` over the whole canvas, in sRGB (straight RGBA); none if it has no pixels yet.
+    pub(crate) fn layer_picture(&self, id: u64) -> Result<Option<Picture>, GenerationError> {
+        let mut guard = self.shared.lock_finished();
+        let st = &mut *guard;
+        st.finish_stroke();
+        st.settle();
+        st.flush();
+        let unreadable = |reason: String| GenerationError::Canvas { reason };
+        let whole = IRect::from_size(st.doc.width(), st.doc.height());
+        let to_srgb = srgb_tables(&st.doc).map(|(to, _)| to);
+        let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else {
+            return Err(unreadable("the canvas isn't drawn yet".to_owned()));
+        };
+        canvas.render_finished(gpu, &mut st.doc);
+        let mut rgba = match canvas.read_layer_part(gpu, LayerId(id), whole) {
+            Ok(pixels) => pixels,
+            Err(e) if e.to_string().contains("no layer") => return Ok(None),
+            Err(e) => return Err(unreadable(e.to_string())),
+        };
+        if let Some(lut) = &to_srgb {
+            lut.apply_rgba(&mut rgba, true);
+        }
+        unpremultiply(&mut rgba);
+        Picture::new(whole.width(), whole.height(), rgba).map(Some).map_err(|e| unreadable(e.to_string()))
+    }
 }
 
 /// `text` as a server address (`host:port`, port 8188 if none given); none if it isn't one.
@@ -548,6 +625,7 @@ impl Generation {
             loads: AtomicU64::new(0),
             saver: Saver::new(saved_sender),
             saved: Mutex::new(saved),
+            workflows: crate::generation_workflows::Workflows::default(),
         };
         generation.worker.set_address(Address::parse(&settings.address));
         Arc::new(generation)
@@ -1748,7 +1826,7 @@ pub(crate) fn random_seed() -> u64 {
 }
 
 /// "Generated · " and the prompt's first words.
-fn layer_name(prompt: &str) -> String {
+pub(crate) fn layer_name(prompt: &str) -> String {
     let prompt = prompt.trim();
     if prompt.is_empty() {
         return "Generated".to_owned();
@@ -1762,14 +1840,35 @@ fn layer_name(prompt: &str) -> String {
 
 /// A result as kept: in the canvas's colours, premultiplied, with its thumbnail.
 fn keep(id: u64, result: &procraft_diffusion::RunResult, run: &Running, from_srgb: Option<&Lut>) -> Option<Kept> {
-    let area = run.area;
+    // a workflow's picture goes where its Output node says, at the run's area's size, named as it
+    // asks; it's masked by the selection only where it lines up with the area
+    let (area, name, masked) = match &result.place {
+        Some(place) => {
+            let x0 = i32::try_from(place.x).unwrap_or(0);
+            let y0 = i32::try_from(place.y).unwrap_or(0);
+            let area = IRect::new(
+                x0,
+                y0,
+                x0.saturating_add(i32::try_from(run.area.width()).unwrap_or(0)),
+                y0.saturating_add(i32::try_from(run.area.height()).unwrap_or(0)),
+            );
+            let name = if place.name.trim().is_empty() { run.name.clone() } else { place.name.clone() };
+            (area, name, area == run.area)
+        }
+        None => (run.area, run.name.clone(), true),
+    };
     let from = result.generated;
-    let thumbnail = thumbnail(&result.picture)?;
-    let mut pixels = result.picture.rgba.clone();
+    let picture = if (result.picture.width, result.picture.height) == (area.width(), area.height()) {
+        result.picture.clone()
+    } else {
+        result.picture.resized(area.width(), area.height()).ok()?
+    };
+    let thumbnail = thumbnail(&picture)?;
+    let mut pixels = picture.rgba;
     if let Some(lut) = from_srgb {
         lut.apply_rgba(&mut pixels, false);
     }
-    if let Some(mask) = &run.mask {
+    if let Some(mask) = run.mask.as_ref().filter(|_| masked) {
         for (px, &value) in pixels.as_chunks_mut::<4>().0.iter_mut().zip(mask) {
             let alpha = u16::from(px[3]);
             px[3] = ((alpha * u16::from(value) + 127) / 255) as u8;
@@ -1786,7 +1885,7 @@ fn keep(id: u64, result: &procraft_diffusion::RunResult, run: &Running, from_srg
     (pixels.len() == area.width() as usize * area.height() as usize * 4).then_some(Kept {
         id,
         seed: result.seed,
-        name: run.name.clone(),
+        name,
         area,
         pixels: Some(Arc::new(pixels)),
         thumbnail,
@@ -2248,7 +2347,7 @@ mod tests {
             extract: None,
         };
         let picture = Picture::new(width, height, [255u8, 0, 0, 255].repeat((width * height) as usize)).unwrap();
-        let result = procraft_diffusion::RunResult { seed: 1, picture, generated: (width, height) };
+        let result = procraft_diffusion::RunResult { seed: 1, picture, generated: (width, height), place: None };
         let kept = keep(1, &result, &run, None).unwrap();
         assert_eq!((kept.area.x0, kept.area.y0, kept.area.x1, kept.area.y1), (26, 26, 174, 174));
         let pixels = kept.pixels.as_deref().map(Vec::as_slice).unwrap_or_default();

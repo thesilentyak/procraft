@@ -174,6 +174,27 @@ impl Comfy {
         self.send(&self.agent, "/queue", &json!({ "delete": [prompt_id] })).map(drop)
     }
 
+    /// What the server knows of every node it has (`/object_info`), keyed by class.
+    pub fn all_node_info(&self) -> Result<serde_json::Map<String, Value>, Error> {
+        match self.get("/object_info")? {
+            Value::Object(info) => Ok(info),
+            _ => Err(Error::protocol("its node list isn't an object")),
+        }
+    }
+
+    /// Asks the tooling add-on to send WebSocket client `client_id` the workflow open in
+    /// ComfyUI's tab, now and on every change. False if the server's add-on can't (it's missing or
+    /// too old); a client already signed up counts as signed up.
+    pub fn subscribe_workflows(&self, client_id: &str) -> Result<bool, Error> {
+        let answer = self
+            .agent
+            .post(self.address.http("/api/etn/workflow/subscribe"))
+            .header("Content-Type", "application/json")
+            .send(json!({ "client_id": client_id }).to_string())
+            .map_err(|e| self.unreachable(e))?;
+        Ok(answer.status() != 404 && answer.status() != 405)
+    }
+
     /// The text of `path` in ComfyUI's user folder (`userdata`); none if there's no such file yet.
     pub fn user_file(&self, path: &str) -> Result<Option<String>, Error> {
         let url = self.address.http(&format!("/userdata/{}", encode_path(path)));
@@ -299,6 +320,9 @@ pub enum Event {
     Interrupted { prompt_id: String },
     /// A picture: a sampling preview (JPEG) or a picture the graph sends (PNG).
     Picture { png: bool, bytes: Vec<u8> },
+    /// The tooling add-on sent a workflow (ComfyUI's tab has one with a Krita Output node open,
+    /// and it changed): the graph in its API format.
+    Workflow { workflow: Value },
 }
 
 /// A server's WebSocket, for one client id.
@@ -355,6 +379,7 @@ fn event(message: &Value) -> Option<Event> {
             Event::Failed { prompt_id, kind: text("exception_type"), message: text("exception_message") }
         }
         "execution_interrupted" => Event::Interrupted { prompt_id },
+        "etn_workflow_published" => Event::Workflow { workflow: data.get("workflow")?.clone() },
         _ => return None,
     })
 }
@@ -404,6 +429,11 @@ mod tests {
         let done = json!({ "type": "executing", "data": { "node": null, "prompt_id": "p" } });
         assert_eq!(event(&done), Some(Event::Executing { prompt_id: "p".into(), node: None }));
         assert_eq!(event(&json!({ "type": "status", "data": {} })), None);
+        let published = json!({
+            "type": "etn_workflow_published",
+            "data": { "publisher": { "name": "ComfyUI Web", "id": "c" }, "workflow": { "1": {} } },
+        });
+        assert_eq!(event(&published), Some(Event::Workflow { workflow: json!({ "1": {} }) }));
 
         let mut frame = vec![0, 0, 0, 1, 0, 0, 0, 2];
         frame.extend_from_slice(b"PNG!");

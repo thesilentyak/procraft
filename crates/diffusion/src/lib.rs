@@ -38,5 +38,7 @@ pub use plan::{ModelSize, Plan, Resolution, Size, largest_for_vram, plan, plan_a
 pub use request::{Control, ControlKind, ControlStep, Request, Selection, SelectionMode};
 pub use requirements::{Feature, Missing, Readiness};
 pub use styles::{Kind as StyleKind, LoraUse, Style, StyleFile, StyleSettings, styles_for};
-pub use worker::{Connection, Extraction, RunId, RunResult, RunState, ServerState, Worker};
+pub use worker::{
+    Connection, Extraction, LiveWorkflow, RunId, RunResult, RunState, ServerState, Worker, WorkflowRequest,
+};
 pub use workflow::{OutputPlace, Param, ParamKind, ParamValue, Prepared, Workflow, WorkflowInputs};
