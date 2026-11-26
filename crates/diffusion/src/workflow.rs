@@ -148,6 +148,11 @@ impl Workflow {
 
     /// The node classes whose inputs [`parameters`](Self::parameters) needs described: the ones
     /// an "auto" or "choice" Parameter feeds.
+    /// Whether `info` (the server's `/object_info`) describes every node this workflow uses.
+    pub fn described_by(&self, info: &Map<String, Value>) -> bool {
+        self.graph.classes().all(|class| info.contains_key(class))
+    }
+
     pub fn classes_to_describe(&self) -> Vec<String> {
         let mut classes = Vec::new();
         for node in self.graph.nodes_of(PARAMETER) {

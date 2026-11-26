@@ -635,7 +635,15 @@ fn workflow_run(
     request: &WorkflowRequest,
     models: &ServerModels,
 ) -> Result<(), Error> {
-    let info = on.shared.inner.lock().server.node_info.clone();
+    let mut info = on.shared.inner.lock().server.node_info.clone();
+    // ComfyUI restarted with new nodes since the app connected: read its nodes again, for their
+    // ranges and choices
+    if !request.workflow.described_by(&info)
+        && let Ok(fresh) = on.api.all_node_info()
+    {
+        info = Arc::new(fresh);
+        on.shared.inner.lock().server.node_info = Arc::clone(&info);
+    }
     let has = |node: &str| if info.is_empty() { models.has_node(node) } else { info.contains_key(node) };
     if !["ETN_LoadImageBase64", "ETN_LoadMaskBase64", "ETN_SendImageWebSocket"].iter().all(|n| has(n)) {
         return Err(Error::Request { reason: "the server needs the comfyui-tooling-nodes add-on".to_owned() });

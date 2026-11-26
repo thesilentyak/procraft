@@ -120,6 +120,11 @@ impl Graph {
     }
 
     /// The class of the node with id `node`.
+    /// Every node's class, once each time it appears.
+    pub(crate) fn classes(&self) -> impl Iterator<Item = &str> {
+        self.nodes.iter().map(|(class, _)| class.as_str())
+    }
+
     pub(crate) fn class(&self, node: &str) -> Option<&str> {
         self.node(node).map(|(class, _)| class.as_str())
     }
