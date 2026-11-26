@@ -402,7 +402,7 @@ internal object StyleStudio {
         // what's typed so far, the value as it was selected at first so a number replaces it
         var typing by remember { mutableStateOf<androidx.compose.ui.text.input.TextFieldValue?>(null) }
         Box {
-            SliderRow(label, value, if (typing != null) "" else shown, onChange)
+            SliderRow(label, value, if (typing != null) "" else shown, onChange = onChange)
             val text = typing
             if (text == null) {
                 Box(Modifier.align(Alignment.TopEnd).width(110.dp).height(36.dp).tap {
