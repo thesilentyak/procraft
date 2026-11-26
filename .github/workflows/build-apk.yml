@@ -45,8 +45,13 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - name: Build
         working-directory: android
-        # no release keystore here, so the build is signed with the runner's debug key
-        run: ./gradlew --no-daemon :app:assembleRelease -Pprocraft.abis=arm64-v8a
+        # no release keystore here, so the build is signed with the runner's debug key. The plugin
+        # repositories sometimes fail to answer on GitHub's runners: one more try after a pause.
+        run: |
+          ./gradlew --no-daemon :app:assembleRelease -Pprocraft.abis=arm64-v8a || {
+            sleep 60
+            ./gradlew --no-daemon :app:assembleRelease -Pprocraft.abis=arm64-v8a
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: procraft-diffusion-arm64-${{ github.sha }}
