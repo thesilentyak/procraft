@@ -330,6 +330,20 @@ mod tests {
     }
 
     #[test]
+    fn a_pixel_art_rectangle_selection_is_whole_pixels_on_pixel_corners() {
+        let s = CanvasSession::new(16, 16);
+        assert!(s.make_pixel_art());
+        // the canvas ten times its size in a 160 window: window points are tenths of pixels
+        s.shared.lock().view = Some(procraft_engine::view::View::fit((16, 16), (160, 160)));
+        s.select_shape(false, 13.0, 14.0, 56.0, 36.0, crate::SelectionJoin::Add);
+        let selection = s.shared.lock().selection.clone().expect("selected");
+        assert!(selection.data.iter().all(|&v| v == 0 || v == 255), "all or nothing");
+        // (1.3, 1.4) to (5.6, 3.6): pixels 1 to 5 across, 1 to 3 down
+        let at = |x: usize, y: usize| selection.data[y * 16 + x];
+        assert_eq!((at(1, 1), at(5, 3), at(0, 1), at(6, 1), at(1, 4)), (255, 255, 0, 0, 0));
+    }
+
+    #[test]
     fn a_pixel_art_canvas_is_made_clear_and_marked() {
         let s = CanvasSession::new(32, 32);
         assert!(!s.is_pixel_art());

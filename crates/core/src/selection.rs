@@ -262,8 +262,10 @@ impl CanvasSession {
     /// (`x1`, `y1`) joins the selection. Drawn on the window, so it turns with the view.
     pub fn select_shape(&self, ellipse: bool, x0: f32, y0: f32, x1: f32, y1: f32, join: SelectionJoin) {
         let (a, b) = (Vec2::new(x0, y0), Vec2::new(x1, y1));
-        // on a pixel art canvas, its corners on pixel corners, upright on the canvas
-        if let Some(points) = self.shared.lock().pixel_box(ellipse, a, b) {
+        // on a pixel art canvas, its corners on pixel corners, upright on the canvas (the canvas let
+        // go of before the selection takes it again)
+        let pixel_box = self.shared.lock().pixel_box(ellipse, a, b);
+        if let Some(points) = pixel_box {
             self.select_canvas_polygon(points, join);
             return;
         }
