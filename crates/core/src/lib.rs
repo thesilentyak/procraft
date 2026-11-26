@@ -660,6 +660,8 @@ pub(crate) struct State {
     pub(crate) hooks: Option<Arc<hooks::Hooks>>,
     /// A plugin's own artwork shown here, if this session shows one: its strokes go to it.
     pub(crate) plugin_artwork: Option<plugin_artwork::PluginArtwork>,
+    /// A pixel art canvas's pencil or eraser stroke in progress.
+    pixel_stroke: Option<pixel_art::PixelStroke>,
     /// Opened from a folder holding a plugin's artwork: its kind and its data, until the app opens
     /// it with its plugin.
     pub(crate) plugin_opened: Option<plugin_artwork::PluginOpened>,
@@ -2262,6 +2264,7 @@ impl CanvasSession {
             hooks: None,
             picker_program: None,
             plugin_artwork: None,
+            pixel_stroke: None,
             plugin_opened: None,
             sound_heard: None,
             sound_hover: None,
@@ -2542,6 +2545,11 @@ impl CanvasSession {
         if st.plugin_stepping > 0 {
             return;
         }
+        // a pixel art canvas's pencil and eraser set whole pixels themselves
+        if st.pixel_touch(pixel_art::Touch::Down(pointer), &samples) {
+            self.shared.frame(st);
+            return;
+        }
         // radial symmetry in as many parts as a plugin says, for this stroke
         st.doc.guide.radial = st.hooks.as_ref().and_then(|hooks| hooks.radial_segments());
         // a fill still spreading in shows all of itself before anything is drawn over it
@@ -2812,6 +2820,10 @@ impl Shared {
         if st.plugin_stepping > 0 {
             return;
         }
+        if st.pixel_touch(pixel_art::Touch::Moved, &samples) {
+            self.frame(st);
+            return;
+        }
         if st.scene_shown() {
             st.scene_stroke_add(&samples, false);
             self.frame(st);
@@ -2908,6 +2920,10 @@ impl CanvasSession {
         {
             history.painted(history::hex(st.color));
         }
+        if st.pixel_touch(pixel_art::Touch::Up, &samples) {
+            self.shared.frame(st);
+            return;
+        }
         if st.scene_shown() {
             st.scene_stroke_add(&samples, true);
             self.shared.frame(st);
@@ -2966,6 +2982,10 @@ impl CanvasSession {
         self.shared.drop_queued_input();
         st.airbrush = None;
         if st.plugin_touch(plugin_artwork::Phase::Off, &[]) {
+            self.shared.frame(st);
+            return;
+        }
+        if st.pixel_touch(pixel_art::Touch::Off, &[]) {
             self.shared.frame(st);
             return;
         }

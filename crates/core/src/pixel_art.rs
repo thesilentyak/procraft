@@ -8,8 +8,12 @@ use procraft_engine::document::Document;
 use procraft_engine::geom::Affine;
 use procraft_engine::pixel;
 
+use procraft_engine::document::LayerId;
+use procraft_engine::geom::{IRect, Vec2};
+use procraft_engine::pixel::{Ink, Perfect, Stroke};
+
 use crate::project::{write_atomically, write_png};
-use crate::{CanvasSession, MobileError};
+use crate::{CanvasSession, MobileError, PenSample, PointerKind, State, ToolKind};
 
 /// A canvas pixel shown this many points across or more shows the pixel grid.
 pub(crate) const GRID_FROM: f32 = 6.0;
@@ -84,6 +88,142 @@ impl CanvasSession {
         write_atomically(Path::new(&path), |p| write_png(p, bw, bh, &big, &icc))?;
         self.exported(1.0);
         Ok(())
+    }
+}
+
+/// Where a stroke is: starting (with what it's drawn with), going on, ending, or called off (a
+/// second finger made it a gesture).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Touch {
+    Down(PointerKind),
+    Moved,
+    Up,
+    Off,
+}
+
+/// A pixel art canvas's pencil or eraser stroke in progress.
+pub(crate) struct PixelStroke {
+    layer: LayerId,
+    stroke: Stroke,
+    footprint: Vec<(i32, i32)>,
+    /// A one-pixel line's path, kept pixel-perfect.
+    perfect: Option<Perfect>,
+    last: Option<(i32, i32)>,
+}
+
+impl State {
+    /// On a pixel art canvas, the paint and erase tools set whole pixels themselves: true if this
+    /// stroke is theirs (taken here), false to leave it to the brushes.
+    pub(crate) fn pixel_touch(&mut self, touch: Touch, samples: &[PenSample]) -> bool {
+        if let Touch::Down(pointer) = touch {
+            self.pixel_stroke = None;
+            match self.pixel_stroke_begins(pointer) {
+                Some(stroke) => self.pixel_stroke = Some(stroke),
+                None => return false,
+            }
+        }
+        let Some(mut on) = self.pixel_stroke.take() else { return false };
+        let points: Vec<(i32, i32)> = self
+            .to_canvas(samples)
+            .iter()
+            .filter(|s| s.pos.x.is_finite() && s.pos.y.is_finite())
+            .map(|s| (s.pos.x.floor() as i32, s.pos.y.floor() as i32))
+            .collect();
+        if touch != Touch::Off {
+            for p in points {
+                let from = on.last.unwrap_or(p);
+                for q in procraft_engine::pixel::line(from, p).into_iter().skip(usize::from(on.last.is_some())) {
+                    self.pixel_draw(&mut on, q);
+                }
+                on.last = Some(p);
+            }
+            if let Some((rect, part)) = on.stroke.take_changed() {
+                self.rewrite_layer(on.layer, IRect::new(rect[0], rect[1], rect[2], rect[3]), part);
+            }
+        }
+        match touch {
+            Touch::Down(_) | Touch::Moved => self.pixel_stroke = Some(on),
+            // one step undo takes back; none for a stroke that changed nothing, or was called off
+            Touch::Up | Touch::Off => {
+                if let Some(canvas) = self.canvas.as_mut() {
+                    canvas.collapse_steps();
+                    if touch == Touch::Off || !on.stroke.any() {
+                        canvas.undo();
+                        canvas.forget_redo();
+                    }
+                }
+                self.revision += 1;
+            }
+        }
+        true
+    }
+
+    /// A pixel stroke as one starts with `pointer`, if it's the pixel pencil's: on a pixel art
+    /// canvas, painting or erasing a paint layer that can be painted.
+    fn pixel_stroke_begins(&mut self, pointer: PointerKind) -> Option<PixelStroke> {
+        if !self.doc.pixel_art || self.plugin_artwork.is_some() || self.cloning || self.adjusting {
+            return None;
+        }
+        let tool = if pointer == PointerKind::StylusEraser { ToolKind::Erase } else { self.tool };
+        let id = self.doc.current();
+        let layer = self.doc.layer(id).cloned()?;
+        let paintable = layer.kind == procraft_engine::document::LayerKind::Paint
+            && !self.doc.is_locked(id)
+            && !layer.drawn_from_data();
+        if tool == ToolKind::Smudge || !paintable {
+            return None;
+        }
+        let sliders = self.sliders(tool);
+        let width = pixel::pencil_width(sliders.size);
+        let ink = match tool {
+            ToolKind::Erase => Ink::Erase(sliders.opacity),
+            _ => Ink::Paint(self.color, sliders.opacity),
+        };
+        let pixels = self.layer_pixels(id)?;
+        let mask = self.selection.as_ref().map(|m| m.data.clone());
+        let stroke = Stroke::new(self.doc.width(), self.doc.height(), pixels, ink, layer.alpha_lock, mask)?;
+        self.canvas.as_mut()?.mark_steps();
+        Some(PixelStroke {
+            layer: id,
+            stroke,
+            footprint: pixel::footprint(width),
+            perfect: (width == 1).then(Perfect::default),
+            last: None,
+        })
+    }
+
+    /// The pencil at pixel `p`: its footprint set there and where the symmetry copies it, a
+    /// one-pixel line kept pixel-perfect.
+    fn pixel_draw(&self, on: &mut PixelStroke, p: (i32, i32)) {
+        let (go, corner) = match on.perfect.as_mut() {
+            Some(perfect) => perfect.add(p),
+            None => (true, None),
+        };
+        if let Some(c) = corner {
+            for q in self.pixel_copies(c) {
+                on.stroke.unset(q);
+            }
+        }
+        if go {
+            for &(dx, dy) in &on.footprint {
+                for q in self.pixel_copies((p.0 + dx, p.1 + dy)) {
+                    on.stroke.set(q);
+                }
+            }
+        }
+    }
+
+    /// Pixel `p` and where the drawing guide's symmetry copies it, each a whole pixel.
+    fn pixel_copies(&self, p: (i32, i32)) -> Vec<(i32, i32)> {
+        let middle = Vec2::new(p.0 as f32 + 0.5, p.1 as f32 + 0.5);
+        let mut out = vec![p];
+        for (at, _, _) in self.doc.guide.copies(middle) {
+            let q = (at.x.floor() as i32, at.y.floor() as i32);
+            if !out.contains(&q) {
+                out.push(q);
+            }
+        }
+        out
     }
 }
 
