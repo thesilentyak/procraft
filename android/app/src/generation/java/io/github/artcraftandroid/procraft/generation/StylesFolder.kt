@@ -8,6 +8,7 @@ import android.os.Environment
 import android.provider.DocumentsContract
 import android.provider.MediaStore
 import io.github.artcraftandroid.procraft.core.StyleFileText
+import io.github.artcraftandroid.procraft.core.WorkflowFileText
 import java.io.File
 
 /**
@@ -27,6 +28,8 @@ internal object StylesFolder {
     private const val KEY = "styles_folder"
     /** A file bigger than this isn't a style. */
     private const val MOST_BYTES = 256L * 1024
+    /** A file bigger than this isn't a workflow (they're text, a few tens of kilobytes). */
+    private const val MOST_WORKFLOW_BYTES = 8L * 1024 * 1024
     private const val ABOUT = "About these files.txt"
     private const val ABOUT_TEXT =
         "This folder holds your ProCraft Diffusion styles: one .toml file for each style, named after it.\n\n" +
@@ -87,8 +90,19 @@ internal object StylesFolder {
         }.sortedBy { it.name }
     }
 
-    /** The style files there are and where each is. */
-    private fun list(context: Context): List<Pair<String, Uri>> {
+    /** The folder's workflow files (each `.json` in it), by name, as [read] reads the styles. */
+    fun readWorkflows(context: Context): List<WorkflowFileText> {
+        val resolver = context.contentResolver
+        return list(context, ".json").mapNotNull { (name, uri) ->
+            runCatching { resolver.openInputStream(uri)?.use { String(it.readBytes()) } }.getOrNull()?.let { WorkflowFileText(name, it) }
+        }.sortedBy { it.name.lowercase() }
+    }
+
+    /** The files there are and where each is: those ending `suffix`, or styles and workflows both. */
+    private fun list(context: Context, suffix: String? = ".toml"): List<Pair<String, Uri>> {
+        fun wanted(name: String) = if (suffix != null) name.endsWith(suffix, ignoreCase = true)
+            else name.endsWith(".toml", ignoreCase = true) || name.endsWith(".json", ignoreCase = true)
+        fun limit(name: String) = if (name.endsWith(".json", ignoreCase = true)) MOST_WORKFLOW_BYTES else MOST_BYTES
         val resolver = context.contentResolver
         val tree = tree(context)
         val found = mutableListOf<Pair<String, Uri>>()
@@ -105,7 +119,7 @@ internal object StylesFolder {
                     while (c.moveToNext()) {
                         val name = c.getString(1) ?: continue
                         val folder = c.getString(3) == DocumentsContract.Document.MIME_TYPE_DIR
-                        if (folder || !name.endsWith(".toml", ignoreCase = true) || c.getLong(2) > MOST_BYTES) continue
+                        if (folder || !wanted(name) || c.getLong(2) > limit(name)) continue
                         found += name to DocumentsContract.buildDocumentUriUsingTree(tree, c.getString(0))
                     }
                 }
@@ -116,7 +130,7 @@ internal object StylesFolder {
                 resolver.query(files, columns, "${MediaStore.MediaColumns.RELATIVE_PATH} = ?", arrayOf("$DEFAULT/"), null)?.use { c ->
                     while (c.moveToNext()) {
                         val name = c.getString(1) ?: continue
-                        if (name.endsWith(".toml", ignoreCase = true)) found += name to android.content.ContentUris.withAppendedId(files, c.getLong(0))
+                        if (wanted(name)) found += name to android.content.ContentUris.withAppendedId(files, c.getLong(0))
                     }
                 }
             }
@@ -135,7 +149,7 @@ internal object StylesFolder {
     fun write(context: Context, name: String, text: String, replacing: String?): String? {
         val resolver = context.contentResolver
         return runCatching {
-            val there = list(context)
+            val there = list(context, null)
             val target = there.firstOrNull { it.first == name }?.second ?: run {
                 val tree = tree(context)
                 if (tree != null) {
@@ -159,7 +173,8 @@ internal object StylesFolder {
     /** Hands style file `name` to another app (or saves it on the device) through the share sheet;
      *  the reason it couldn't, if it couldn't. */
     fun export(context: Context, name: String): String? {
-        val text = read(context).firstOrNull { it.name == name }?.text ?: return "its file isn't in the folder"
+        val text = (read(context).firstOrNull { it.name == name }?.text ?: readWorkflows(context).firstOrNull { it.name == name }?.text)
+            ?: return "its file isn't in the folder"
         return runCatching {
             val dir = File(context.cacheDir, "exports").apply { mkdirs() }
             val file = File(dir, name).apply { writeText(text) }
@@ -180,14 +195,14 @@ internal object StylesFolder {
                 size = c.getLong(1)
             }
         }
-        if (size > MOST_BYTES) return null
+        if (size > MOST_WORKFLOW_BYTES) return null
         val text = resolver.openInputStream(uri)?.use { String(it.readBytes()) } ?: return null
         name to text
     }.getOrNull()
 
     /** Removes the style file `name`; the reason it couldn't, if it couldn't. */
     fun delete(context: Context, name: String): String? {
-        val uri = list(context).firstOrNull { it.first == name }?.second ?: return null
+        val uri = list(context, null).firstOrNull { it.first == name }?.second ?: return null
         return runCatching {
             if (tree(context) != null) DocumentsContract.deleteDocument(context.contentResolver, uri) else context.contentResolver.delete(uri, null, null)
             null

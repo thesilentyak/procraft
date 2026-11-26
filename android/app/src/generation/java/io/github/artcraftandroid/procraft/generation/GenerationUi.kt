@@ -221,6 +221,7 @@ object GenerationUi {
             generation = g
             g.setRecentPrompts(p.getString("recent", "")?.split('\n')?.filter { it.isNotBlank() } ?: emptyList())
             opened?.let { (s, f) -> g.setFolder(s, f) }
+            Workflows.start(context, g)
         }
     }
 
@@ -242,6 +243,7 @@ object GenerationUi {
         // a trace landed in a control layer: the layers panel shows it
         if (state.madeLayer != null) refreshLayers?.invoke()
         server = g.server()
+        Workflows.poll(appContext, g)
         // the trigger words couldn't be kept on the server: said under Generate
         g.takeNotesError()?.let { error = it }
         val ids = state.results.map { it.id }.toSet()
@@ -356,6 +358,7 @@ object GenerationUi {
             val files = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { StylesFolder.read(context) }
             g.setStyleFiles(files)
             stylesRead++
+            Workflows.reread(context, g)
         }
         Popover(400.dp, arrowX, modifier.then(room)) {
             when {
@@ -423,8 +426,8 @@ object GenerationUi {
                     Box {
                     Column(
                         Modifier.width(116.dp).height(76.dp).clip(shape).background(Card)
-                            .then(if (s.id == style) Modifier.border(2.dp, Pc.Accent, shape) else Modifier)
-                            .combinedClickable(remember { MutableInteractionSource() }, indication = null, onLongClick = { styleMenu = s.id }, onClick = { keptStyle = null; style = s.id })
+                            .then(if (s.id == style && Workflows.chosen == null) Modifier.border(2.dp, Pc.Accent, shape) else Modifier)
+                            .combinedClickable(remember { MutableInteractionSource() }, indication = null, onLongClick = { styleMenu = s.id }, onClick = { keptStyle = null; style = s.id; Workflows.choose(formContext, null) })
                             .padding(10.dp),
                     ) {
                         Row(Modifier.weight(1f)) {
@@ -447,7 +450,9 @@ object GenerationUi {
                     if (styleMenu == s.id) StyleMenu(g, s)
                     }
                 }
-                // the + card: New style (from the chosen one) or Import… (a style file)
+                // the workflows from ComfyUI: the live one, then the kept ones
+                Workflows.Cards(g) { error = null }
+                // the + card: New style (from the chosen one) or Import… (a style or workflow file)
                 Box {
                     Box(Modifier.width(56.dp).height(76.dp).clip(RoundedCornerShape(12.dp)).background(Card).tap { styleMenu = "+" }, contentAlignment = Alignment.Center) {
                         Text("+", color = Dim, fontSize = 26.sp)
@@ -474,8 +479,10 @@ object GenerationUi {
             // suggestions for the tag being typed, or (field empty) the recent prompts
             if (promptFocused) TagStrip(g)
             Spacer(Modifier.height(8.dp))
-            // strength: the last stretch snaps to a new image
-            Box(Modifier.padding(horizontal = 6.dp)) {
+            // a workflow: its other rows (folded under More but the prompts); a style: strength, the
+            // last stretch snapping to a new image
+            if (Workflows.chosen != null) Workflows.Parameters(vm, g)
+            else Box(Modifier.padding(horizontal = 6.dp)) {
                 val shown = if (strength >= 1f) "New image" else "${(strength * 100).toInt()}% · Refine"
                 SliderRow("Strength", strength, shown) { t -> strength = if (t > 0.97f) 1f else Math.round(t * 100) / 100f }
             }
@@ -510,6 +517,8 @@ object GenerationUi {
                     }
                 }
             }
+            // a style's own parts: control layers, the selection's mode, resolution
+            if (Workflows.chosen == null) {
             // control layers: one row each (trace, × to make it a plain layer again, how closely to
             // follow it), hidden ones too (they still guide), then + Line art, + Scribble and + Depth
             // to add an empty one to draw on or trace into
@@ -607,15 +616,17 @@ object GenerationUi {
                 val size = g.sizeFor(session, resolution, style)
                 Text(planText(size), color = Dim, fontSize = 12.sp, modifier = Modifier.padding(start = 20.dp, end = 20.dp, bottom = 4.dp))
             }
+            }
         }
         Column(Modifier.padding(bottom = 16.dp)) {
             // Generate, or Cancel while a run goes
             val running = state.running
             val selection = vm.session?.let { g.selection(it) }
             val picked = selection?.let { mode ?: it.mode }
-            val needsPrompt = picked == GenerationMode.ADD && prompt.isBlank()
-            val blocked = styles.firstOrNull { it.id == style }?.reason
-            val ready = server?.connection == ServerConnection.CONNECTED && styles.isNotEmpty() && !needsPrompt && blocked == null
+            val workflow = Workflows.chosen != null
+            val needsPrompt = !workflow && picked == GenerationMode.ADD && prompt.isBlank()
+            val blocked = if (workflow) Workflows.reason(g) else styles.firstOrNull { it.id == style }?.reason
+            val ready = server?.connection == ServerConnection.CONNECTED && (workflow || styles.isNotEmpty()) && !needsPrompt && blocked == null
             val words = when {
                 running != null -> "Cancel · ${(running.progress * 100).toInt()}%"
                 count > 1 -> "Generate $count"
@@ -627,12 +638,14 @@ object GenerationUi {
                     .background(if (ready || running != null) fill else fill.copy(alpha = 0.4f))
                     .tap {
                         focus.clearFocus()
-                        if (running != null) g.cancel() else if (ready) run(vm, g, RunSettings(prompt, style, strength, seed, count.toUInt(), resolution, picked, controlSteps.map { (id, v) -> io.github.artcraftandroid.procraft.core.ControlSetting(id, v) }))
+                        if (running != null) g.cancel()
+                        else if (ready && workflow) { error = Workflows.run(vm, g, prompt, seed, count); poll(g) }
+                        else if (ready) run(vm, g, RunSettings(prompt, style, strength, seed, count.toUInt(), resolution, picked, controlSteps.map { (id, v) -> io.github.artcraftandroid.procraft.core.ControlSetting(id, v) }))
                     },
                 contentAlignment = Alignment.Center,
             ) { Text(words, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.SemiBold) }
             if (needsPrompt && running == null) Text("Add needs a prompt: say what to put there.", color = Dim, fontSize = 13.sp, modifier = Modifier.padding(start = 18.dp, end = 18.dp, top = 10.dp))
-            (error ?: state.error ?: blocked?.takeIf { running == null })?.let { Text(it, color = WARN, fontSize = 13.sp, modifier = Modifier.padding(start = 18.dp, end = 18.dp, top = 10.dp)) }
+            (error ?: Workflows.problem ?: state.error ?: blocked?.takeIf { running == null })?.let { Text(it, color = WARN, fontSize = 13.sp, modifier = Modifier.padding(start = 18.dp, end = 18.dp, top = 10.dp)) }
         }
     }
 
@@ -794,6 +807,17 @@ object GenerationUi {
      *  it couldn't, or null. */
     private fun importStyle(context: Context, g: Generation, uri: android.net.Uri): String? {
         val (fileName, text) = StylesFolder.imported(context, uri) ?: return "Couldn't import it: the file can't be read"
+        // a workflow (ComfyUI's API format): kept beside the styles as a .json, its card chosen
+        if (fileName.endsWith(".json", ignoreCase = true) || text.trimStart().startsWith("{")) {
+            g.checkWorkflowFile(text)?.let { return "Couldn't import it: $it" }
+            val name = fileName.substringBeforeLast('.').ifBlank { "Workflow" } + ".json"
+            StylesFolder.write(context, name, text, null)?.let { return "Couldn't import it: $it" }
+            Workflows.reread(context, g)
+            Workflows.choose(context, "file:$name")
+            view = View.FORM
+            if (!StylesFolder.granted(context)) StyleStudio.asking = true
+            return null
+        }
         g.styleFileProblem(text)?.let { return "Couldn't import it: $it" }
         g.setStyleFiles(StylesFolder.read(context))
         val name = g.styleFileName(fileName.substringBeforeLast('.'), null)
