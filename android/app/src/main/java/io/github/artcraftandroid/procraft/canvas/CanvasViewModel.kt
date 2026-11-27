@@ -8957,6 +8957,18 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         choosePixelPalette(colours)
     }
 
+    /** The palette's colours copied as hex codes (`#1a1c2c, #5d275d, …`), as the pixel art workflows' Palette takes them. */
+    fun copyPixelPalette() {
+        if (pixelPalette.isEmpty()) {
+            message = "The palette is empty."
+            return
+        }
+        val text = pixelPalette.joinToString(", ") { "#%06x".format(it and 0xFFFFFF) }
+        val clip = getApplication<Application>().getSystemService(android.content.ClipboardManager::class.java)
+        clip?.setPrimaryClip(android.content.ClipData.newPlainText("Palette", text))
+        message = "Copied ${pixelPalette.size} colours. Paste them into a workflow's Palette."
+    }
+
     /** The colours on the canvas as the palette (all of them, up to 64). */
     fun pixelPaletteFromPicture() {
         val s = session ?: return

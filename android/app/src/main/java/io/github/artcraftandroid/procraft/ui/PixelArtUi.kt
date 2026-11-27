@@ -281,6 +281,7 @@ private fun PaletteButtons(vm: io.github.artcraftandroid.procraft.canvas.CanvasV
     Box {
         StripButton("⋯") { menu = true }
         androidx.compose.material3.DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+            androidx.compose.material3.DropdownMenuItem(text = { Text("Copy hex codes") }, onClick = { menu = false; vm.copyPixelPalette() })
             androidx.compose.material3.DropdownMenuItem(text = { Text("Paste hex codes") }, onClick = { menu = false; vm.pastePixelPalette() })
             androidx.compose.material3.DropdownMenuItem(text = { Text("From the picture") }, onClick = { menu = false; vm.pixelPaletteFromPicture() })
             androidx.compose.material3.DropdownMenuItem(text = { Text("Clear") }, onClick = { menu = false; vm.choosePixelPalette(emptyList()) })
