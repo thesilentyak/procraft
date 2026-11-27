@@ -257,13 +257,142 @@ def pixel_edit():
     return nodes
 
 
+def pixel_animation():
+    """Pixel animation: MiniMax H3 animates the canvas's sprite. The sprite is blown up with hard
+    edges (to at most 768 pixels a side) and centred on white, the sides a multiple of 32; it's the
+    video's first and last frame, so the move loops. The sprite's part of every few video frames is
+    put back on the canvas's pixels by SpriteFusion's Pixel Snapper, all of them side by side so
+    they share one palette, white keyed out, and the frames go back as an animation (batch mode
+    "animation"): the app makes them one result whose Apply adds them as frames, named after the
+    move."""
+    unet = "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+    lora = "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"
+    te = "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
+    vae = "minimax_h3_video_vae_fp16.safetensors"
+    nodes = []
+
+    def node(nid, cls, widgets, links, outputs, widget_links=(), api_widgets=None, title=None, pos=(0, 0)):
+        nodes.append(dict(id=nid, cls=cls, widgets=widgets, links=links, outputs=outputs,
+                          widget_links=set(widget_links), api=api_widgets or {}, title=title, pos=pos))
+
+    maths = [("FLOAT", "FLOAT"), ("INT", "INT"), ("BOOL", "BOOLEAN")]
+
+    def math(nid, expression, values, title, pos):
+        node(nid, "ComfyMathExpression", [expression], {f"values.{k}": v for k, v in values.items()}, maths,
+             api_widgets={"expression": expression}, title=title, pos=pos)
+
+    node(1, "ETN_KritaCanvas", [], {}, [("image", "IMAGE"), ("width", "INT"), ("height", "INT"), ("seed", "INT"), ("mask", "MASK")],
+         title="Canvas (from the app)", pos=(0, 700))
+    node(2, "ETN_Parameter", ["Prompt", "prompt (positive)", "", -1e10, 1e10], {}, [("value", "*")],
+         api_widgets={"name": "Prompt", "type": "prompt (positive)", "default": "", "min": -1e10, "max": 1e10},
+         title="Prompt: the move (from the app)", pos=(0, 0))
+    node(3, "ETN_Parameter", ["Frames", "number (integer)", "8", 2, 12], {}, [("value", "*")],
+         api_widgets={"name": "Frames", "type": "number (integer)", "default": "8", "min": 2, "max": 12},
+         title="Frames (from the app)", pos=(0, 220))
+    node(4, "ETN_Parameter", ["Seconds", "number", "1.6", 1, 5], {}, [("value", "*")],
+         api_widgets={"name": "Seconds", "type": "number", "default": "1.6", "min": 1, "max": 5},
+         title="Seconds (from the app)", pos=(0, 440))
+    canvas_w, canvas_h = (1, 1), (1, 2)
+    math(11, "max(1, floor(768 / max(a, b)))", {"a": canvas_w, "b": canvas_h}, "How much to blow it up", (400, 700))
+    k_int, k_float = (11, 1), (11, 0)
+    math(12, "ceil(a * b / 32) * 32", {"a": canvas_w, "b": k_int}, "Video width", (400, 900))
+    math(13, "ceil(a * b / 32) * 32", {"a": canvas_h, "b": k_int}, "Video height", (400, 1100))
+    math(14, "floor((c - a * b) / 2)", {"a": canvas_w, "b": k_int, "c": (12, 1)}, "Sprite x in the video", (400, 1300))
+    math(15, "floor((c - a * b) / 2)", {"a": canvas_h, "b": k_int, "c": (13, 1)}, "Sprite y in the video", (400, 1500))
+    math(16, "a * b", {"a": canvas_w, "b": k_int}, "Sprite width, blown up", (400, 1700))
+    math(17, "a * b", {"a": canvas_h, "b": k_int}, "Sprite height, blown up", (400, 1900))
+    node(18, "ImageScaleBy", ["nearest-exact", 1.0], {"image": (1, 0), "scale_by": k_float}, [("IMAGE", "IMAGE")],
+         widget_links=["scale_by"], api_widgets={"upscale_method": "nearest-exact"}, title="Blown up with hard edges",
+         pos=(800, 700))
+    node(19, "EmptyImage", [512, 512, 1, 16777215], {"width": (12, 1), "height": (13, 1)}, [("IMAGE", "IMAGE")],
+         widget_links=["width", "height"], api_widgets={"batch_size": 1, "color": 16777215}, title="White video frame",
+         pos=(800, 900))
+    node(20, "ImageCompositeMasked", [0, 0, False], {"destination": (19, 0), "source": (18, 0), "x": (14, 1), "y": (15, 1)},
+         [("IMAGE", "IMAGE")], widget_links=["x", "y"], api_widgets={"resize_source": False},
+         title="First (and last) frame", pos=(800, 1100))
+    before = "A 2D pixel art game sprite animation:"
+    after = ("The camera is completely still, the character stays in the centre of the frame at the same size, and "
+             "the plain white background never changes. Crisp blocky pixel art with dark outlines, flat colours, "
+             "no motion blur.")
+    node(21, "StringConcatenate", [before, "", " "], {"string_b": (2, 0)}, [("STRING", "STRING")],
+         widget_links=["string_b"], api_widgets={"string_a": before, "delimiter": " "}, pos=(400, 0))
+    node(22, "StringConcatenate", ["", after, " "], {"string_a": (21, 0)}, [("STRING", "STRING")],
+         widget_links=["string_a"], api_widgets={"string_b": after, "delimiter": " "}, title="The whole prompt",
+         pos=(800, 0))
+    length = "max(5, round(a * 24)) + (5 - (max(5, round(a * 24)) % 17)) % 17"
+    math(23, length, {"a": (4, 0)}, "Video length in frames (17k + 5)", (400, 440))
+    node(30, "UNETLoader", [unet, "default"], {}, [("MODEL", "MODEL")],
+         api_widgets={"unet_name": unet, "weight_dtype": "default"}, pos=(1200, 0))
+    node(31, "LoraLoaderModelOnly", [lora, 1.0], {"model": (30, 0)}, [("MODEL", "MODEL")],
+         api_widgets={"lora_name": lora, "strength_model": 1.0}, pos=(1200, 160))
+    node(32, "CLIPLoader", [te, "minimax", "default"], {}, [("CLIP", "CLIP")],
+         api_widgets={"clip_name": te, "type": "minimax", "device": "default"}, pos=(1200, 320))
+    node(33, "VAELoader", [vae], {}, [("VAE", "VAE")], api_widgets={"vae_name": vae}, pos=(1200, 480))
+    node(34, "MiniMaxH3ImageToVideo", ["", 768, 768, 39],
+         {"clip": (32, 0), "vae": (33, 0), "prompt": (22, 0), "width": (12, 1), "height": (13, 1), "length": (23, 1),
+          "first_frame": (20, 0), "last_frame": (20, 0)},
+         [("positive", "CONDITIONING"), ("latent", "LATENT")], widget_links=["prompt", "width", "height", "length"],
+         title="The same first and last frame: it loops", pos=(1600, 0))
+    node(35, "RandomNoise", [0, "fixed"], {"noise_seed": (1, 3)}, [("NOISE", "NOISE")], widget_links=["noise_seed"],
+         pos=(1600, 300))
+    node(36, "BasicGuider", [], {"model": (31, 0), "conditioning": (34, 0)}, [("GUIDER", "GUIDER")], pos=(1600, 440))
+    node(37, "KSamplerSelect", ["res_multistep"], {}, [("SAMPLER", "SAMPLER")],
+         api_widgets={"sampler_name": "res_multistep"}, pos=(1600, 560))
+    node(38, "BasicScheduler", ["simple", 8, 1.0], {"model": (31, 0)}, [("SIGMAS", "SIGMAS")],
+         api_widgets={"scheduler": "simple", "steps": 8, "denoise": 1.0}, pos=(1600, 680))
+    node(39, "SamplerCustomAdvanced", [], {"noise": (35, 0), "guider": (36, 0), "sampler": (37, 0), "sigmas": (38, 0),
+                                           "latent_image": (34, 1)},
+         [("output", "LATENT"), ("denoised_output", "LATENT")], pos=(2000, 0))
+    node(40, "VAEDecode", [], {"samples": (39, 0), "vae": (33, 0)}, [("IMAGE", "IMAGE")], pos=(2000, 300))
+    node(41, "ImageCrop", [512, 512, 0, 0], {"image": (40, 0), "width": (16, 1), "height": (17, 1), "x": (14, 1), "y": (15, 1)},
+         [("IMAGE", "IMAGE")], widget_links=["width", "height", "x", "y"], title="Just the sprite's part", pos=(2000, 440))
+    math(42, "a - 1", {"a": (23, 1)}, "Without the repeated last frame", (2000, 700))
+    node(43, "GetImageRangeFromBatch", [0, 1], {"images": (41, 0), "num_frames": (42, 1)}, [("IMAGE", "IMAGE"), ("MASK", "MASK")],
+         widget_links=["num_frames"], api_widgets={"start_index": 0}, pos=(2400, 0))
+    math(44, "max(1, round(a / b))", {"a": (42, 1), "b": (3, 0)}, "Keep every nth frame", (2400, 200))
+    node(45, "RebatchImages", [1], {"images": (43, 0), "batch_size": (44, 1)}, [("IMAGE", "IMAGE")],
+         widget_links=["batch_size"], pos=(2400, 400))
+    node(46, "ImageFromBatch", [0, 1], {"image": (45, 0)}, [("IMAGE", "IMAGE")],
+         api_widgets={"batch_index": 0, "length": 1}, pos=(2400, 560))
+    node(47, "ImageListToBatch+", [], {"image": (46, 0)}, [("IMAGE", "IMAGE")], title="The frames kept", pos=(2400, 720))
+    node(48, "GetImageSize", [], {"image": (47, 0)}, [("width", "INT"), ("height", "INT"), ("batch_size", "INT")],
+         title="How many frames", pos=(2400, 880))
+    node(49, "ImageGrid", [4, 256, 256, 0], {"images": (47, 0), "columns": (48, 2), "cell_width": (16, 1), "cell_height": (17, 1)},
+         [("IMAGE", "IMAGE")], widget_links=["columns", "cell_width", "cell_height"], api_widgets={"padding": 0},
+         title="In one row", pos=(2800, 0))
+    node(50, "GetImageSize", [], {"image": (49, 0)}, [("width", "INT"), ("height", "INT"), ("batch_size", "INT")],
+         pos=(2800, 240))
+    math(51, "round(a / b)", {"a": (50, 0), "b": k_int}, "The row's width in canvas pixels", (2800, 400))
+    node(52, "SpriteFusionPixelSnapper",
+         [32, 1.0, "exact_size", 1, 64, 64, "connected_chroma_key", "#FFFFFF", 48, "majority", "", "uniform"],
+         {"image": (49, 0), "pixel_size": k_float, "exact_width": (51, 1), "exact_height": canvas_h},
+         [("image", "IMAGE"), ("grid_width", "INT"), ("grid_height", "INT"), ("mask", "MASK"), ("key_color_used", "STRING")],
+         widget_links=["pixel_size", "exact_width", "exact_height"],
+         api_widgets={"colors": 32, "output_mode": "exact_size", "output_scale": 1, "transparency": "connected_chroma_key",
+                      "key_color": "#FFFFFF", "key_tolerance": 48, "cell_method": "majority", "custom_palette": "",
+                      "grid_mode": "uniform"},
+         title="Back onto the canvas's pixels, one palette for every frame", pos=(2800, 600))
+    node(53, "JoinImageWithAlpha", [], {"image": (52, 0), "alpha": (52, 3)}, [("IMAGE", "IMAGE")],
+         title="White taken out", pos=(3200, 0))
+    node(54, "ImageTile+", [1, 2, 0.0, 0, 0], {"image": (53, 0), "cols": (48, 2)},
+         [("IMAGE", "IMAGE"), ("tile_width", "INT"), ("tile_height", "INT"), ("overlap_x", "INT"), ("overlap_y", "INT")],
+         widget_links=["cols"], api_widgets={"rows": 1, "overlap": 0.0, "overlap_x": 0, "overlap_y": 0},
+         title="Cut into frames", pos=(3200, 200))
+    node(55, "ETN_KritaOutput", [0, 0, "", "animation", False], {"images": (54, 0)}, [],
+         api_widgets={"x": 0, "y": 0, "name": "", "batch_mode": "animation", "resize_canvas": False},
+         title="Back to the app, as frames", pos=(3600, 0))
+    return nodes
+
+
 def widget_inputs(n):
     # the inputs that are widgets given a link
     types = {"text": "STRING", "seed": "INT", "denoise": "FLOAT", "prompt": "STRING", "width": "INT",
              "height": "INT", "string_b": "STRING", "request": "STRING", "background": "COMBO",
              "palette": "STRING", "caption": "STRING", "target_width": "INT", "target_height": "INT",
              "scale_by": "FLOAT", "pixel_size": "FLOAT", "exact_width": "INT", "exact_height": "INT",
-             "custom_palette": "STRING", "switch": "BOOLEAN"}
+             "custom_palette": "STRING", "switch": "BOOLEAN", "x": "INT", "y": "INT", "length": "INT",
+             "noise_seed": "INT", "num_frames": "INT", "batch_size": "INT", "columns": "INT", "cell_width": "INT",
+             "cell_height": "INT", "cols": "INT", "string_a": "STRING"}
     return [(w, types.get(w, "*")) for w in n["widget_links"]]
 
 
@@ -334,6 +463,7 @@ if __name__ == "__main__":
         (minimax(True), "ProCraft - MiniMax edit"),
         (rd_flow(), "ProCraft - Pixel art (RD Flow 64)"),
         (pixel_edit(), "ProCraft - Pixel art edit (MiniMax)"),
+        (pixel_animation(), "ProCraft - Pixel animation (MiniMax H3)"),
     ]
     for nodes, name in made:
         json.dump(to_ui(nodes, name), open(f"{where}/{name}.json", "w"), indent=2)

@@ -105,6 +105,8 @@ pub struct OutputPlace {
     /// The offset from the canvas's top left.
     pub x: i64,
     pub y: i64,
+    /// Its batch mode is "animation": the pictures it sends are the frames of one animation.
+    pub animation: bool,
 }
 
 /// A workflow ready to queue.
@@ -348,6 +350,7 @@ impl Workflow {
                 name: text_input(found, "name").unwrap_or_default(),
                 x: i64::from(ax) + offset("x"),
                 y: i64::from(ay) + offset("y"),
+                animation: text_input(found, "batch_mode").as_deref() == Some("animation"),
             });
             let images = found.get("images").cloned().unwrap_or(Value::Null);
             g.replace(&node, "ETN_SendImageWebSocket", [("images", images), ("format", json!("PNG"))]);
@@ -612,7 +615,10 @@ mod tests {
         assert!(texts.contains(&json!("koi pond, scenery, no humans")));
         assert!(texts.contains(&json!("")));
         let sender = prepared.graph.nodes_of("ETN_SendImageWebSocket");
-        assert_eq!(prepared.outputs, vec![OutputPlace { node: sender[0].clone(), name: "Koi".into(), x: 0, y: 0 }]);
+        assert_eq!(
+            prepared.outputs,
+            vec![OutputPlace { node: sender[0].clone(), name: "Koi".into(), x: 0, y: 0, animation: false }]
+        );
         assert_eq!(prepared.area, [0, 0, 64, 48]);
     }
 
@@ -662,7 +668,10 @@ mod tests {
         run.selection = Some(mask);
         let prepared = w.prepare(&params, &run, &Map::new()).unwrap();
         assert_eq!(prepared.area, [28, 8, 14, 14]);
-        assert_eq!(prepared.outputs, vec![OutputPlace { node: "4".into(), name: String::new(), x: 28, y: 8 }]);
+        assert_eq!(
+            prepared.outputs,
+            vec![OutputPlace { node: "4".into(), name: String::new(), x: 28, y: 8, animation: false }]
+        );
         assert_eq!(input(&prepared, "Inpaint", "w"), 14);
         assert_eq!(input(&prepared, "Inpaint", "active"), true);
         let g = &prepared.graph;
@@ -779,6 +788,34 @@ mod tests {
         let picture = input(&prepared, "ImageScaleBy", "image");
         assert_eq!(prepared.graph.class(picture[0].as_str().unwrap()), Some("ETN_LoadImageBase64"));
         assert_eq!(prepared.outputs[0].name, "Pixel edit");
+    }
+
+    #[test]
+    fn the_pixel_animation_starter_reads_and_prepares() {
+        let w = Workflow::parse("Animate", include_str!("../tests/workflows/pixel-animation.json")).unwrap();
+        let params = w.parameters(&Map::new());
+        let names: Vec<_> = params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Frames", "Prompt", "Seconds"]);
+        assert_eq!(params[0].kind, ParamKind::Number { min: Some(2.0), max: Some(12.0), integer: true });
+        assert_eq!(params[2].kind, ParamKind::Number { min: Some(1.0), max: Some(5.0), integer: false });
+        let run = inputs(&[("Prompt", ParamValue::Text("walks to the right".into()))]);
+        let prepared = w.prepare(&params, &run, &Map::new()).unwrap();
+        assert_eq!(input(&prepared, "StringConcatenate", "string_b"), "walks to the right");
+        assert_eq!(input(&prepared, "RandomNoise", "noise_seed"), 7);
+        // the canvas's size wherever it's used, and the defaults where the app left them
+        assert_eq!(input(&prepared, "SpriteFusionPixelSnapper", "exact_height"), 48);
+        assert_eq!(
+            input(&prepared, "ImageScaleBy", "image")[0].as_str().map(|n| prepared.graph.class(n)),
+            Some(Some("ETN_LoadImageBase64"))
+        );
+        let maths = prepared.graph.nodes_of("ComfyMathExpression");
+        let values: Vec<Value> =
+            maths.iter().filter_map(|n| prepared.graph.inputs(n).and_then(|i| i.get("values.a")).cloned()).collect();
+        assert!(values.contains(&json!(64)) && values.contains(&json!(48)) && values.contains(&json!(1.6)));
+        assert!(values.iter().all(|v| !v.is_array() || v[0].as_str().map(|n| prepared.graph.class(n)) != Some(Some("ETN_Parameter"))));
+        assert_eq!(prepared.outputs.len(), 1);
+        assert_eq!(prepared.outputs[0].name, "", "the frames are named after the move");
+        assert!(prepared.outputs[0].animation);
     }
 
     #[test]

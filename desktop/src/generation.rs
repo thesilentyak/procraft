@@ -146,6 +146,8 @@ pub struct GenerationUi {
     state: GenerationState,
     server: ServerStatus,
     thumbnails: HashMap<u64, TextureHandle>,
+    /// An animation result's frames, played in its thumbnail.
+    frame_textures: HashMap<u64, Vec<TextureHandle>>,
     preview: Option<(u64, TextureHandle)>,
     /// How many results the bar is scrolled back from the newest.
     back: usize,
@@ -269,6 +271,7 @@ impl GenerationUi {
             state: GenerationState::default(),
             server,
             thumbnails: HashMap::new(),
+            frame_textures: HashMap::new(),
             preview: None,
             back: 0,
             deleting: None,
@@ -325,6 +328,21 @@ impl GenerationUi {
         self.thumbnails.retain(|id, _| ids.contains(id));
         for r in &self.state.results {
             self.thumbnails.entry(r.id).or_insert_with(|| texture(ctx, &format!("result {}", r.id), &r.thumbnail));
+        }
+        self.frame_textures.retain(|id, _| ids.contains(id));
+        for r in self.state.results.iter().filter(|r| !r.frames.is_empty()) {
+            self.frame_textures.entry(r.id).or_insert_with(|| {
+                r.frames
+                    .iter()
+                    .enumerate()
+                    .map(|(k, f)| {
+                        let size = [f.width as usize, f.height as usize];
+                        let picture = egui::ColorImage::from_rgba_premultiplied(size, &f.rgba);
+                        // a sprite's frames: crisp pixels
+                        ctx.load_texture(format!("result {} frame {k}", r.id), picture, TextureOptions::NEAREST)
+                    })
+                    .collect()
+            });
         }
     }
 
@@ -1496,13 +1514,30 @@ impl GenerationUi {
             x += CHEVRON;
             for r in self.state.results.iter().skip(skip).take(room) {
                 let cell = Rect::from_min_size(pos2(x, cy - THUMB / 2.0), vec2(THUMB, THUMB));
-                if let Some(t) = self.thumbnails.get(&r.id) {
+                // an animation plays, 10 frames a second, its frame count in a corner
+                let frames = self.frame_textures.get(&r.id).filter(|f| !f.is_empty());
+                let playing = frames.and_then(|f| {
+                    let at = (ui.input(|i| i.time) * 10.0) as usize % f.len();
+                    ui.ctx().request_repaint_after(Duration::from_millis(100));
+                    f.get(at)
+                });
+                if let Some(t) = playing.or_else(|| self.thumbnails.get(&r.id)) {
                     ui.painter().image(
                         t.id(),
                         fit(cell, t.size_vec2()),
                         Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
                         Color32::WHITE,
                     );
+                }
+                if let Some(f) = frames {
+                    let badge = format!("{}", f.len());
+                    let corner = cell.right_bottom() - vec2(12.0, 9.0);
+                    ui.painter().rect_filled(
+                        Rect::from_center_size(corner, vec2(18.0, 14.0)),
+                        5.0,
+                        Color32::from_black_alpha(176),
+                    );
+                    text(ui.painter(), corner, Align2::CENTER_CENTER, &badge, 10.0, Weight::Medium, Color32::WHITE);
                 }
                 if shown == Some(r.id) {
                     ui.painter().rect_stroke(
@@ -1632,10 +1667,13 @@ impl GenerationUi {
             if pill(ui, &mut bx, cy, "Apply", true, target.is_some())
                 && let Some(id) = target
             {
-                match self.generation.apply_result(session, id) {
-                    Some(_) => asked = Some(Asked::Notice("Added as a layer".to_owned(), false)),
-                    None => asked = Some(Asked::Notice("No room for another layer".to_owned(), true)),
-                }
+                let frames = self.state.results.iter().find(|r| r.id == id).map_or(0, |r| r.frames.len());
+                asked = Some(match (self.generation.apply_result(session, id), frames > 1) {
+                    (Some(_), true) => Asked::Notice(format!("Added {frames} frames"), false),
+                    (None, true) => Asked::Notice(format!("No room for {frames} more layers"), true),
+                    (Some(_), false) => Asked::Notice("Added as a layer".to_owned(), false),
+                    (None, false) => Asked::Notice("No room for another layer".to_owned(), true),
+                });
             }
             let again_ready = self.last.is_some() && self.state.running.is_none();
             let again = Rect::from_center_size(pos2(bx - ROUND / 2.0, cy), vec2(ROUND, ROUND));
@@ -2014,8 +2052,14 @@ mod tests {
         let settings = GenerationSettings { address: String::new(), nsfw: false, largest_megapixels: None };
         let mut ui = GenerationUi::new(settings, GenerationResolution::Normal);
         let thumbnail = ThumbnailImage { width: 2, height: 2, rgba: vec![255; 16] };
-        let result =
-            |id| ResultInfo { id, seed: 7, thumbnail: thumbnail.clone(), scaled_from_width: 0, scaled_from_height: 0 };
+        let result = |id| ResultInfo {
+            id,
+            seed: 7,
+            thumbnail: thumbnail.clone(),
+            scaled_from_width: 0,
+            scaled_from_height: 0,
+            frames: Vec::new(),
+        };
         ui.state.results = vec![result(1), result(2)];
         ui.tray_up = true;
         tray_frame(&ctx, &mut ui, &mut look, &session, vec![]);

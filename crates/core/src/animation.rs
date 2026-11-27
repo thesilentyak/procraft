@@ -368,7 +368,8 @@ impl CanvasSession {
                 },
                 |d| {
                     let now = d.animation.as_ref().is_some_and(|a| a.pages == pages);
-                    (now != on).then(|| d.animation = on.then(|| Animation { pages, ..Animation::default() }))
+                    let pixel_art = d.pixel_art;
+                    (now != on).then(|| d.animation = on.then(|| Animation::starting(pages, pixel_art)))
                 },
             )
             .is_some();

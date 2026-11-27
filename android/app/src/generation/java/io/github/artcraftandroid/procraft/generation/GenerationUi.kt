@@ -195,6 +195,8 @@ object GenerationUi {
     private var last: RunSettings? = null
     private var error by mutableStateOf<String?>(null)
     private val bitmaps = mutableStateMapOf<ULong, ImageBitmap>()
+    /** An animation result's frames, to play in the tray. */
+    private val frameBitmaps = mutableStateMapOf<ULong, List<ImageBitmap>>()
     private var preview by mutableStateOf<Pair<Long, ImageBitmap>?>(null)
 
     private fun prefs(context: Context) = context.getSharedPreferences("generation", Context.MODE_PRIVATE)
@@ -249,6 +251,8 @@ object GenerationUi {
         val ids = state.results.map { it.id }.toSet()
         bitmaps.keys.retainAll(ids)
         for (r in state.results) if (r.id !in bitmaps) bitmaps[r.id] = r.thumbnail.bitmap()
+        frameBitmaps.keys.retainAll(ids)
+        for (r in state.results) if (r.frames.isNotEmpty() && r.id !in frameBitmaps) frameBitmaps[r.id] = r.frames.map { it.bitmap() }
         val run = state.running
         val p = run?.preview
         if (run != null && p != null) {
@@ -1050,14 +1054,23 @@ object GenerationUi {
             horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             val scroll = rememberScrollState()
+            // animations play in their thumbnails, 10 frames a second
+            val playing = state.results.any { it.frames.isNotEmpty() }
+            val tick by androidx.compose.runtime.produceState(0, playing) {
+                while (playing) { kotlinx.coroutines.delay(100); value++ }
+            }
             Box(Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
             Row(Modifier.horizontalScroll(scroll, reverseScrolling = true), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
                 for (r in state.results) {
-                    val bitmap = bitmaps[r.id] ?: continue
+                    val frames = frameBitmaps[r.id]
+                    val bitmap = frames?.let { f -> f.getOrNull(tick % f.size) } ?: bitmaps[r.id] ?: continue
                     val shape = RoundedCornerShape(10.dp)
                     Box {
                         Image(
-                            bitmap, "Result", contentScale = ContentScale.Crop,
+                            bitmap, if (frames != null) "Animation" else "Result",
+                            contentScale = if (frames != null) ContentScale.Fit else ContentScale.Crop,
+                            // an animation's frames are small sprites: crisp pixels
+                            filterQuality = if (frames != null) androidx.compose.ui.graphics.FilterQuality.None else androidx.compose.ui.graphics.drawscope.DrawScope.DefaultFilterQuality,
                             modifier = Modifier.size(66.dp).clip(shape)
                                 .then(if (shown == r.id) Modifier.border(2.5.dp, Pc.Accent, shape) else Modifier)
                                 .combinedClickable(
@@ -1066,6 +1079,13 @@ object GenerationUi {
                                     onClick = { g.showResult(session, if (shown == r.id) null else r.id) },
                                 ),
                         )
+                        if (frames != null) {
+                            Text(
+                                "${frames.size}", color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.align(Alignment.BottomEnd).padding(3.dp)
+                                    .clip(RoundedCornerShape(5.dp)).background(Color(0xB0000000)).padding(horizontal = 4.dp),
+                            )
+                        }
                         // held: a small Delete above it, for the pictures nobody wants
                         if (deleting == r.id) {
                             val up = with(LocalDensity.current) { 48.dp.roundToPx() }
@@ -1114,7 +1134,14 @@ object GenerationUi {
             }
             Pill("Apply", primary = true, enabled = target != null) {
                 target?.let {
-                    if (g.applyResult(session, it) != null) vm.showNotice("Added as a layer") else vm.showNotice("No room for another layer", warning = true)
+                    val frames = state.results.firstOrNull { r -> r.id == it }?.frames?.size ?: 0
+                    val added = g.applyResult(session, it) != null
+                    when {
+                        frames > 1 && added -> vm.showNotice("Added $frames frames")
+                        frames > 1 -> vm.showNotice("No room for $frames more layers", warning = true)
+                        added -> vm.showNotice("Added as a layer")
+                        else -> vm.showNotice("No room for another layer", warning = true)
+                    }
                     // the new layer in the view-model's list
                     vm.refresh()
                 }

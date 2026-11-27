@@ -51,6 +51,8 @@ const SCALED_UP: f64 = 1.5;
 const KEPT_RESULTS: usize = 24;
 /// The artwork's private folder of generation results, inside its own folder.
 const RESULTS_DIR: &str = "generation";
+/// The most frames an animation result holds (an index claiming more is damaged).
+const MOST_FRAMES: u32 = 64;
 /// The results' index in [`RESULTS_DIR`], listing them oldest first.
 const RESULTS_INDEX: &str = "index.json";
 /// The index's format version.
@@ -289,6 +291,10 @@ pub struct ResultInfo {
     pub scaled_from_width: u32,
     #[uniffi(default = 0)]
     pub scaled_from_height: u32,
+    /// An animation's frames, small and premultiplied, to play in the tray (`thumbnail` is the
+    /// first); empty for a picture.
+    #[uniffi(default = [])]
+    pub frames: Vec<ThumbnailImage>,
 }
 
 /// A layer whose pixels guide generation, as the popover lists it.
@@ -378,6 +384,9 @@ struct Kept {
     scaled_from: (u32, u32),
     /// Its PNG is in the artwork's folder.
     saved: bool,
+    /// How many frames it holds: 1 for a picture; an animation's frames are stacked top to bottom
+    /// in its pixels and its thumbnail, each the area's size (the thumbnail's, a thumbnail's).
+    frames: u32,
 }
 
 /// What the results' index keeps of one result, oldest first.
@@ -394,6 +403,18 @@ struct SavedResult {
     /// The thumbnail PNG's size.
     #[serde(default)]
     thumbnail: [u32; 2],
+    /// How many frames it holds (missing in older indexes: one).
+    #[serde(default = "one_frame", skip_serializing_if = "is_one_frame")]
+    frames: u32,
+}
+
+fn one_frame() -> u32 {
+    1
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_one_frame(frames: &u32) -> bool {
+    *frames <= 1
 }
 
 /// `<folder>/generation/index.json`: the format version and every result kept, in order.
@@ -415,6 +436,7 @@ struct WriteResult {
     scaled_from: [u32; 2],
     pixels: Option<Arc<Vec<u8>>>,
     thumbnail: ThumbnailImage,
+    frames: u32,
 }
 
 /// A save finished on the background thread: where, and which results' PNGs are now written.
@@ -460,6 +482,9 @@ struct Running {
     preview: Option<ThumbnailImage>,
     /// A run tracing the picture into a control layer, rather than making a picture.
     extract: Option<Extracting>,
+    /// On a pixel art canvas, the colours of the picture it was sent: an animation's frames are
+    /// put on them.
+    colours: Option<Vec<[u8; 3]>>,
 }
 
 /// What a trace run makes: the kind of lines, and the control layer they go into.
@@ -549,9 +574,19 @@ impl Generation {
         }
         artwork.from_srgb = from_srgb;
         let id = submit(&self.worker);
-        artwork.running = Some(Running { id, area, mask, name, taken: 0, previews: 0, preview: None, extract: None });
+        artwork.running =
+            Some(Running { id, area, mask, name, taken: 0, previews: 0, preview: None, extract: None, colours: None });
         artwork.error = None;
         Ok(id)
+    }
+}
+
+impl Generation {
+    /// The colours the run going was sent (a pixel art canvas's), for its animations' frames.
+    pub(crate) fn keep_run_colours(&self, session: &CanvasSession, colours: Option<Vec<[u8; 3]>>) {
+        if let Some(running) = self.artwork_of(session).running.as_mut() {
+            running.colours = colours;
+        }
     }
 }
 
@@ -561,18 +596,30 @@ pub(crate) struct WorkflowCanvas {
     pub(crate) picture: Picture,
     pub(crate) selection: Option<Vec<u8>>,
     pub(crate) from_srgb: Option<Lut>,
+    /// On a pixel art canvas, the picture's colours (if it has 256 or fewer).
+    pub(crate) colours: Option<Vec<[u8; 3]>>,
 }
 
 impl CanvasSession {
     /// The canvas as a workflow gets it.
+    /// The canvas as a workflow gets it. A pixel art canvas's picture is laid on white where it's
+    /// clear (a sprite reaches the model on a plain background, not on black), its colours kept.
     pub(crate) fn workflow_canvas(&self) -> Result<WorkflowCanvas, GenerationError> {
+        let pixel_art = self.shared.lock().doc.pixel_art;
         let canvas = self.picture_for_generation(true)?;
-        let picture = canvas
+        let mut picture = canvas
             .picture
             .ok_or_else(|| GenerationError::Canvas { reason: "the canvas isn't drawn yet".to_owned() })?;
+        let colours = if pixel_art {
+            let colours = procraft_engine::pixel::colours_of(&picture.rgba, procraft_engine::pixel::MOST_COLOURS);
+            on_white(&mut picture.rgba);
+            colours
+        } else {
+            None
+        };
         let whole = IRect::from_size(canvas.width, canvas.height);
         let selection = current_selection(self).map(|s| crate::layer_ops::mask_part(&s.mask, whole));
-        Ok(WorkflowCanvas { picture, selection, from_srgb: canvas.from_srgb })
+        Ok(WorkflowCanvas { picture, selection, from_srgb: canvas.from_srgb, colours })
     }
 
     /// Layer `id` over the whole canvas, in sRGB (straight RGBA); none if it has no pixels yet.
@@ -599,6 +646,17 @@ impl CanvasSession {
         }
         unpremultiply(&mut rgba);
         Picture::new(whole.width(), whole.height(), rgba).map(Some).map_err(|e| unreadable(e.to_string()))
+    }
+}
+
+/// A straight-alpha RGBA picture laid over white, solid.
+fn on_white(rgba: &mut [u8]) {
+    for px in rgba.as_chunks_mut::<4>().0 {
+        let a = u16::from(px[3]);
+        for c in px.iter_mut().take(3) {
+            *c = ((u16::from(*c) * a + 255 * (255 - a) + 127) / 255) as u8;
+        }
+        px[3] = 255;
     }
 }
 
@@ -899,7 +957,8 @@ impl Generation {
         crate::generation_tags::remember(&request.prompt);
         let name = layer_name(&request.prompt);
         let id = self.worker.submit(request);
-        artwork.running = Some(Running { id, area, mask, name, taken: 0, previews: 0, preview: None, extract: None });
+        artwork.running =
+            Some(Running { id, area, mask, name, taken: 0, previews: 0, preview: None, extract: None, colours: None });
         artwork.error = None;
         Ok(id)
     }
@@ -981,6 +1040,7 @@ impl Generation {
             previews: 0,
             preview: None,
             extract: Some(Extracting { kind, layer }),
+            colours: None,
         });
         artwork.error = None;
         Ok(id)
@@ -1067,12 +1127,20 @@ impl Generation {
             results: artwork
                 .results
                 .iter()
-                .map(|k| ResultInfo {
-                    id: k.id,
-                    seed: k.seed,
-                    thumbnail: k.thumbnail.clone(),
-                    scaled_from_width: k.scaled_from.0,
-                    scaled_from_height: k.scaled_from.1,
+                .map(|k| {
+                    let mut frames = frame_thumbnails(k);
+                    let thumbnail = if k.frames > 1 { frames.first().cloned() } else { None };
+                    if k.frames <= 1 {
+                        frames.clear();
+                    }
+                    ResultInfo {
+                        id: k.id,
+                        seed: k.seed,
+                        thumbnail: thumbnail.unwrap_or_else(|| k.thumbnail.clone()),
+                        scaled_from_width: k.scaled_from.0,
+                        scaled_from_height: k.scaled_from.1,
+                        frames,
+                    }
                 })
                 .collect(),
             shown: artwork.shown,
@@ -1093,8 +1161,10 @@ impl Generation {
         let shown = result.and_then(|id| self.pixels_for(&mut artwork, id).map(|pixels| (id, pixels)));
         if let Some((id, pixels)) = shown
             && let Some(area) = artwork.results.iter().find(|k| k.id == id).map(|k| k.area)
+            && let Some(first) = frame_of(pixels.as_slice(), area.width(), area.height(), 0)
         {
-            session.set_overlay(Some((area, pixels.as_slice())));
+            // an animation shows its first frame
+            session.set_overlay(Some((area, first)));
             artwork.shown = Some(id);
         } else {
             session.set_overlay(None);
@@ -1105,8 +1175,10 @@ impl Generation {
     }
 
     /// Adds result `result` to `session`'s artwork as a new layer at the top of the stack (where
-    /// it showed), named after its prompt, as one undo step; returns the layer's id. Its pixels
-    /// are read from its PNG when they aren't in memory.
+    /// it showed), named after its prompt, as one undo step; returns the layer's id. An
+    /// animation's frames are added as frames instead (Animation Assist turned on), just above
+    /// the current frame; the first's id is returned. Its pixels are read from its PNG when they
+    /// aren't in memory.
     pub fn apply_result(&self, session: &CanvasSession, result: u64) -> Option<u64> {
         let mut artwork = self.artwork_of(session);
         // the result applied takes the overlay's place; let the one shown go first
@@ -1116,9 +1188,14 @@ impl Generation {
             release_hidden_pixels(&mut artwork);
         }
         let pixels = self.pixels_for(&mut artwork, result)?;
-        let (area, name) = artwork.results.iter().find(|k| k.id == result).map(|k| (k.area, k.name.clone()))?;
+        let (area, name, frames) =
+            artwork.results.iter().find(|k| k.id == result).map(|k| (k.area, k.name.clone(), k.frames))?;
         session.set_overlay(None);
-        let layer = session.add_generated(area, pixels.as_slice(), &name);
+        let layer = if frames > 1 {
+            session.add_generated_frames(area, pixels.as_slice(), frames, &name)
+        } else {
+            session.add_generated(area, pixels.as_slice(), &name)
+        };
         artwork.shown = None;
         release_hidden_pixels(&mut artwork);
         layer
@@ -1292,8 +1369,9 @@ impl Generation {
         }
         let folder = artwork.folder.clone()?;
         let area = kept.area;
+        let height = area.height().saturating_mul(kept.frames.max(1));
         let path = folder.join(RESULTS_DIR).join(result_name(id));
-        let pixels = match crate::project::read_png(&path, area.width(), area.height()) {
+        let pixels = match crate::project::read_png(&path, area.width(), height) {
             Ok(pixels) => Arc::new(pixels),
             Err(e) => {
                 log::warn!("generation: result {id}: {e}");
@@ -1343,9 +1421,27 @@ impl Generation {
             if r.extract.is_some() {
                 return false;
             }
-            for result in run.results.iter().skip(r.taken) {
+            let new: Vec<&procraft_diffusion::RunResult> = run.results.iter().skip(r.taken).collect();
+            let mut at = 0;
+            while let Some(&result) = new.get(at) {
+                // an animation output's pictures from one go of the workflow are one result
+                let together = match &result.place {
+                    Some(place) if place.animation => new
+                        .iter()
+                        .skip(at)
+                        .take_while(|o| o.seed == result.seed && o.place.as_ref().is_some_and(|p| p.node == place.node))
+                        .count(),
+                    _ => 1,
+                };
+                let group = new.get(at..at + together).unwrap_or_default();
+                at += together.max(1);
                 artwork.next = artwork.next.saturating_add(1);
-                if let Some(kept) = keep(artwork.next, result, r, artwork.from_srgb.as_ref()) {
+                let kept = if together > 1 {
+                    keep_animation(artwork.next, group, r, artwork.from_srgb.as_ref())
+                } else {
+                    keep(artwork.next, result, r, artwork.from_srgb.as_ref())
+                };
+                if let Some(kept) = kept {
                     artwork.results.push(kept);
                     made = true;
                 }
@@ -1378,6 +1474,7 @@ impl Generation {
                     scaled_from: [scaled_from_width, scaled_from_height],
                     pixels: kept.pixels.as_ref().map(Arc::clone),
                     thumbnail: kept.thumbnail.clone(),
+                    frames: kept.frames.max(1),
                 }
             })
             .collect();
@@ -1491,7 +1588,7 @@ fn write_results(folder: &Path, results: &[WriteResult]) -> Vec<u64> {
     for result in results {
         let [x0, y0, x1, y1] = result.area;
         let area = IRect::new(x0, y0, x1, y1);
-        let (width, height) = (area.width(), area.height());
+        let (width, height) = (area.width(), area.height().saturating_mul(result.frames.max(1)));
         if width == 0 || height == 0 {
             continue;
         }
@@ -1528,6 +1625,7 @@ fn write_results(folder: &Path, results: &[WriteResult]) -> Vec<u64> {
             area: result.area,
             scaled_from: result.scaled_from,
             thumbnail: [thumb_width, thumb_height],
+            frames: result.frames.max(1),
         });
     }
     let text = match serde_json::to_vec(&ResultsIndex { version: RESULTS_VERSION, results: index }) {
@@ -1588,7 +1686,9 @@ fn load_results(folder: &Path) -> FoundResults {
             area: [x0, y0, x1, y1],
             scaled_from: [from_width, from_height],
             thumbnail: [thumb_width, thumb_height],
+            frames,
         } = saved;
+        let frames = frames.max(1);
         next = next.max(id);
         let area = IRect::new(x0, y0, x1, y1);
         let (width, height) = (area.width(), area.height());
@@ -1597,7 +1697,12 @@ fn load_results(folder: &Path) -> FoundResults {
         if width == 0 || height == 0 || width > most || height > most {
             continue;
         }
-        if thumb_width == 0 || thumb_height == 0 || thumb_width > THUMBNAIL_SIDE || thumb_height > THUMBNAIL_SIDE {
+        if thumb_width == 0
+            || thumb_height == 0
+            || thumb_width > THUMBNAIL_SIDE
+            || thumb_height > THUMBNAIL_SIDE.saturating_mul(frames)
+            || frames > MOST_FRAMES
+        {
             continue;
         }
         let path = dir.join(thumbnail_name(id));
@@ -1617,6 +1722,7 @@ fn load_results(folder: &Path) -> FoundResults {
             thumbnail: ThumbnailImage { width: thumb_width, height: thumb_height, rgba },
             scaled_from: (from_width, from_height),
             saved: true,
+            frames,
         });
     }
     if results.len() > KEPT_RESULTS {
@@ -1863,6 +1969,11 @@ fn keep(id: u64, result: &procraft_diffusion::RunResult, run: &Running, from_srg
     } else {
         result.picture.resized(area.width(), area.height()).ok()?
     };
+    let mut picture = picture;
+    // an animation's frames on the colours of the picture it was made from
+    if let (Some(colours), Some(true)) = (&run.colours, result.place.as_ref().map(|p| p.animation)) {
+        procraft_engine::pixel::snap_to(&mut picture.rgba, colours);
+    }
     let thumbnail = thumbnail(&picture)?;
     let mut pixels = picture.rgba;
     if let Some(lut) = from_srgb {
@@ -1891,7 +2002,54 @@ fn keep(id: u64, result: &procraft_diffusion::RunResult, run: &Running, from_srg
         thumbnail,
         scaled_from,
         saved: false,
+        frames: 1,
     })
+}
+
+/// The pictures one run's animation output sent, as one result: each kept as a picture is, their
+/// pixels and thumbnails stacked top to bottom. None if any can't be kept or they differ in size.
+fn keep_animation(
+    id: u64,
+    frames: &[&procraft_diffusion::RunResult],
+    run: &Running,
+    from_srgb: Option<&Lut>,
+) -> Option<Kept> {
+    let kept: Vec<Kept> = frames.iter().map(|r| keep(id, r, run, from_srgb)).collect::<Option<_>>()?;
+    let first = kept.first()?;
+    let (area, thumb) = (first.area, (first.thumbnail.width, first.thumbnail.height));
+    if kept.iter().any(|k| k.area != area || (k.thumbnail.width, k.thumbnail.height) != thumb) {
+        return None;
+    }
+    let mut pixels = Vec::new();
+    let mut rgba = Vec::new();
+    for k in &kept {
+        pixels.extend_from_slice(k.pixels.as_deref()?);
+        rgba.extend_from_slice(&k.thumbnail.rgba);
+    }
+    let count = u32::try_from(kept.len()).ok()?;
+    Some(Kept {
+        pixels: Some(Arc::new(pixels)),
+        thumbnail: ThumbnailImage { width: thumb.0, height: thumb.1.checked_mul(count)?, rgba },
+        frames: count,
+        ..first.clone()
+    })
+}
+
+/// Frame `index` of a result's stacked pixels or thumbnail (`width × height` each, RGBA8).
+fn frame_of(stacked: &[u8], width: u32, height: u32, index: u32) -> Option<&[u8]> {
+    let size = (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
+    let start = size.checked_mul(index as usize)?;
+    stacked.get(start..start.checked_add(size)?)
+}
+
+/// A kept result's thumbnails, one a frame (one for a picture).
+fn frame_thumbnails(k: &Kept) -> Vec<ThumbnailImage> {
+    let frames = k.frames.max(1);
+    let (width, height) = (k.thumbnail.width, k.thumbnail.height / frames);
+    (0..frames)
+        .filter_map(|i| frame_of(&k.thumbnail.rgba, width, height, i))
+        .map(|rgba| ThumbnailImage { width, height, rgba: rgba.to_vec() })
+        .collect()
 }
 
 fn thumbnail(picture: &Picture) -> Option<ThumbnailImage> {
@@ -1957,11 +2115,29 @@ impl CanvasSession {
         let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else {
             return Err(unreadable("the canvas isn't drawn yet".to_owned()));
         };
+        // while animating, the current frame alone (with a background and a foreground frame), as
+        // playing shows it: not the frames around it as onion skins
+        let focus = st
+            .doc
+            .animation
+            .as_ref()
+            .filter(|a| !a.pages)
+            .and_then(|_| procraft_engine::animation::current_frame(&st.doc));
+        let playing = canvas.play_frame();
+        if focus.is_some() {
+            canvas.set_play_frame(focus);
+            canvas.invalidate();
+        }
         canvas.render_finished(gpu, &mut st.doc);
         // control layers guide the run with their own pixels, not painted in as colour
         let left_out: Vec<LayerId> = st.doc.control_layers().map(|l| l.id).collect();
-        let mut rgba =
-            canvas.read_composite_without(gpu, &mut st.doc, &left_out).map_err(|e| unreadable(e.to_string()))?;
+        let read = canvas.read_composite_without(gpu, &mut st.doc, &left_out);
+        if focus.is_some() {
+            canvas.set_play_frame(playing);
+            canvas.invalidate();
+            canvas.render(gpu, &mut st.doc, None);
+        }
+        let mut rgba = read.map_err(|e| unreadable(e.to_string()))?;
         if let Some(lut) = &to_srgb {
             lut.apply_rgba(&mut rgba, true);
         }
@@ -2045,6 +2221,53 @@ impl CanvasSession {
         st.revision += 1;
         self.shared.frame(st);
         Some(id)
+    }
+
+    /// `frames` pictures stacked top to bottom in `pixels` (premultiplied, `area`'s size each)
+    /// added as frames, one undo step: Animation Assist turned on if it's off, a new top-level
+    /// layer each just above the current frame (at the top when there is none), in order, named
+    /// "<name> 1", "<name> 2"…; the first is made current. Returns its id; none without room.
+    pub(crate) fn add_generated_frames(&self, area: IRect, pixels: &[u8], frames: u32, name: &str) -> Option<u64> {
+        let count = usize::try_from(frames).ok()?;
+        let ids = self.change("generate", |d| {
+            if !d.has_room(count) || area.intersect(IRect::from_size(d.width(), d.height())) != area {
+                return None;
+            }
+            if d.animation.is_none() {
+                d.animation = Some(procraft_engine::animation::Animation::starting(false, d.pixel_art));
+            }
+            // above the current frame, out of any group
+            let all = procraft_engine::animation::frames(d);
+            let under = procraft_engine::animation::current_frame(d)
+                .and_then(|i| all.get(i).copied())
+                .or_else(|| d.members(None).last().copied());
+            if let Some(under) = under {
+                d.set_current(under);
+            }
+            let mut ids = Vec::with_capacity(count);
+            for k in 1..=count {
+                let id = d.add_layer();
+                d.rename(id, &format!("{name} {k}"));
+                ids.push(id);
+            }
+            if let Some(&first) = ids.first() {
+                d.set_current(first);
+            }
+            Some(ids)
+        })?;
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        if let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) {
+            for (k, id) in ids.iter().enumerate() {
+                let part = frame_of(pixels, area.width(), area.height(), u32::try_from(k).ok()?)?;
+                canvas.upload_layer_part(gpu, *id, area, part).ok()?;
+            }
+            canvas.set_play_frame(None);
+            canvas.invalidate();
+        }
+        st.revision += 1;
+        self.shared.frame(st);
+        ids.first().map(|id| id.0)
     }
 }
 
@@ -2345,6 +2568,7 @@ mod tests {
             previews: 0,
             preview: None,
             extract: None,
+            colours: None,
         };
         let picture = Picture::new(width, height, [255u8, 0, 0, 255].repeat((width * height) as usize)).unwrap();
         let result = procraft_diffusion::RunResult { seed: 1, picture, generated: (width, height), place: None };
@@ -2377,6 +2601,7 @@ mod tests {
             thumbnail: ThumbnailImage { width: 1, height: 1, rgba: vec![255, 0, 0, 255] },
             scaled_from: (0, 0),
             saved: false,
+            frames: 1,
         };
         generation.artwork_of(&s).results.push(kept);
         generation.show_result(&s, Some(1));
@@ -2398,6 +2623,144 @@ mod tests {
         let state = generation.state();
         assert_eq!(state.shown, None);
         assert_eq!(state.results.len(), 1, "the bar keeps the result");
+    }
+
+    /// A run over a `side`-square canvas whose pictures are put on red and blue.
+    fn animation_run(side: u32) -> Running {
+        Running {
+            id: 0,
+            area: IRect::from_size(side, side),
+            mask: None,
+            name: "Walk".to_owned(),
+            taken: 0,
+            previews: 0,
+            preview: None,
+            extract: None,
+            colours: Some(vec![[255, 0, 0], [0, 0, 255]]),
+        }
+    }
+
+    /// Frame `k` of an animation over a `side` square: reddish on the left, bluish on the right,
+    /// the top row half clear; sent by an animation output.
+    fn animation_frame(k: u8, side: u32) -> procraft_diffusion::RunResult {
+        let rgba: Vec<u8> = (0..side * side)
+            .flat_map(|i| {
+                let (x, y) = (i % side, i / side);
+                let alpha = if y == 0 { 100 } else { 255 };
+                if x < side / 2 { [240, 10 + k, 20, alpha] } else { [15, 5, 230 - k, alpha] }
+            })
+            .collect();
+        let place =
+            procraft_diffusion::OutputPlace { node: "9".into(), name: String::new(), x: 0, y: 0, animation: true };
+        procraft_diffusion::RunResult {
+            seed: 3,
+            picture: Picture::new(side, side, rgba).unwrap(),
+            generated: (side, side),
+            place: Some(place),
+        }
+    }
+
+    #[test]
+    fn an_animation_is_one_result_on_the_sprite_s_colours_and_applies_as_frames() {
+        let Some(s) = session(16) else { return };
+        let generation = Generation::new(settings());
+        let frames: Vec<_> = (0..3).map(|k| animation_frame(k, 16)).collect();
+        let run = animation_run(16);
+        let kept = keep_animation(5, &frames.iter().collect::<Vec<_>>(), &run, None).unwrap();
+        assert_eq!(kept.frames, 3);
+        let pixels = kept.pixels.clone().unwrap();
+        assert_eq!(pixels.len(), 16 * 16 * 4 * 3);
+        // every frame on the two colours, solid, its half-clear row clear
+        for k in 0..3 {
+            let frame = frame_of(&pixels, 16, 16, k).unwrap();
+            assert_eq!(at(frame, 16, 2, 5), [255, 0, 0, 255]);
+            assert_eq!(at(frame, 16, 12, 5), [0, 0, 255, 255]);
+            assert_eq!(at(frame, 16, 2, 0), [0, 0, 0, 0]);
+        }
+        generation.artwork_of(&s).results.push(kept);
+        let state = generation.state();
+        let info = state.results.first().unwrap();
+        assert_eq!(info.frames.len(), 3);
+        assert_eq!(info.thumbnail, info.frames[0]);
+
+        // two frames there, the first current: the three go between them, in order
+        let first = s.layers().iter().find(|l| l.current).map(|l| l.id).unwrap();
+        let second = s.add_layer();
+        s.select_layer(first);
+        let applied = generation.apply_result(&s, 5).unwrap();
+        let doc = s.shared.lock().doc.clone();
+        assert!(doc.animation.as_ref().is_some_and(|a| a.fps == 15), "Animation Assist turned on");
+        let order: Vec<u64> = doc.members(None).iter().map(|l| l.0).collect();
+        assert_eq!(order.len(), 5);
+        assert_eq!((order[0], order[4]), (first, second));
+        assert_eq!(order[1], applied);
+        let names: Vec<String> = order[1..4].iter().map(|id| doc.layer(LayerId(*id)).unwrap().name.clone()).collect();
+        assert_eq!(names, ["Walk 1", "Walk 2", "Walk 3"]);
+        assert_eq!(doc.current().0, applied);
+        let shown = composite(&s);
+        assert_eq!(at(&shown, 16, 2, 5)[0], 255, "the first new frame shows");
+    }
+
+    #[test]
+    fn an_animation_result_is_saved_and_read_back_whole() {
+        let folder = temp_folder("animation");
+        let frames: Vec<_> = (0..3).map(|k| animation_frame(k, 8)).collect();
+        let kept = keep_animation(4, &frames.iter().collect::<Vec<_>>(), &animation_run(8), None).unwrap();
+        let write = WriteResult {
+            id: 4,
+            seed: kept.seed,
+            name: kept.name.clone(),
+            area: [0, 0, 8, 8],
+            scaled_from: [0, 0],
+            pixels: kept.pixels.clone(),
+            thumbnail: kept.thumbnail.clone(),
+            frames: 3,
+        };
+        assert_eq!(write_results(&folder, &[write]), vec![4]);
+        let found = load_results(&folder);
+        let loaded = found.results.first().expect("read back");
+        assert_eq!(loaded.frames, 3);
+        assert_eq!(loaded.thumbnail, kept.thumbnail);
+        let s = CanvasSession::new(8, 8);
+        let generation = Generation::new(settings());
+        generation.set_folder(&s, folder.to_string_lossy().into_owned());
+        let state = wait_results(&generation, 1);
+        assert_eq!(state.results.first().map(|r| r.frames.len()), Some(3));
+        let mut artwork = generation.artwork_of(&s);
+        let pixels = generation.pixels_for(&mut artwork, 4).unwrap();
+        assert_eq!(pixels.as_slice(), kept.pixels.as_deref().unwrap().as_slice());
+        drop(artwork);
+        drop(generation);
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn while_animating_a_run_sees_the_current_frame_alone() {
+        let Some(s) = session(16) else { return };
+        let red = [255u8, 0, 0, 255].repeat(16 * 16);
+        let blue = [0u8, 0, 255, 255].repeat(16 * 16);
+        let first = s.add_generated(IRect::from_size(16, 16), &red, "red").unwrap();
+        s.add_generated(IRect::from_size(16, 16), &blue, "blue").unwrap();
+        assert!(s.set_animation_assist(true));
+        s.select_layer(first);
+        let picture = s.workflow_canvas().unwrap().picture;
+        assert_eq!(at(&picture.rgba, 16, 8, 8), [255, 0, 0, 255], "no onion skin of the blue frame");
+        // and the canvas still shows the onion skins afterwards
+        let shown = composite(&s);
+        assert_ne!(at(&shown, 16, 8, 8), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn a_pixel_art_canvas_goes_to_a_workflow_on_white_its_colours_kept() {
+        let Some(s) = session(16) else { return };
+        assert!(s.make_pixel_art());
+        let mut sprite = vec![0u8; 16 * 16 * 4];
+        sprite[..4].copy_from_slice(&[10, 200, 30, 255]);
+        s.add_generated(IRect::from_size(16, 16), &sprite, "sprite").unwrap();
+        let canvas = s.workflow_canvas().unwrap();
+        assert_eq!(canvas.colours, Some(vec![[10, 200, 30]]));
+        assert_eq!(at(&canvas.picture.rgba, 16, 0, 0), [10, 200, 30, 255]);
+        assert_eq!(at(&canvas.picture.rgba, 16, 5, 5), [255, 255, 255, 255]);
     }
 
     /// A fresh folder in the temporary directory for one test.
@@ -2430,6 +2793,7 @@ mod tests {
             thumbnail: thumbnail(&picture).unwrap(),
             scaled_from: (side / 2, side / 2),
             saved: false,
+            frames: 1,
         }
     }
 
@@ -2678,6 +3042,7 @@ mod tests {
                 area: [0, 0, side as i32, side as i32],
                 scaled_from: [side / 2, side / 2],
                 thumbnail: [kept.thumbnail.width, kept.thumbnail.height],
+                frames: 1,
             }],
         };
         fs::write(dir.join(RESULTS_INDEX), serde_json::to_vec(&index).unwrap()).unwrap();

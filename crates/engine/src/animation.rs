@@ -64,6 +64,16 @@ impl Default for Animation {
 }
 
 impl Animation {
+    /// Animation (or, `pages`, Page) Assist as it starts on a canvas: on a pixel art canvas at 10
+    /// frames a second with one onion skin frame each side, easier to read on pixels.
+    pub fn starting(pages: bool, pixel_art: bool) -> Animation {
+        if pixel_art && !pages {
+            Animation { fps: 10, onion_frames: 1, ..Animation::default() }
+        } else {
+            Animation { pages, ..Animation::default() }
+        }
+    }
+
     /// The settings with every value in range.
     pub fn repaired(mut self) -> Animation {
         self.fps = self.fps.clamp(1, 60);

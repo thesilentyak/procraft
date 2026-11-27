@@ -332,6 +332,52 @@ fn inked(was: [u8; 4], ink: Ink, alpha_lock: bool) -> [u8; 4] {
     out.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
 }
 
+/// The colours of a straight-alpha RGBA picture's solid pixels (alpha at least half), in the
+/// order first met; none if there are more than `most` or none at all.
+pub fn colours_of(rgba: &[u8], most: usize) -> Option<Vec<[u8; 3]>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut colours = Vec::new();
+    for px in rgba.as_chunks::<4>().0 {
+        let [r, g, b, a] = *px;
+        if a >= 128 && seen.insert([r, g, b]) {
+            colours.push([r, g, b]);
+            if colours.len() > most {
+                return None;
+            }
+        }
+    }
+    (!colours.is_empty()).then_some(colours)
+}
+
+/// Puts a straight-alpha RGBA picture on `colours`: each pixel under half alpha becomes clear,
+/// every other the nearest of the colours (by red, green and blue, weighted as the eye weighs
+/// them), solid. Nothing changes with no colours.
+pub fn snap_to(rgba: &mut [u8], colours: &[[u8; 3]]) {
+    if colours.is_empty() {
+        return;
+    }
+    let mut known: std::collections::HashMap<[u8; 3], [u8; 3]> = std::collections::HashMap::new();
+    for px in rgba.as_chunks_mut::<4>().0 {
+        if px[3] < 128 {
+            *px = [0; 4];
+            continue;
+        }
+        let here = [px[0], px[1], px[2]];
+        let near = *known.entry(here).or_insert_with(|| nearest(here, colours));
+        *px = [near[0], near[1], near[2], 255];
+    }
+}
+
+/// The colour of `colours` nearest `c`.
+fn nearest(c: [u8; 3], colours: &[[u8; 3]]) -> [u8; 3] {
+    let distance = |o: &[u8; 3]| {
+        let d = |a: u8, b: u8| i32::from(a) - i32::from(b);
+        let (dr, dg, db) = (d(c[0], o[0]), d(c[1], o[1]), d(c[2], o[2]));
+        2 * dr * dr + 4 * dg * dg + 3 * db * db
+    };
+    colours.iter().min_by_key(|o| distance(o)).copied().unwrap_or(c)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,5 +518,24 @@ mod tests {
         }
         assert_eq!(scaled_up(&picture, 2, 1, 1).unwrap(), picture);
         assert_eq!(scaled_up(&picture, 3, 1, 2), None, "the wrong size");
+    }
+
+    #[test]
+    fn a_picture_s_colours_are_its_solid_pixels_and_too_many_are_none() {
+        let rgba = [10, 20, 30, 255, 10, 20, 30, 255, 1, 2, 3, 0, 200, 0, 0, 128];
+        assert_eq!(colours_of(&rgba, 8), Some(vec![[10, 20, 30], [200, 0, 0]]));
+        assert_eq!(colours_of(&rgba, 1), None);
+        assert_eq!(colours_of(&[0, 0, 0, 0], 8), None);
+    }
+
+    #[test]
+    fn snapping_puts_each_pixel_on_the_nearest_colour_solid_or_clear() {
+        let colours = [[0, 0, 0], [250, 120, 40]];
+        let mut rgba = [240, 130, 50, 200, 20, 10, 5, 255, 240, 130, 50, 100];
+        snap_to(&mut rgba, &colours);
+        assert_eq!(rgba, [250, 120, 40, 255, 0, 0, 0, 255, 0, 0, 0, 0]);
+        let mut same = [9, 9, 9, 255];
+        snap_to(&mut same, &[]);
+        assert_eq!(same, [9, 9, 9, 255]);
     }
 }
