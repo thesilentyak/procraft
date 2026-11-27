@@ -209,8 +209,9 @@ Package `io.github.hekel1989.procraftdiffusion.debug` (the old ProCraft debug ap
   upright; Copy hex codes for a workflow's Palette). The issue for ProCraft's authors is #433.
 - **Pixel art stage 2, animation** (`docs/pixel-art/03-animation-proposal.md`, `04-animation-design.md`):
   part A built 2026-11-26: the starter "ProCraft - Pixel animation (MiniMax H3)" (the sprite as a
-  looping video's first and last frame, every few frames snapped back to the canvas's pixels, sent
-  with batch mode "animation"); the app keeps one run's animation output as one result (frames
+  looping video's first and last frame, blown up ×8 within 768–1280, every few frames snapped back
+  to the canvas's pixels, sent with batch mode "animation"; the app steadies them against the
+  sprite); the app keeps one run's animation output as one result (frames
   stacked in one PNG, on the sprite's own colours), the tray plays it, Apply adds the frames above
   the current one with Animation Assist on (10 fps and one onion frame on pixel art); while
   animating a run sees the current frame alone, and a pixel art canvas goes to a workflow on white.

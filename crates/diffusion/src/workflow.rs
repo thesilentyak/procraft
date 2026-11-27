@@ -796,7 +796,7 @@ mod tests {
         let params = w.parameters(&Map::new());
         let names: Vec<_> = params.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["Frames", "Prompt", "Seconds"]);
-        assert_eq!(params[0].kind, ParamKind::Number { min: Some(2.0), max: Some(12.0), integer: true });
+        assert_eq!(params[0].kind, ParamKind::Number { min: Some(2.0), max: Some(24.0), integer: true });
         assert_eq!(params[2].kind, ParamKind::Number { min: Some(1.0), max: Some(5.0), integer: false });
         let run = inputs(&[("Prompt", ParamValue::Text("walks to the right".into()))]);
         let prepared = w.prepare(&params, &run, &Map::new()).unwrap();

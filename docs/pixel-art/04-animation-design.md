@@ -23,23 +23,28 @@ Made by `dev/starters/make_starters.py` with the others, from the workflow tried
 (2026-11-26: a 64 × 64 fox, a usable 8-frame loop in about a minute on a 16 GB card).
 
 - **From the app**: the canvas (its picture and seed), and three parameters: **Prompt** (the move,
-  in view), **Frames** (whole number, 2 to 12, default 8) and **Seconds** (1 to 5, default 1.6).
-- **The picture**: blown up with hard edges by the largest whole number that keeps its longest
-  side within 768 pixels, then centred on white with the sides rounded up to a multiple of 32 (the
-  model's step). It's the video's first and last frame, so the move loops.
+  in view), **Frames** (whole number, 2 to 24, default 8) and **Seconds** (1 to 5, default 1.6).
+- **The picture**: blown up with hard edges by a whole number, aiming for its longest side at 8
+  times the canvas's (so each canvas pixel gets 8 × 8 video pixels), kept between 768 and 1280
+  pixels; then centred on white with the sides rounded up to a multiple of 32 (the model's step).
+  It's the video's first and last frame, so the move loops. A 64 canvas gets ×12 (768), a 128
+  canvas ×8 (1024), a 250 canvas ×5 (1280; about 4 minutes on a 16 GB card, against 1 at 768).
 - **The video**: MiniMax H3 first-and-last-frame to video with its 8-step LoRA, at 24 frames a
   second; its length from Seconds as the model's own workflow works it out (17k + 5 frames). The
   prompt is the move wrapped in the words that worked: a pixel art sprite animation, the camera
-  still, the character centred at one size, a plain white background, crisp blocky pixels.
+  still, the character centred at one size, a plain background, crisp blocky pixels.
 - **Frames kept**: the sprite's part of each video frame, the repeated last frame left out, every
   *n*th kept so about Frames remain.
-- **Back to pixels**: the frames side by side through SpriteFusion's Pixel Snapper at the blow-up's
-  cell size (one palette for all of them, white keyed out as transparent), cut back into frames at
-  the canvas's size.
+- **Back to pixels**: each frame through SpriteFusion's Pixel Snapper at the blow-up's cell size,
+  at the canvas's size, white keyed out as transparent. (Their palettes may differ a little; the
+  app puts every frame on the sprite's own colours anyway. Laying them side by side for one shared
+  palette hit the snapper's 10 000-pixel side once videos grew past 768.)
 - **Out**: one Krita Output node with batch mode **animation** (the tooling nodes' own word for
   "these are frames"), named "Animation".
-- Frames stays at 12 or below: the snapper takes at most 10 000 pixels a side, and 12 frames at 768
-  is 9 216.
+- Tried 2026-11-27 on a 250 × 249 dancer shrunk from a GIF the user likes ("sways side to side",
+  "cheers with both fists"): the same face and colours throughout, crisp, 50 to 90% of each frame
+  kept as drawn; the dark offset shadow behind her mostly lost while she moves, and fists raised
+  past the canvas's top cut off (leave room round a sprite for its move).
 
 ### A2. What the canvas sends
 
@@ -131,6 +136,8 @@ pictures sent; later); the sheet and the named animation the frames make (parts 
   are stored, saved or read, beyond a count).
 - 2026-11-26: frames snapped to the reference picture's own colours, not the palette strip: the
   strip may hold a starting palette the sprite doesn't use.
+- 2026-11-27: the video sized for 8 × 8 video pixels a canvas pixel (768 to 1280), and up to 24
+  frames, after a 128 canvas came back soft at ×6.
 - 2026-11-27: frames steadied against the sprite and snapped to its colours up to 4 096 of them
   (the user saw soft, fuzzy frames from a 268-colour RD Flow goblin on a 128 canvas: the snapping
   had been skipped over 256 colours, and the video's softness spans pixels when the blow-up is

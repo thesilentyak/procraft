@@ -20,7 +20,7 @@
       "type": "number (integer)",
       "default": "8",
       "min": 2,
-      "max": 12
+      "max": 24
     }
   },
   "4": {
@@ -36,7 +36,7 @@
   "11": {
     "class_type": "ComfyMathExpression",
     "inputs": {
-      "expression": "max(1, floor(768 / max(a, b)))",
+      "expression": "max(1, floor(min(1280, max(768, 8 * max(a, b))) / max(a, b)))",
       "values.a": [
         "1",
         1
@@ -204,7 +204,7 @@
   "22": {
     "class_type": "StringConcatenate",
     "inputs": {
-      "string_b": "The camera is completely still, the character stays in the centre of the frame at the same size, and the plain white background never changes. Crisp blocky pixel art with dark outlines, flat colours, no motion blur.",
+      "string_b": "The camera is completely still, the character stays in the centre of the frame at the same size, and the plain background never changes. Crisp blocky pixel art with dark outlines, flat colours, no motion blur.",
       "delimiter": " ",
       "string_a": [
         "21",
@@ -465,64 +465,10 @@
       ]
     }
   },
-  "48": {
-    "class_type": "GetImageSize",
-    "inputs": {
-      "image": [
-        "47",
-        0
-      ]
-    }
-  },
-  "49": {
-    "class_type": "ImageGrid",
-    "inputs": {
-      "padding": 0,
-      "images": [
-        "47",
-        0
-      ],
-      "columns": [
-        "48",
-        2
-      ],
-      "cell_width": [
-        "16",
-        1
-      ],
-      "cell_height": [
-        "17",
-        1
-      ]
-    }
-  },
-  "50": {
-    "class_type": "GetImageSize",
-    "inputs": {
-      "image": [
-        "49",
-        0
-      ]
-    }
-  },
-  "51": {
-    "class_type": "ComfyMathExpression",
-    "inputs": {
-      "expression": "round(a / b)",
-      "values.a": [
-        "50",
-        0
-      ],
-      "values.b": [
-        "11",
-        1
-      ]
-    }
-  },
   "52": {
     "class_type": "SpriteFusionPixelSnapper",
     "inputs": {
-      "colors": 32,
+      "colors": 256,
       "output_mode": "exact_size",
       "output_scale": 1,
       "transparency": "connected_chroma_key",
@@ -532,7 +478,7 @@
       "custom_palette": "",
       "grid_mode": "uniform",
       "image": [
-        "49",
+        "47",
         0
       ],
       "pixel_size": [
@@ -540,7 +486,7 @@
         0
       ],
       "exact_width": [
-        "51",
+        "1",
         1
       ],
       "exact_height": [
@@ -562,23 +508,6 @@
       ]
     }
   },
-  "54": {
-    "class_type": "ImageTile+",
-    "inputs": {
-      "rows": 1,
-      "overlap": 0.0,
-      "overlap_x": 0,
-      "overlap_y": 0,
-      "image": [
-        "53",
-        0
-      ],
-      "cols": [
-        "48",
-        2
-      ]
-    }
-  },
   "55": {
     "class_type": "ETN_KritaOutput",
     "inputs": {
@@ -588,7 +517,7 @@
       "batch_mode": "animation",
       "resize_canvas": false,
       "images": [
-        "54",
+        "53",
         0
       ]
     }
