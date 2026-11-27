@@ -199,8 +199,9 @@ Package `io.github.hekel1989.procraftdiffusion.debug` (the old ProCraft debug ap
 - **Open:** the user has seen a few more small bugs on both platforms that aren't listed yet.
 - **This fork (`thesilentyak/procraft`), 2026-11-26:** ProCraft v0.0.8-beta merged in (tried on
   `update/procraft-v0.0.8` first; `update/**` branches build test APKs). Custom ComfyUI workflows
-  (09/10 docs) with starters for Z-Image, MiniMax H3 and pixel art (RD Flow 64, and Pixel art edit:
-  MiniMax then SpriteFusion's Pixel Snapper); a seed is fitted to each node's own range.
+  (09/10 docs) with starters for Z-Image, MiniMax H3 and pixel art (RD Flow 64; Pixel art (Anima):
+  Anima asked for pixel art on green, snapped to the canvas's pixels; and Pixel art edit: MiniMax
+  then SpriteFusion's Pixel Snapper); a seed is fitted to each node's own range.
 - **Pixel art canvas** (`docs/pixel-art/`, written to go to ProCraft): stage 1 built 2026-11-26 on
   Android, the desktop following for most of it: New canvas › Pixel art (sRGB, a 16-colour
   palette), crisp pixels, a pixel grid and a checkerboard, PNG ×N, the pixel pencil and eraser

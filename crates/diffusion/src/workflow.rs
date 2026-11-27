@@ -819,6 +819,25 @@ mod tests {
     }
 
     #[test]
+    fn the_pixel_art_from_anima_starter_reads_and_prepares() {
+        let w = Workflow::parse("Anima pixels", include_str!("../tests/workflows/pixel-art-anima.json")).unwrap();
+        let params = w.parameters(&Map::new());
+        let names: Vec<_> = params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Colours", "Palette", "Prompt"]);
+        assert_eq!(params[0].kind, ParamKind::Number { min: Some(4.0), max: Some(256.0), integer: true });
+        let run = inputs(&[("Prompt", ParamValue::Text("a fox knight".into()))]);
+        let prepared = w.prepare(&params, &run, &Map::new()).unwrap();
+        assert_eq!(input(&prepared, "StringConcatenate", "string_b"), "a fox knight");
+        assert_eq!(input(&prepared, "KSampler", "seed"), 7);
+        assert_eq!(input(&prepared, "SpriteFusionPixelSnapper", "exact_width"), 64);
+        assert_eq!(input(&prepared, "SpriteFusionPixelSnapper", "exact_height"), 48);
+        assert_eq!(input(&prepared, "SpriteFusionPixelSnapper", "colors"), 32);
+        assert_eq!(input(&prepared, "SpriteFusionPixelSnapper", "custom_palette"), "");
+        assert_eq!(prepared.outputs.len(), 1);
+        assert!(!prepared.outputs[0].animation);
+    }
+
+    #[test]
     fn seeds_fit_a_node_s_range() {
         let spec = json!(["INT", {"min": 10, "max": 19}]);
         assert_eq!(fit_seed(15, Some(&spec)), 15);

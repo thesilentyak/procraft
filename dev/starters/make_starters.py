@@ -374,6 +374,83 @@ def pixel_animation():
     return nodes
 
 
+def pixel_from_anima():
+    """Pixel art from Anima: Anima draws the prompt as pixel art with a thick outline at about a
+    megapixel, the canvas's shape blown up by a whole number, on green (so a character's white
+    parts survive); SpriteFusion's Pixel Snapper takes it back to the canvas's pixels (the most
+    common colour of each block, a limited palette or the one given, the green keyed out
+    everywhere, gaps between arm and body included)."""
+    unet = "anima-base-v1.0.safetensors"
+    nodes = []
+
+    def node(nid, cls, widgets, links, outputs, widget_links=(), api_widgets=None, title=None, pos=(0, 0)):
+        nodes.append(dict(id=nid, cls=cls, widgets=widgets, links=links, outputs=outputs,
+                          widget_links=set(widget_links), api=api_widgets or {}, title=title, pos=pos))
+
+    maths = [("FLOAT", "FLOAT"), ("INT", "INT"), ("BOOL", "BOOLEAN")]
+
+    def math(nid, expression, values, title, pos):
+        node(nid, "ComfyMathExpression", [expression], {f"values.{k}": v for k, v in values.items()}, maths,
+             api_widgets={"expression": expression}, title=title, pos=pos)
+
+    node(1, "ETN_KritaCanvas", [], {}, [("image", "IMAGE"), ("width", "INT"), ("height", "INT"), ("seed", "INT"), ("mask", "MASK")],
+         title="Canvas (from the app)", pos=(0, 600))
+    node(2, "ETN_Parameter", ["Prompt", "prompt (positive)", "", -1e10, 1e10], {}, [("value", "*")],
+         api_widgets={"name": "Prompt", "type": "prompt (positive)", "default": "", "min": -1e10, "max": 1e10},
+         title="Prompt (from the app)", pos=(0, 0))
+    node(3, "ETN_Parameter", ["Colours", "number (integer)", "32", 4, 256], {}, [("value", "*")],
+         api_widgets={"name": "Colours", "type": "number (integer)", "default": "32", "min": 4, "max": 256},
+         title="Colours (from the app)", pos=(0, 200))
+    node(4, "ETN_Parameter", ["Palette", "text", "", -1e10, 1e10], {}, [("value", "*")],
+         api_widgets={"name": "Palette", "type": "text", "default": "", "min": -1e10, "max": 1e10},
+         title="Palette: hex colours, or empty (from the app)", pos=(0, 400))
+    canvas_w, canvas_h = (1, 1), (1, 2)
+    math(10, "max(1, floor(1024 / max(a, b)))", {"a": canvas_w, "b": canvas_h}, "Pixels of picture a canvas pixel", (400, 600))
+    math(11, "ceil(a * b / 16) * 16", {"a": canvas_w, "b": (10, 1)}, "Picture width", (400, 800))
+    math(12, "ceil(a * b / 16) * 16", {"a": canvas_h, "b": (10, 1)}, "Picture height", (400, 1000))
+    before = "masterpiece, best quality, full body,"
+    after = "pixel art, thick black outline, simple background, green background"
+    node(13, "StringConcatenate", [before, "", " "], {"string_b": (2, 0)}, [("STRING", "STRING")],
+         widget_links=["string_b"], api_widgets={"string_a": before, "delimiter": " "}, pos=(400, 0))
+    node(14, "StringConcatenate", ["", after, ", "], {"string_a": (13, 0)}, [("STRING", "STRING")],
+         widget_links=["string_a"], api_widgets={"string_b": after, "delimiter": ", "}, title="The whole prompt",
+         pos=(800, 0))
+    node(20, "UNETLoader", [unet, "default"], {}, [("MODEL", "MODEL")],
+         api_widgets={"unet_name": unet, "weight_dtype": "default"}, pos=(800, 200))
+    node(21, "CLIPLoader", ["qwen_3_06b_base.safetensors", "omnigen2", "default"], {}, [("CLIP", "CLIP")],
+         api_widgets={"clip_name": "qwen_3_06b_base.safetensors", "type": "omnigen2", "device": "default"}, pos=(800, 360))
+    node(22, "VAELoader", ["qwen_image_vae.safetensors"], {}, [("VAE", "VAE")],
+         api_widgets={"vae_name": "qwen_image_vae.safetensors"}, pos=(800, 520))
+    node(23, "CLIPTextEncode", [""], {"clip": (21, 0), "text": (14, 0)}, [("CONDITIONING", "CONDITIONING")],
+         widget_links=["text"], pos=(1200, 0))
+    negative = "worst quality, low quality, blurry, jpeg artifacts, watermark, signature, text"
+    node(24, "CLIPTextEncode", [negative], {"clip": (21, 0)}, [("CONDITIONING", "CONDITIONING")],
+         api_widgets={"text": negative}, pos=(1200, 200))
+    node(25, "EmptyLatentImage", [1024, 1024, 1], {"width": (11, 1), "height": (12, 1)}, [("LATENT", "LATENT")],
+         widget_links=["width", "height"], api_widgets={"batch_size": 1}, pos=(1200, 400))
+    node(26, "KSampler", [0, "fixed", 30, 4.0, "euler_ancestral", "normal", 1.0],
+         {"model": (20, 0), "seed": (1, 3), "positive": (23, 0), "negative": (24, 0), "latent_image": (25, 0)},
+         [("LATENT", "LATENT")], widget_links=["seed"],
+         api_widgets={"steps": 30, "cfg": 4.0, "sampler_name": "euler_ancestral", "scheduler": "normal", "denoise": 1.0},
+         pos=(1600, 0))
+    node(27, "VAEDecode", [], {"samples": (26, 0), "vae": (22, 0)}, [("IMAGE", "IMAGE")], pos=(1600, 400))
+    node(28, "SpriteFusionPixelSnapper",
+         [32, 8.0, "exact_size", 1, 64, 64, "chroma_key", "auto", 32, "majority", "", "uniform"],
+         {"image": (27, 0), "colors": (3, 0), "pixel_size": (10, 0), "exact_width": canvas_w, "exact_height": canvas_h,
+          "custom_palette": (4, 0)},
+         [("image", "IMAGE"), ("grid_width", "INT"), ("grid_height", "INT"), ("mask", "MASK"), ("key_color_used", "STRING")],
+         widget_links=["colors", "pixel_size", "exact_width", "exact_height", "custom_palette"],
+         api_widgets={"output_mode": "exact_size", "output_scale": 1, "transparency": "chroma_key",
+                      "key_color": "auto", "key_tolerance": 32, "cell_method": "majority", "grid_mode": "uniform"},
+         title="Onto the canvas's pixels, the green taken out", pos=(2000, 0))
+    node(29, "JoinImageWithAlpha", [], {"image": (28, 0), "alpha": (28, 3)}, [("IMAGE", "IMAGE")],
+         title="Transparent round it", pos=(2400, 0))
+    node(30, "ETN_KritaOutput", [0, 0, "", "default", False], {"images": (29, 0)}, [],
+         api_widgets={"x": 0, "y": 0, "name": "", "batch_mode": "default", "resize_canvas": False},
+         title="Back to the app", pos=(2800, 0))
+    return nodes
+
+
 def widget_inputs(n):
     # the inputs that are widgets given a link
     types = {"text": "STRING", "seed": "INT", "denoise": "FLOAT", "prompt": "STRING", "width": "INT",
@@ -382,7 +459,7 @@ def widget_inputs(n):
              "scale_by": "FLOAT", "pixel_size": "FLOAT", "exact_width": "INT", "exact_height": "INT",
              "custom_palette": "STRING", "switch": "BOOLEAN", "x": "INT", "y": "INT", "length": "INT",
              "noise_seed": "INT", "num_frames": "INT", "batch_size": "INT", "columns": "INT", "cell_width": "INT",
-             "cell_height": "INT", "cols": "INT", "string_a": "STRING"}
+             "cell_height": "INT", "cols": "INT", "string_a": "STRING", "colors": "INT"}
     return [(w, types.get(w, "*")) for w in n["widget_links"]]
 
 
@@ -454,6 +531,7 @@ if __name__ == "__main__":
         (rd_flow(), "ProCraft - Pixel art (RD Flow 64)"),
         (pixel_edit(), "ProCraft - Pixel art edit (MiniMax)"),
         (pixel_animation(), "ProCraft - Pixel animation (MiniMax H3)"),
+        (pixel_from_anima(), "ProCraft - Pixel art (Anima)"),
     ]
     for nodes, name in made:
         json.dump(to_ui(nodes, name), open(f"{where}/{name}.json", "w"), indent=2)
