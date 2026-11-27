@@ -137,6 +137,11 @@ Built 2026-11-27 (`crates/engine/src/animation.rs`'s tags, `crates/core/src/anim
 - **The sprite sheet** lays a row per animation (a short row's end left clear); the JSON's
   `frameTags` lists the named ones (`name`, `from`, `to`, `direction` "forward"), each frame's
   `frame` its place in the grid.
+- **A sheet for each named animation** too (2026-11-27, the user's ask: Godot reads Aseprite's
+  JSON only with an add-on such as Aseprite Wizard or Aseprite Animation Importer): one row each,
+  `<artwork> <name> (<n> frames).png` beside the combined sheet and JSON, so Godot's SpriteFrames
+  editor can cut it by its frame count without an add-on. Names are made safe for files; two with
+  one name are numbered.
 - **Animate with AI…** (this fork, Android: the desktop has no workflow cards): in Frame options,
   opens Generate on the workflow card that makes animations (`WorkflowCard::animates`: an Output
   node with batch mode "animation"), a kept card first, else the live one, with that frame

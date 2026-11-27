@@ -7998,8 +7998,9 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * The frames that play as a sprite sheet for a game: the PNG (one row, transparent) and its
-     * JSON in Aseprite's format beside it; none if it couldn't be made.
+     * The frames that play as a sprite sheet for a game: the PNG (a row for each animation,
+     * transparent), its JSON in Aseprite's format, and a PNG for each named animation; none if it
+     * couldn't be made.
      */
     suspend fun exportSpriteSheet(): List<File> = withExportCard("The sprite sheet couldn't be exported.") { s ->
         withContext(Dispatchers.IO) {
@@ -8007,13 +8008,17 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             val base = io.github.artcraftandroid.procraft.core.exportFileName(s.name(), false)
             val png = File(dir, "$base sheet.png")
             val json = File(dir, "$base sheet.json")
-            try {
-                s.exportSpriteSheet(png.path, json.path, png.name, 1u)
+            // each named animation's own sheet too, "<name> walk (8 frames).png", for a game engine
+            // without an Aseprite importer
+            dir.listFiles { f -> f.name.startsWith("$base ") && (f.name.endsWith(" frames).png") || f.name.endsWith(" frame).png")) }
+                ?.forEach { it.delete() }
+            val each = try {
+                s.exportSpriteSheet(png.path, json.path, png.name, 1u, File(dir, base).path, "")
             } catch (e: MobileException) {
                 AppLog.e(TAG, "exporting a sprite sheet", e)
                 return@withContext null
             }
-            listOf(png, json)
+            listOf(png, json) + each.map { File(it) }
         }
     }.orEmpty()
 

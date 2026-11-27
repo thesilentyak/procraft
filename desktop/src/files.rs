@@ -881,8 +881,19 @@ pub fn export(
             // the JSON beside the PNG, named as it is, the PNG named inside it
             let json = PathBuf::from(format!("{}.part", path.with_extension("json").to_string_lossy()));
             let image = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            session.export_sprite_sheet(at, json.to_string_lossy().into_owned(), image, 1)?;
-            return Ok(vec![part, json]);
+            // each named animation's own sheet beside them, named after it
+            let prefix = path.with_extension("").to_string_lossy().into_owned();
+            let each = session.export_sprite_sheet(
+                at,
+                json.to_string_lossy().into_owned(),
+                image,
+                1,
+                prefix,
+                ".part".to_owned(),
+            )?;
+            let mut parts = vec![part, json];
+            parts.extend(each.into_iter().map(PathBuf::from));
+            return Ok(parts);
         }
         match format {
             Format::ModelArtwork => session.export_model_artwork(artwork.unwrap_or_default(), at),

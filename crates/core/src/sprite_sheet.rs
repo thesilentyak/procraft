@@ -36,14 +36,19 @@ impl CanvasSession {
     /// row without names), the frames left to right (a frame held longer once, its time in the
     /// JSON), each pixel `scale` across (1: as drawn), transparent where the background was; and
     /// Aseprite's JSON at `json_path`, naming the PNG as `image_name` and the animations as its
-    /// frame tags. Nothing is written without frames, or past 32 768 pixels a side.
+    /// frame tags. With named animations and an `each_prefix`, each named one also gets a sheet
+    /// of its own, one row, at `<each_prefix> <name> (<n> frames).png<each_suffix>` (a game
+    /// engine without an Aseprite importer cuts it by its frame count); their paths are returned.
+    /// Nothing is written without frames, or past 32 768 pixels a side.
     pub fn export_sprite_sheet(
         &self,
         png_path: String,
         json_path: String,
         image_name: String,
         scale: u32,
-    ) -> Result<(), MobileError> {
+        each_prefix: String,
+        each_suffix: String,
+    ) -> Result<Vec<String>, MobileError> {
         let scale = scale.clamp(1, 16);
         // each frame with its row and place along it, and the named animations
         let (units, fps, tags) = {
@@ -101,9 +106,52 @@ impl CanvasSession {
         write_atomically(Path::new(&json_path), |f| {
             crate::storage::write(f, &text).map_err(|e| file_error("saving", e))
         })?;
+        // each named animation on its own, one row
+        let mut each = Vec::new();
+        if !each_prefix.is_empty() {
+            let mut taken = std::collections::HashSet::new();
+            for tag in &tags {
+                let own: Vec<SheetFrame> = frames
+                    .get(tag.from..=tag.to)
+                    .unwrap_or_default()
+                    .iter()
+                    .enumerate()
+                    .map(|(k, f)| SheetFrame {
+                        name: f.name.clone(),
+                        duration: f.duration,
+                        row: 0,
+                        column: k as u32,
+                        rgba: f.rgba.clone(),
+                    })
+                    .collect();
+                let mut name = file_safe(&tag.name);
+                // two animations with one name: the second numbered
+                let mut n = 2;
+                while !taken.insert(name.to_lowercase()) {
+                    name = format!("{} {n}", file_safe(&tag.name));
+                    n += 1;
+                }
+                let count = if own.len() == 1 { "1 frame".to_owned() } else { format!("{} frames", own.len()) };
+                let path = format!("{each_prefix} {name} ({count}).png{each_suffix}");
+                let (ow, oh, rgba) = sheet(&own, w, h, scale)?;
+                let png = crate::project::png_of(ow, oh, &rgba)?;
+                write_atomically(Path::new(&path), |f| {
+                    crate::storage::write(f, &png).map_err(|e| file_error("saving", e))
+                })?;
+                each.push(path);
+            }
+        }
         self.exported(1.0);
-        Ok(())
+        Ok(each)
     }
+}
+
+/// `name` safe in a file's name: letters, digits, spaces, `-` and `_` kept, anything else a space.
+fn file_safe(name: &str) -> String {
+    let kept: String =
+        name.chars().map(|c| if c.is_alphanumeric() || matches!(c, ' ' | '-' | '_') { c } else { ' ' }).collect();
+    let tidy = kept.split_whitespace().collect::<Vec<_>>().join(" ");
+    if tidy.is_empty() { "animation".to_owned() } else { tidy }
 }
 
 /// The frames (each `w × h`, straight RGBA) in their rows and places, each pixel `scale` across;
@@ -208,7 +256,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let (png, json) = (dir.join("a.png"), dir.join("a.json"));
         let path = |p: &std::path::Path| p.to_string_lossy().into_owned();
-        s.export_sprite_sheet(path(&png), path(&json), "a.png".into(), 2).unwrap();
+        assert!(
+            s.export_sprite_sheet(path(&png), path(&json), "a.png".into(), 2, path(&dir.join("a")), String::new())
+                .unwrap()
+                .is_empty(),
+            "no names, no sheets of their own"
+        );
         assert_eq!(s.export_progress(), 1.0);
         let pixels = crate::project::png_pixels(&std::fs::read(&png).unwrap(), 32, 16).unwrap();
         let at = |x: usize, y: usize| &pixels[(y * 32 + x) * 4..(y * 32 + x) * 4 + 4];
@@ -238,7 +291,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let (png, json) = (dir.join("a.png"), dir.join("a.json"));
         let path = |p: &std::path::Path| p.to_string_lossy().into_owned();
-        s.export_sprite_sheet(path(&png), path(&json), "a.png".into(), 1).unwrap();
+        let each = s
+            .export_sprite_sheet(path(&png), path(&json), "a.png".into(), 1, path(&dir.join("a")), String::new())
+            .unwrap();
+        // a sheet each, named after the animation and its frame count
+        let names: Vec<String> =
+            each.iter().map(|p| std::path::Path::new(p).file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["a idle (1 frame).png", "a walk (2 frames).png"]);
+        let walk = crate::project::png_pixels(&std::fs::read(&each[1]).unwrap(), 16, 8).unwrap();
+        assert_eq!((&walk[..4], &walk[walk.len() - 4..]), (&[0, 0, 255, 255][..], &[0, 0, 0, 0][..]));
         // idle on the first row alone, walk's two on the second
         let pixels = crate::project::png_pixels(&std::fs::read(&png).unwrap(), 16, 16).unwrap();
         let at = |x: usize, y: usize| &pixels[(y * 16 + x) * 4..(y * 16 + x) * 4 + 4];
