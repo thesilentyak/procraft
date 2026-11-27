@@ -4,7 +4,7 @@ How the [stage 2 proposal](03-animation-proposal.md) is built. The proposal's pr
 new files with thin hooks, mobile first, every choice made for the user and changeable.
 
 Status: agreed with the user 2026-11-26 ("let's move forward with building"); part A built
-2026-11-26. Built in three parts:
+2026-11-26, part B 2026-11-27. Built in three parts:
 **A** (AI animation, the user's first want), then **B** (sprite sheets and export), then **C**
 (animations by name).
 
@@ -100,16 +100,23 @@ pictures sent; later); the sheet and the named animation the frames make (parts 
 
 ## B. Sprite sheets and export (to go to ProCraft)
 
+Built 2026-11-27 (`crates/core/src/sprite_sheet.rs`).
+
 - **Pixel-friendly defaults**: Animation Assist turned on for a pixel art canvas starts at 10
   frames a second with one onion skin frame each side (instead of 15 and 12).
-- **Share › Sprite sheet** (Android's Share panel and the desktop's): every played frame in one
-  PNG, a frame held longer appearing once, one row per animation (part C; one row until then), at
-  ×1 to ×16 with crisp pixels (×1 by default), transparent; beside it `<name>.json` in Aseprite's
-  JSON array format (`frames`: each frame's place, size and duration in milliseconds; `meta`:
-  the app, image name, size, scale, and `frameTags` once part C names animations). On Android
-  both go out through the share sheet / Files, on the desktop to the folder chosen.
-- **Crisp GIF**: Animated GIF and Animated PNG on a pixel art canvas offer the PNG's ×N scales and
-  draw the frames with nearest pixels.
+- **Share › Share Layers › Sprite Sheet** (Android's Share panel and the desktop's): every frame
+  that plays in one PNG, left to right in one row (a row per animation once part C names them), a
+  frame held longer appearing once, transparent where the background was, at the artwork's own
+  pixels (the core takes ×1 to ×16; the menus ask for ×1, what engines want). Beside it
+  `<name> sheet.json` in Aseprite's JSON array format: `frames` (each frame's layer name, place,
+  size and duration in milliseconds: 1000 / fps, times one more for each frame it's held) and
+  `meta` (the app, the PNG's file name, its size, the scale, and `frameTags`, empty until part C).
+  On Android both go to the share sheet together (Save to device asks for a folder); on the
+  desktop the PNG goes where it's saved and the JSON beside it. A sheet wider than 32 768 pixels
+  isn't made.
+- **Crisp GIF and APNG**: on a pixel art canvas their frames are scaled up by a whole number with
+  each pixel a square, to about 512 pixels at full size (a 64 sprite ×8, a 128 ×4, a 250 ×2) or
+  within the web-ready size, instead of a speck of the canvas's own size. No new setting.
 
 ## C. Animations by name (to go to ProCraft)
 

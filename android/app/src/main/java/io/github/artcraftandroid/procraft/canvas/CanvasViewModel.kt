@@ -7997,6 +7997,26 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * The frames that play as a sprite sheet for a game: the PNG (one row, transparent) and its
+     * JSON in Aseprite's format beside it; none if it couldn't be made.
+     */
+    suspend fun exportSpriteSheet(): List<File> = withExportCard("The sprite sheet couldn't be exported.") { s ->
+        withContext(Dispatchers.IO) {
+            val dir = File(getApplication<Application>().cacheDir, "exports").apply { mkdirs() }
+            val base = io.github.artcraftandroid.procraft.core.exportFileName(s.name(), false)
+            val png = File(dir, "$base sheet.png")
+            val json = File(dir, "$base sheet.json")
+            try {
+                s.exportSpriteSheet(png.path, json.path, png.name, 1u)
+            } catch (e: MobileException) {
+                AppLog.e(TAG, "exporting a sprite sheet", e)
+                return@withContext null
+            }
+            listOf(png, json)
+        }
+    }.orEmpty()
+
     // ---- palettes ----
 
     /** The palettes as the core keeps them now. */

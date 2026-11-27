@@ -437,6 +437,8 @@ fn groups(tab: usize, showing: &Showing, prefs: &Prefs) -> Vec<Vec<Row>> {
                 Button("PNG Files", None, Some(Act::Share(Format::LayerPngs))),
                 Button("Animated GIF", None, Some(Act::AnimatedExport(Animated::Gif))),
                 Button("Animated PNG", None, Some(Act::AnimatedExport(Animated::Png))),
+                // the frames in one PNG and Aseprite's JSON, for a game
+                Button("Sprite Sheet", None, Some(Act::Share(Format::SpriteSheet))),
                 Button("Animated MP4", None, Some(Act::AnimatedExport(Animated::Mp4))),
                 Button("Animated HEVC", None, Some(Act::AnimatedExport(Animated::Hevc))),
             ],

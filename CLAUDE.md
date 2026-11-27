@@ -216,8 +216,9 @@ Package `io.github.hekel1989.procraftdiffusion.debug` (the old ProCraft debug ap
   stacked in one PNG, on the sprite's own colours), the tray plays it, Apply adds the frames above
   the current one with Animation Assist on (10 fps and one onion frame on pixel art); while
   animating a run sees the current frame alone, and a pixel art canvas goes to a workflow on white.
-  Next: part B (sprite sheet export with Aseprite's JSON, crisp GIF), then part C (animations by
-  name, Animate with AI… from the frame strip).
+  Part B built 2026-11-27: Share Layers › Sprite Sheet (one row, transparent, with Aseprite's JSON
+  beside it), and a pixel art canvas's animated GIF or PNG scaled up crisply to about 512.
+  Next: part C (animations by name, Animate with AI… from the frame strip).
 
 ## Working with DeepSeek (optional)
 

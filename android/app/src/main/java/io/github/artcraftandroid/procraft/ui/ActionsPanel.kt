@@ -188,6 +188,13 @@ fun ActionsPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier)
             vm.exportPackageFile(extension)?.let { runCatching { shareFile(context, it, "application/octet-stream") } }
         }
     }
+    fun shareSpriteSheet() {
+        vm.viewModelScope.launch {
+            val files = vm.exportSpriteSheet()
+            // a PNG and a JSON together: saved to a folder under their own names
+            if (files.isNotEmpty()) runCatching { shareFiles(context, files, "application/octet-stream") }
+        }
+    }
     fun share(jpeg: Boolean, scale: Int = 1) {
         vm.viewModelScope.launch {
             vm.exportImage(jpeg, scale)?.let { runCatching { shareFile(context, it, if (jpeg) "image/jpeg" else "image/png") } }
@@ -292,6 +299,8 @@ fun ActionsPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier)
                 Act("PNG Files") { share(CanvasViewModel.Export.LAYER_PNGS) },
                 Act("Animated GIF") { vm.animatedExport = CanvasViewModel.Animated.GIF },
                 Act("Animated PNG") { vm.animatedExport = CanvasViewModel.Animated.PNG },
+                // the frames in one PNG and Aseprite's JSON, for a game
+                Act("Sprite Sheet") { shareSpriteSheet() },
                 Act("Animated MP4") { vm.animatedExport = CanvasViewModel.Animated.MP4 },
                 Act("Animated HEVC") { vm.animatedExport = CanvasViewModel.Animated.HEVC },
             ),

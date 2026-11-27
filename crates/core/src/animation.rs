@@ -19,6 +19,9 @@ use crate::{CanvasSession, MobileError};
 const GIF_BATCH_BYTES: usize = 256 << 20;
 /// How many pixels, from all the frames, a shared GIF palette is made from.
 const GIF_PALETTE_SAMPLES: usize = 1 << 18;
+/// About how big a pixel art canvas's animated GIF or PNG is at full size: scaled up by a whole
+/// number to this side, so a little sprite isn't a speck where it's shared.
+const PIXEL_ART_EXPORT_SIDE: u32 = 512;
 
 /// The frames: the visible top-level layers and groups, bottom first.
 fn frames(doc: &Document) -> Vec<LayerId> {
@@ -26,7 +29,7 @@ fn frames(doc: &Document) -> Vec<LayerId> {
 }
 
 /// The frames that play: all but a background frame and a foreground frame.
-fn played(doc: &Document) -> Vec<LayerId> {
+pub(crate) fn played(doc: &Document) -> Vec<LayerId> {
     let all = frames(doc);
     let range = animation::played(doc.animation.as_ref(), all.len());
     all.get(range).map(<[LayerId]>::to_vec).unwrap_or_default()
@@ -159,7 +162,7 @@ impl CanvasSession {
                 .iter()
                 .skip(next)
                 .take(few)
-                .map(|&unit| self.render_frame(unit, transparent, max_side))
+                .map(|&unit| self.export_frame(unit, transparent, max_side))
                 .collect::<Result<Vec<_>, _>>()?;
             next += frames.len();
             let Some(&(w, h, _)) = frames.first() else { break };
@@ -195,7 +198,7 @@ impl CanvasSession {
         // as the GIF's: the frames to 0.95, the file to 1
         self.exported(0.0);
         let made = |k: usize| self.exported(0.95 * k as f32 / count.max(1) as f32);
-        let (w, h, rgba) = self.render_frame(first, transparent, max_side)?;
+        let (w, h, rgba) = self.export_frame(first, transparent, max_side)?;
         // a frame lasts 1/fps seconds, in thousandths
         let delay = (1000.0 / fps.clamp(0.1, 1000.0)).round().clamp(1.0, 65535.0) as u16;
         write_atomically(Path::new(&path), |f| {
@@ -210,7 +213,7 @@ impl CanvasSession {
             writer.write_image_data(&rgba).map_err(|e| file_error("saving", e))?;
             made(1);
             for (k, &unit) in rest.iter().enumerate() {
-                let (fw, fh, frame) = self.render_frame(unit, transparent, max_side)?;
+                let (fw, fh, frame) = self.export_frame(unit, transparent, max_side)?;
                 if (fw, fh) != (w, h) {
                     return Err(file_error("saving", "the frames differ in size"));
                 }
@@ -241,7 +244,7 @@ impl CanvasSession {
         let mut samples: Vec<[u8; 4]> = Vec::new();
         let mut size = None;
         for (k, &unit) in units.iter().enumerate() {
-            let (w, h, rgba) = self.render_frame(unit, transparent, max_side)?;
+            let (w, h, rgba) = self.export_frame(unit, transparent, max_side)?;
             size.get_or_insert((w, h));
             let pixels = rgba.as_chunks::<4>().0;
             let step = (pixels.len() / per_frame).max(1);
@@ -251,10 +254,33 @@ impl CanvasSession {
         Ok(size.map(|(w, h)| GifWriter::shared(w, h, &samples)))
     }
 
+    /// A frame as an animated GIF or PNG has it: as [`Self::render_frame`] makes it, but on a
+    /// pixel art canvas scaled by a whole number with each pixel a square, to about
+    /// [`PIXEL_ART_EXPORT_SIDE`] at full size (0) or within `max_side`.
+    fn export_frame(
+        &self,
+        unit: LayerId,
+        transparent: bool,
+        max_side: u32,
+    ) -> Result<(u32, u32, Vec<u8>), MobileError> {
+        if !self.shared.lock().doc.pixel_art {
+            return self.render_frame(unit, transparent, max_side);
+        }
+        let (w, h, rgba) = self.render_frame(unit, transparent, 0)?;
+        let longest = w.max(h).max(1);
+        let scale = if max_side == 0 { PIXEL_ART_EXPORT_SIDE / longest } else { max_side / longest };
+        if scale == 0 {
+            return self.render_frame(unit, transparent, max_side);
+        }
+        let scaled = procraft_engine::pixel::scaled_up(&rgba, w, h, scale.max(1))
+            .ok_or_else(|| file_error("saving", "the frame couldn't be scaled up"))?;
+        Ok((w * scale.max(1), h * scale.max(1), scaled))
+    }
+
     /// `unit` with a background and a foreground frame and no other (the background too unless
     /// `transparent`), straight alpha, scaled to fit `max_side` (0: full size). The canvas shows
     /// the whole picture again afterwards.
-    fn render_frame(
+    pub(crate) fn render_frame(
         &self,
         unit: LayerId,
         transparent: bool,

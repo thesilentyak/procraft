@@ -92,6 +92,7 @@ mod palettes;
 mod pick;
 mod pickers;
 mod pixel_art;
+mod sprite_sheet;
 /// A picker plugin's picture compiled: whose it is, its code, the keys it reads its controls by.
 pub(crate) type PickerProgram = (String, Arc<str>, Option<Arc<[String]>>, Arc<procraft_gpu::PictureProgram>);
 #[cfg(test)]

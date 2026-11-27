@@ -41,6 +41,8 @@ pub enum Format {
     Svg,
     /// A pixel art canvas's picture as a PNG, each pixel a square this many across.
     PngScaled(u32),
+    /// The frames that play in one PNG for a game, Aseprite's JSON beside it.
+    SpriteSheet,
 }
 
 impl Format {
@@ -56,6 +58,7 @@ impl Format {
             | Format::ChosenLayerPngs
             | Format::ModelRender
             | Format::ModelTextures => "PNG",
+            Format::SpriteSheet => "Sprite Sheet",
             Format::Tiff | Format::ModelTiff => "TIFF",
             Format::Jpeg | Format::ModelJpeg => "JPEG",
             Format::ModelObj => "OBJ",
@@ -77,6 +80,7 @@ impl Format {
             Format::Pdf | Format::LayersPdf => "pdf",
             Format::Png
             | Format::PngScaled(_)
+            | Format::SpriteSheet
             | Format::LayerPngs
             | Format::ChosenLayerPngs
             | Format::ModelRender
@@ -873,6 +877,13 @@ pub fn export(
         // written beside it first, so a cancelled export leaves what was there as it was
         let part = PathBuf::from(format!("{}.part", path.to_string_lossy()));
         let at = part.to_string_lossy().into_owned();
+        if format == Format::SpriteSheet {
+            // the JSON beside the PNG, named as it is, the PNG named inside it
+            let json = PathBuf::from(format!("{}.part", path.with_extension("json").to_string_lossy()));
+            let image = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            session.export_sprite_sheet(at, json.to_string_lossy().into_owned(), image, 1)?;
+            return Ok(vec![part, json]);
+        }
         match format {
             Format::ModelArtwork => session.export_model_artwork(artwork.unwrap_or_default(), at),
             Format::Procraft | Format::Package => session.export_package(at, seed(), time_lapse),
@@ -889,7 +900,7 @@ pub fn export(
             Format::ModelRender => session.export_model_render(at, false),
             Format::ModelTiff => session.export_model_tiff(at),
             Format::Svg => session.export_svg(at),
-            Format::LayerPngs | Format::ChosenLayerPngs | Format::ModelTextures => Ok(()),
+            Format::LayerPngs | Format::ChosenLayerPngs | Format::ModelTextures | Format::SpriteSheet => Ok(()),
         }?;
         Ok(vec![part])
     });
