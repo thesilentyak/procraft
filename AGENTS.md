@@ -197,6 +197,17 @@ Package `io.github.hekel1989.procraftdiffusion.debug` (the old ProCraft debug ap
   SharedPreferences "generation", the desktop's prefs; a kept style waits until the styles folder
   is read); the + card's menu has New style and Import…; Studio slider values can be typed.
 - **Open:** the user has seen a few more small bugs on both platforms that aren't listed yet.
+- **This fork (`thesilentyak/procraft`), 2026-11-26:** ProCraft v0.0.8-beta merged in (tried on
+  `update/procraft-v0.0.8` first; `update/**` branches build test APKs). Custom ComfyUI workflows
+  (09/10 docs) with starters for Z-Image, MiniMax H3 and pixel art (RD Flow 64, and Pixel art edit:
+  MiniMax then SpriteFusion's Pixel Snapper); a seed is fitted to each node's own range.
+- **Pixel art canvas** (`docs/pixel-art/`, written to go to ProCraft): stage 1 built 2026-11-26 on
+  Android, the desktop following for most of it: New canvas › Pixel art (sRGB, a 16-colour
+  palette), crisp pixels, a pixel grid and a checkerboard, PNG ×N, the pixel pencil and eraser
+  (pixel-perfect, QuickShape drawn in pixels), exact selections, nearest transforms, exact fill with
+  Contiguous, an exact eyedropper, and the palette square under the side bar (under the top bar
+  upright; Copy hex codes for a workflow's Palette). Next: stage 2 (animation for games), designed
+  first; the issue for ProCraft's authors is drafted in `02-design.md`.
 
 ## Working with DeepSeek (optional)
 
