@@ -221,6 +221,10 @@ Package `io.github.hekel1989.procraftdiffusion.debug` (the old ProCraft debug ap
   Part C built 2026-11-27: animations by name (Frame options' Start Animation Here…, Rename,
   Remove; coloured bands on the strip; playing loops the current one; a sheet row and a frameTag
   each; AI animations named after the move) and Animate with AI… (Android).
+- **Sprite sheet import** (`docs/pixel-art/05-sprite-import-design.md`): built 2026-11-27 on Android
+  and the desktop. Actions › Add › Insert a sprite sheet: the background taken away, frames found
+  by the gaps (or a grid), the pixel size found and real pixels made, one set of colours, the feet
+  lined up, steadied; added as a named animation, the canvas grown if the sprite is bigger.
 
 ## Working with DeepSeek (optional)
 

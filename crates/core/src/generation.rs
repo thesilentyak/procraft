@@ -2275,55 +2275,9 @@ impl CanvasSession {
     /// in order, named "<name> 1", "<name> 2"…, an animation named after the move starting at the
     /// first, which is made current. Returns its id; none without room.
     pub(crate) fn add_generated_frames(&self, area: IRect, pixels: &[u8], frames: u32, name: &str) -> Option<u64> {
-        let count = usize::try_from(frames).ok()?;
-        let ids = self.change("generate", |d| {
-            if !d.has_room(count) || area.intersect(IRect::from_size(d.width(), d.height())) != area {
-                return None;
-            }
-            if d.animation.is_none() {
-                d.animation = Some(procraft_engine::animation::Animation::starting(false, d.pixel_art));
-            }
-            // after the animation holding the current frame (else the current frame), out of any
-            // group: an animation already there stays whole
-            let all = procraft_engine::animation::frames(d);
-            let under = procraft_engine::animation::current_frame(d)
-                .map(|i| {
-                    procraft_engine::animation::animation_of(d, i).map_or(i, |(_, r)| r.end.saturating_sub(1).max(i))
-                })
-                .and_then(|i| all.get(i).copied())
-                .or_else(|| d.members(None).last().copied());
-            if let Some(under) = under {
-                d.set_current(under);
-            }
-            let mut ids = Vec::with_capacity(count);
-            for k in 1..=count {
-                let id = d.add_layer();
-                d.rename(id, &format!("{name} {k}"));
-                ids.push(id);
-            }
-            if let Some(&first) = ids.first() {
-                d.set_current(first);
-                // an animation of their own, named after the move
-                let move_name = name.strip_prefix("Generated · ").unwrap_or(name);
-                if let Some(a) = d.animation.as_mut() {
-                    a.set_tag(first, move_name);
-                }
-            }
-            Some(ids)
-        })?;
-        let mut guard = self.shared.lock();
-        let st = &mut *guard;
-        if let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) {
-            for (k, id) in ids.iter().enumerate() {
-                let part = frame_of(pixels, area.width(), area.height(), u32::try_from(k).ok()?)?;
-                canvas.upload_layer_part(gpu, *id, area, part).ok()?;
-            }
-            canvas.set_play_frame(None);
-            canvas.invalidate();
-        }
-        st.revision += 1;
-        self.shared.frame(st);
-        ids.first().map(|id| id.0)
+        // an animation of their own, named after the move
+        let move_name = name.strip_prefix("Generated · ").unwrap_or(name);
+        self.add_animation_frames("generate", area, pixels, frames, name, move_name)
     }
 }
 

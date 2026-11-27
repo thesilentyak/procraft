@@ -247,6 +247,13 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
      */
     private var messagesGiven = 0
 
+    /** A sprite sheet being imported, while its import sheet is open (SpriteImportUi.kt). */
+    var spriteSheet by mutableStateOf<io.github.artcraftandroid.procraft.ui.SpriteSheetImporting?>(null)
+
+    /** A picked sprite sheet's straight pixels, in the canvas's colours, and its file's name. */
+    suspend fun sheetPicture(uri: android.net.Uri): Pair<io.github.artcraftandroid.procraft.core.ThumbnailImage, String>? =
+        withContext(Dispatchers.IO) { decodePicture(uri, io.github.artcraftandroid.procraft.ui.CanvasSpace.p3)?.let { it to (fileName(uri) ?: "") } }
+
     /** A passing message to show; each one given is counted (see [messagesGiven]). */
     var message: String?
         get() = messageText

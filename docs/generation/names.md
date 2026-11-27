@@ -84,3 +84,12 @@ when something gets a name, and change it here first when a name changes.
 | **Marker nodes** (docs only) | The add-on's nodes that mark where the app's inputs go and results come out: Krita Canvas, Krita Selection, Krita Output, Parameter, Krita Image Layer, Krita Mask Layer. | — |
 | **Parameters** (the **Parameters part**) | The popover's part with a row per Parameter or layer node of the chosen workflow. | "Parameters" |
 | **Keep** | Saves the live workflow as a kept one, under a name. | "Keep…" |
+
+## Pixel art animation (`docs/pixel-art/`)
+
+| Name | What it is | Shown as |
+|---|---|---|
+| **Sprite sheet** (export) | Share Layers' sheet of the frames, a row per animation, with Aseprite's JSON beside it. | "Sprite Sheet" |
+| **Animation** (named) | A run of frames with a name, from Frame options or an import; a coloured band on the strip. | "Start Animation Here…" |
+| **Insert a sprite sheet** | Actions › Add: a sheet picture from anywhere read into clean, lined-up frames as a named animation. | "Insert a sprite sheet" |
+| **Import sheet** (docs only) | Its window: the sheet with each frame boxed, the frames playing, Name, and Not right? (Grid, Background). | "Import 8 frames" |

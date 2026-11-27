@@ -78,6 +78,8 @@ pub enum Act {
     /// Insert a file or a photo, or Paste, swiped open: what they bring goes on a private layer.
     InsertPrivateFile,
     InsertPrivatePhoto,
+    /// Insert a sprite sheet: its frames as a named animation.
+    InsertSpriteSheet,
     PastePrivate,
     /// On a model: its 2D texture shown flat, strokes reaching through it, the lighting studio.
     ModelFlat,
@@ -365,6 +367,7 @@ fn groups(tab: usize, showing: &Showing, prefs: &Prefs) -> Vec<Vec<Row>> {
                     Some(Act::InsertPrivatePhoto),
                 ),
                 Private("Take a photo", "Take a private photo", None, None),
+                Button("Insert a sprite sheet", None, Some(Act::InsertSpriteSheet)),
                 Button("Add text", None, Some(Act::AddText)),
             ],
             vec![

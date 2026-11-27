@@ -222,6 +222,9 @@ fun ActionsPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier)
     val takePhoto = androidx.activity.compose.rememberLauncherForActivityResult(androidx.activity.result.contract.ActivityResultContracts.TakePicture()) { taken ->
         if (taken) vm.insertPicture(photo, privately)
     }
+    val pickSheet = androidx.activity.compose.rememberLauncherForActivityResult(androidx.activity.result.contract.ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let { vm.insertSpriteSheet(it) }
+    }
     fun file(private: Boolean) {
         privately = private
         // a video's frames come in too
@@ -247,6 +250,7 @@ fun ActionsPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier)
                 Act("Insert a file", private = "Insert a private file", onPrivate = { file(true) }) { file(false) },
                 Act("Insert a photo", private = "Insert a private photo", onPrivate = { photoFrom(true) }) { photoFrom(false) },
                 Act("Take a photo", private = "Take a private photo", onPrivate = { camera(true) }) { camera(false) },
+                Act("Insert a sprite sheet") { pickSheet.launch(arrayOf("image/*")) },
                 Act("Add text") { vm.addText() },
             ),
             // Paste is grey until something has been cut or copied

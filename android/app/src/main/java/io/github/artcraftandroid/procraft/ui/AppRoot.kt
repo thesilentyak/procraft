@@ -508,6 +508,7 @@ private fun ScreensShown(vm: CanvasViewModel, keptClear: Clearance) {
             RasterizePrompt(vm)
             vm.animatedExport?.let { AnimatedExport(vm, it) }
             vm.modelAnimatedExport?.let { ModelAnimatedExport(vm, it) }
+            vm.spriteSheet?.let { SpriteSheetImportSheet(vm, it) }
             // full-screen pages slide up over everything, and back down
             androidx.compose.animation.AnimatedVisibility(
                 vm.canvasInfoOpen,

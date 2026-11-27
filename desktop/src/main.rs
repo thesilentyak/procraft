@@ -76,6 +76,7 @@ mod settings;
 mod shortcuts;
 mod sound;
 mod source_editor;
+mod sprite_import;
 mod startup;
 mod stroke_sound;
 mod studio;

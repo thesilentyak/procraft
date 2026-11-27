@@ -94,6 +94,7 @@ mod pick;
 mod pickers;
 mod pixel_art;
 mod sprite_sheet;
+mod sprite_sheet_import;
 /// A picker plugin's picture compiled: whose it is, its code, the keys it reads its controls by.
 pub(crate) type PickerProgram = (String, Arc<str>, Option<Arc<[String]>>, Arc<procraft_gpu::PictureProgram>);
 #[cfg(test)]
@@ -332,6 +333,7 @@ pub use side_bar::{
 pub use side_slider::{
     ShadowStep, SideSliderTap, side_slider_drag_share, side_slider_shown_percent, side_slider_tap, side_thumb_shadow,
 };
+pub use sprite_sheet_import::{SheetPlace, SpriteSheetImport, SpriteSheetInserted, SpriteSheetLook};
 pub use storage::{NO_ROOM, save_failure_to_tell, storage_full_writes, storage_was_full};
 pub use studio::{
     SliderExtrasInfo, SourceImage, SourceKind, StudioAbout, curve_samples, repeatable_source, slider_extras,

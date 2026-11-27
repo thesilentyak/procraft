@@ -245,6 +245,8 @@ pub struct Interface {
     /// Animation Assist's bar, while it is on, and sharing the layers as an animation.
     animation: crate::animation::AnimationBar,
     animated_export: Option<crate::animated_export::AnimatedExport>,
+    /// Insert a sprite sheet's window, while it's open.
+    sprite_sheet: Option<crate::sprite_import::SheetImport>,
     /// The export screen just ended, kept a frame: its preview's textures were drawn in the frame
     /// it ended in, and a texture let go of is gone before that frame is.
     ended_export: Option<crate::animated_export::AnimatedExport>,
@@ -368,6 +370,7 @@ impl Interface {
             shortcut_list: Default::default(),
             animation: crate::animation::AnimationBar::default(),
             animated_export: None,
+            sprite_sheet: None,
             ended_export: None,
             exporting_from_gallery: false,
             time_lapse: crate::timelapse::TimeLapseUi::default(),
@@ -1005,6 +1008,23 @@ impl Interface {
         }
         self.hover_cursor(&ctx, session, &info, input);
         self.selection_pointer(&ctx, input);
+        // Insert a sprite sheet's window, over the canvas
+        if let Some(sheet) = self.sprite_sheet.as_mut() {
+            let ended = sheet.show(&ctx, session);
+            if ended.is_some() {
+                self.sprite_sheet = None;
+            }
+            match ended {
+                Some(crate::sprite_import::Ended::Added(done)) if done.grown => {
+                    self.overlays.done(format!("Added {} frames; the canvas grew to fit", done.frames), false);
+                }
+                Some(crate::sprite_import::Ended::Added(done)) => {
+                    self.overlays.done(format!("Added {} frames", done.frames), false);
+                }
+                Some(crate::sprite_import::Ended::Failed) => self.overlays.notice("No room for these frames", true),
+                _ => {}
+            }
+        }
         if let Some(kind) = self.overlays.show(ui, &mut self.look, colour, true) {
             self.overlays.shape = session.quickshape_choose(kind).or(self.overlays.shape.take());
         }
@@ -3386,6 +3406,14 @@ impl Interface {
                 self.settings = true;
             }
             Some(Act::Flip { horizontal }) => session.flip_canvas(horizontal),
+            Some(Act::InsertSpriteSheet) => {
+                self.open = None;
+                match crate::sprite_import::SheetImport::pick() {
+                    Some(Ok(sheet)) => self.sprite_sheet = Some(sheet),
+                    Some(Err(why)) => crate::files::tell("Insert a sprite sheet", &why),
+                    None => {}
+                }
+            }
             Some(Act::AddText) => self.add_text(ctx, session),
             Some(act @ (Act::InsertFile | Act::InsertPhoto | Act::InsertPrivateFile | Act::InsertPrivatePhoto)) => {
                 self.open = None;
@@ -3841,6 +3869,7 @@ impl Interface {
                 || self.background_pick.is_some())
                 && self.colours.takes_keys())
             || self.animation.takes_keys()
+            || self.sprite_sheet.is_some()
     }
 
     /// Nothing covers the canvas: no full-screen page or editor is open.
