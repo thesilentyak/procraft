@@ -17,6 +17,7 @@ mod adjust;
 mod adjust_menu;
 mod adjusting;
 mod animation;
+mod animation_names;
 mod app_log;
 mod bars;
 mod big_pictures;
@@ -181,6 +182,7 @@ pub use animation::{
     AnimationPlayback, AnimationSettings, FrameRate, PlayStep, animation_next_step, export_fps_at, export_fps_fraction,
     export_fps_label, frame_rate,
 };
+pub use animation_names::AnimationName;
 pub use app_log::process_line;
 pub use bars::{BarHang, BarLayout, BarPlace, BarSides, EdgeCollapse, HangSide, LayoutBar, WindowEdge, bar_layout_key};
 pub use big_pictures::{big_pictures_left, wait_for_big_pictures};

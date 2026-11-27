@@ -96,6 +96,8 @@ pub struct AnimationBar {
     /// The frame and how far into its hold the timeline was last left, and its hold's slider held.
     held: (usize, usize),
     holding: bool,
+    /// Naming an animation in the frame options: whether it renames one, and the name typed.
+    naming: Option<(bool, String)>,
 }
 
 /// Where frame `current` is among the timeline's `slots` (each frame's index, again for each frame
@@ -114,7 +116,7 @@ pub enum Said {
 impl AnimationBar {
     /// The onion skins' colours have their hex keypad open: it takes the keys.
     pub fn takes_keys(&self) -> bool {
-        self.colours.as_ref().is_some_and(|(_, c)| c.takes_keys())
+        self.colours.as_ref().is_some_and(|(_, c)| c.takes_keys()) || self.naming.is_some()
     }
 
     /// Playing stops, menus close (Animation Assist went off, or a screen covers the bar).
@@ -239,8 +241,95 @@ impl AnimationBar {
             let first = slots.iter().position(|f| *f == index);
             let place = slot_of(&slots, index, self.held).zip(first).map_or(0, |(at, first)| at - first);
             self.options_popover(ctx, session, &settings, &frames, index, place, bar);
+        } else if self.naming.is_some()
+            && let Some(&id) = current.and_then(|i| frames.get(i))
+        {
+            self.naming_popover(ctx, session, id, bar);
         }
         said
+    }
+
+    /// Naming the animation holding frame `id` (starting one there, or renaming it), standing on
+    /// the middle of the bar: the name's field, then Start (or Rename) and Cancel. Return names
+    /// it, Escape leaves it.
+    fn naming_popover(&mut self, ctx: &egui::Context, session: &CanvasSession, id: u64, bar: Rect) {
+        let Some((renaming, mut name)) = self.naming.take() else { return };
+        let height = 8.0 + 11.0 + TITLE_LINE + 15.0 + 44.0 + 10.0 + 44.0 * 2.0 + 2.0 + 8.0 + panel::ARROW_HEIGHT;
+        let rect = Rect::from_min_size(pos2(bar.center().x - 130.0, bar.top() - 2.0 - height), vec2(260.0, height));
+        let mut done: Option<bool> = None;
+        egui::Area::new(Id::unique("naming animation")).fixed_pos(rect.min).order(Order::Foreground).show(ctx, |ui| {
+            ui.allocate_rect(rect, Sense::click_and_drag());
+            down_popover(ui, rect, 130.0);
+            let (left, right) = (rect.left() + 8.0, rect.right() - 8.0);
+            let mut y = rect.top() + 8.0;
+            let title = if renaming { "Rename the animation" } else { "Name the animation" };
+            text(
+                ui.painter(),
+                pos2(left + 14.0, y + 11.0),
+                Align2::LEFT_TOP,
+                title,
+                23.0,
+                Weight::Bold,
+                argb(PANEL_TITLE),
+            );
+            y += 11.0 + TITLE_LINE + 15.0;
+            let field = Rect::from_min_max(pos2(left, y), pos2(right, y + 44.0));
+            ui.painter().rect_filled(field, 18, argb(GROUP));
+            let edit = ui.put(
+                field.shrink2(vec2(16.0, 10.0)),
+                egui::TextEdit::singleline(&mut name)
+                    .font(Weight::Regular.font(17.0))
+                    .text_color(argb(PANEL_TITLE))
+                    .frame(egui::Frame::NONE)
+                    .char_limit(40)
+                    .hint_text("idle, walk, attack\u{2026}"),
+            );
+            edit.request_focus();
+            if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                done = Some(true);
+            }
+            y += 44.0 + 10.0;
+            let group = Rect::from_min_max(pos2(left, y), pos2(right, y + 44.0 * 2.0 + 2.0));
+            ui.painter().rect_filled(group, 18, argb(GROUP));
+            for (k, label) in [if renaming { "Rename" } else { "Start" }, "Cancel"].into_iter().enumerate() {
+                let row = Rect::from_min_max(pos2(left, y), pos2(right, y + 44.0));
+                text(
+                    ui.painter(),
+                    pos2(row.left() + 16.0, row.center().y),
+                    Align2::LEFT_CENTER,
+                    label,
+                    17.0,
+                    Weight::Regular,
+                    argb(PANEL_TITLE),
+                );
+                if ui.interact(row, ui.scope_id().with(("naming", k)), Sense::click()).clicked() {
+                    done = Some(k == 0);
+                }
+                y += 44.0;
+                if k == 0 {
+                    ui.painter().rect_filled(
+                        Rect::from_min_max(pos2(left, y), pos2(right, y + 2.0)),
+                        0,
+                        argb(ROW_LINE),
+                    );
+                    y += 2.0;
+                }
+            }
+        });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            done = Some(false);
+        }
+        match done {
+            Some(true) if !name.trim().is_empty() => {
+                if renaming {
+                    session.rename_animation(id, name);
+                } else {
+                    session.start_animation(id, name);
+                }
+            }
+            Some(_) => {}
+            None => self.naming = Some((renaming, name)),
+        }
     }
 
     /// Playing goes on: the next frame shows when it is due.
@@ -272,7 +361,8 @@ impl AnimationBar {
         let Some(settings) = session.animation_settings() else { return };
         let sequence = session.animation_sequence();
         let (slots, frames): (Vec<u32>, Vec<u32>) = session
-            .animation_played_places()
+            // the animation holding the current frame, when they have names
+            .animation_playing_places()
             .into_iter()
             .filter_map(|slot| Some((slot, *sequence.get(slot as usize)?)))
             .unzip();
@@ -403,6 +493,7 @@ impl AnimationBar {
         let painter = ui.painter_at(track);
         painter.rect_filled(track, 18, argb(TRACK_FILL));
         let mut tapped = None;
+        let names = session.animation_names();
         for (i, frame) in slots.iter().enumerate() {
             // a frame's held places: grey cards after it
             let held = i > 0 && slots.get(i - 1) == Some(frame);
@@ -423,6 +514,27 @@ impl AnimationBar {
                     Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
                     Color32::WHITE,
                 );
+            }
+            // a named animation's frames: a band of its colour along the bottom, its name on its first
+            let f = *frame as u32;
+            if let Some((k, n)) = names.iter().enumerate().find(|(_, n)| f >= n.first && f < n.first + n.count) {
+                let colour = argb(ANIMATION_COLOURS.get(k % ANIMATION_COLOURS.len()).copied().unwrap_or(0xFFE8833A));
+                let band = Rect::from_min_max(pos2(card.left(), card.bottom() - 4.0), card.right_bottom());
+                painter.rect_filled(band, 0, colour);
+                if !held && f == n.first {
+                    let at = card.left_top() + vec2(2.0, 2.0);
+                    let width = (n.name.chars().count() as f32 * 5.0 + 4.0).min(card.width() - 4.0);
+                    painter.rect_filled(Rect::from_min_size(at, vec2(width, 11.0)), 3, colour);
+                    text(
+                        &painter,
+                        at + vec2(2.0, 0.5),
+                        Align2::LEFT_TOP,
+                        &n.name,
+                        8.5,
+                        Weight::Regular,
+                        Color32::WHITE,
+                    );
+                }
             }
             painter.rect_stroke(card, 6, Stroke::new(1.0, argb(FRAME_EDGE)), egui::StrokeKind::Inside);
             if response.clicked() && response.interact_pointer_pos().is_some_and(|p| card.contains(p)) {
@@ -709,8 +821,19 @@ impl AnimationBar {
         // a plugin's in-betweens: a frame drawn between this one and the next
         let inbetween = self.tweens && !a.pages && place == 0 && index + 1 < frames.len();
         let own: &[&str] = if inbetween { &["Duplicate", "Delete", "In-between"] } else { &["Duplicate", "Delete"] };
-        // a plugin's actions for the frame, after the app's own
+        // the animation by name holding this frame: started here, renamed, taken away
+        let named = if a.pages { None } else { session.animation_name_of(id) };
+        let mut naming: Vec<(String, u8)> = Vec::new();
+        if !a.pages && !session.animation_starts_at(id) {
+            naming.push(("Start Animation Here\u{2026}".to_owned(), 0));
+        }
+        if let Some(n) = &named {
+            naming.push((format!("Rename \u{201c}{n}\u{201d}\u{2026}"), 1));
+            naming.push((format!("Remove \u{201c}{n}\u{201d}"), 2));
+        }
+        // a plugin's actions for the frame, after the app's own and the names'
         let mut actions: Vec<&str> = own.to_vec();
+        actions.extend(naming.iter().map(|(l, _)| l.as_str()));
         actions.extend(self.frame_actions.iter().map(|a| a.label.as_str()));
         let rows = actions.len() as f32;
         let content = 11.0 + TITLE_LINE + 15.0 + hold_rows + 44.0 * rows + 2.0 * (rows - 1.0) + ends;
@@ -760,9 +883,16 @@ impl AnimationBar {
                     self.options_open = false;
                     // on a held place it splits there, or is held one frame less
                     match (i, place) {
+                        // naming its animation
+                        _ if i >= own.len() && i < own.len() + naming.len() => match naming.get(i - own.len()) {
+                            Some((_, 0)) => self.naming = Some((false, "walk".to_owned())),
+                            Some((_, 1)) => self.naming = Some((true, named.clone().unwrap_or_default())),
+                            Some((_, 2)) => _ = session.remove_animation(id),
+                            _ => {}
+                        },
                         // a plugin's, run with this frame's layer current
                         _ if i >= own.len() => {
-                            let key = self.frame_actions.get(i - own.len()).map(|a| a.key.clone());
+                            let key = self.frame_actions.get(i - own.len() - naming.len()).map(|a| a.key.clone());
                             if key.is_some() && session.select_layer(id) {
                                 self.run_action = key;
                             }
@@ -822,6 +952,9 @@ impl AnimationBar {
         }
     }
 }
+
+/// The named animations' colours on the timeline, in turn.
+const ANIMATION_COLOURS: [u32; 6] = [0xFFE8833A, 0xFF3FA86B, 0xFF8A63D2, 0xFFD64F8A, 0xFF2E9BB8, 0xFFC9A227];
 
 /// How long a frame shows at the animation's frames a second.
 fn frame_time(a: &AnimationSettings) -> Duration {

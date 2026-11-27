@@ -9709,6 +9709,10 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     var frameSlots by mutableStateOf<List<Int>>(emptyList())
         private set
 
+    /** The animations by name: each one's name, first frame and how many frames. */
+    var animationNames by mutableStateOf<List<io.github.artcraftandroid.procraft.core.AnimationName>>(emptyList())
+        private set
+
     /** The frame and how far into its hold the timeline was last left. */
     private var heldAt by mutableStateOf(0 to 0)
 
@@ -9757,6 +9761,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         animation = settings
         if (settings == null) {
             animationFrames = emptyList()
+            animationNames = emptyList()
             frameSlots = emptyList()
             playedSlots = emptyList()
             currentFrame = null
@@ -9765,6 +9770,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         animationFrames = s.animationFrames()
+        animationNames = s.animationNames()
         frameSlots = s.animationSequence().map { it.toInt() }
         playedSlots = s.animationPlayedPlaces().map { it.toInt() }
         currentFrame = s.currentFrame()?.toInt()
@@ -9899,13 +9905,41 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     fun togglePlaying() = if (playingFrame != null) stopPlaying() else play()
 
+    /** The current frame's layer, for its options. */
+    private val currentFrameId: ULong? get() = currentFrame?.let { animationFrames.getOrNull(it) }
+
+    /** The name of the animation holding the current frame, if it has one. */
+    fun currentAnimationName(): String? = currentFrameId?.let { session?.animationNameOf(it) }
+
+    /** Whether an animation starts at the current frame. */
+    fun animationStartsHere(): Boolean = currentFrameId?.let { session?.animationStartsAt(it) } == true
+
+    /** Starts an animation named [name] at the current frame. */
+    fun startAnimation(name: String) {
+        val id = currentFrameId ?: return
+        if (session?.startAnimation(id, name) == true) refresh()
+    }
+
+    /** Renames the animation holding the current frame. */
+    fun renameAnimation(name: String) {
+        val id = currentFrameId ?: return
+        if (session?.renameAnimation(id, name) == true) refresh()
+    }
+
+    /** Takes away the name of the animation holding the current frame: its frames join the one before. */
+    fun removeAnimation() {
+        val id = currentFrameId ?: return
+        if (session?.removeAnimation(id) == true) refresh()
+    }
+
     private fun play() {
         val s = session ?: return
         val a = animation ?: return
         // the timeline's places that play, in order, each frame as often as it is held (the shared
         // core's): a background or foreground frame shows with each, never on its own
         val places = s.animationSequence().map { it.toInt() }
-        val order = s.animationPlayedPlaces().map { it.toInt() }.filter { it in places.indices }
+        // the animation holding the current frame, when they have names
+        val order = s.animationPlayingPlaces().map { it.toInt() }.filter { it in places.indices }
         if (order.isEmpty()) return
         animationSettingsOpen = false
         frameOptionsOpen = false

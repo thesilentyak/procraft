@@ -49,6 +49,10 @@ pub struct WorkflowCard {
     pub live: bool,
     /// Why it can't run (nothing received yet, a file that isn't a workflow); none when it can.
     pub reason: Option<String>,
+    /// It sends an animation's frames (an Output node's batch mode "animation"): the frame
+    /// strip's Animate with AI… picks it.
+    #[uniffi(default = false)]
+    pub animates: bool,
 }
 
 /// Which control a parameter gets.
@@ -181,7 +185,9 @@ impl Generation {
         let server = self.worker.server();
         let mut cards = Vec::new();
         if server.address.is_some() {
-            let reason = match self.live_workflow(&server) {
+            let live = self.live_workflow(&server);
+            let animates = matches!(&live, Some(Ok(w)) if w.animates());
+            let reason = match live {
                 Some(Ok(_)) => None,
                 Some(Err(e)) => Some(e.to_string()),
                 None if server.connection == Connection::Connected && !server.workflow_link => Some(
@@ -190,17 +196,26 @@ impl Generation {
                 ),
                 None => Some("Open a workflow with a Krita Output node in ComfyUI".to_owned()),
             };
-            cards.push(WorkflowCard { id: LIVE_ID.to_owned(), name: LIVE_NAME.to_owned(), live: true, reason });
+            cards.push(WorkflowCard {
+                id: LIVE_ID.to_owned(),
+                name: LIVE_NAME.to_owned(),
+                live: true,
+                reason,
+                animates,
+            });
         }
         let mut files = self.workflows.files.lock().clone();
         files.sort_by_key(|f| f.name.to_lowercase());
         for file in files {
-            let reason = Workflow::parse(&card_name(&file.name), &file.text).err().map(|e| e.to_string());
+            let parsed = Workflow::parse(&card_name(&file.name), &file.text);
+            let animates = parsed.as_ref().is_ok_and(Workflow::animates);
+            let reason = parsed.err().map(|e| e.to_string());
             cards.push(WorkflowCard {
                 id: format!("{FILE_PREFIX}{}", file.name),
                 name: card_name(&file.name),
                 live: false,
                 reason,
+                animates,
             });
         }
         cards

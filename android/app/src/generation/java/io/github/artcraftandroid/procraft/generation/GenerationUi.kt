@@ -332,6 +332,21 @@ object GenerationUi {
         view = View.SERVER
     }
 
+    /**
+     * The frame strip's Animate with AI…: the current frame to the workflow card that makes
+     * animations (a kept one first, else the live one), Generate opened on it. False without one.
+     */
+    fun animateFrame(vm: CanvasViewModel, context: android.content.Context): Boolean {
+        val g = generation ?: return false
+        val cards = g.workflowCards().filter { it.animates && it.reason == null }
+        val card = cards.firstOrNull { !it.live } ?: cards.firstOrNull() ?: return false
+        Workflows.choose(context, card.id)
+        view = View.FORM
+        vm.frameOptionsOpen = false
+        if (vm.panel != Panel.GENERATE) vm.toggle(Panel.GENERATE)
+        return true
+    }
+
     /** The artwork is closing: its run is cancelled and its results dropped. */
     fun leave(vm: CanvasViewModel) {
         val s = vm.session ?: return

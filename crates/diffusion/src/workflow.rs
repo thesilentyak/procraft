@@ -150,6 +150,14 @@ impl Workflow {
 
     /// The node classes whose inputs [`parameters`](Self::parameters) needs described: the ones
     /// an "auto" or "choice" Parameter feeds.
+    /// Whether an Output node sends its pictures as an animation (batch mode "animation").
+    pub fn animates(&self) -> bool {
+        self.graph
+            .nodes_of(OUTPUT)
+            .iter()
+            .any(|n| self.graph.inputs(n).and_then(|i| text_input(i, "batch_mode")).as_deref() == Some("animation"))
+    }
+
     /// Whether `info` (the server's `/object_info`) describes every node this workflow uses.
     pub fn described_by(&self, info: &Map<String, Value>) -> bool {
         self.graph.classes().all(|class| info.contains_key(class))
@@ -815,6 +823,7 @@ mod tests {
         assert!(values.iter().all(|v| !v.is_array() || v[0].as_str().map(|n| prepared.graph.class(n)) != Some(Some("ETN_Parameter"))));
         assert_eq!(prepared.outputs.len(), 1);
         assert_eq!(prepared.outputs[0].name, "", "the frames are named after the move");
+        assert!(w.animates());
         assert!(prepared.outputs[0].animation);
     }
 
@@ -835,6 +844,7 @@ mod tests {
         assert_eq!(input(&prepared, "SpriteFusionPixelSnapper", "custom_palette"), "");
         assert_eq!(prepared.outputs.len(), 1);
         assert!(!prepared.outputs[0].animation);
+        assert!(!w.animates());
     }
 
     #[test]

@@ -4,7 +4,7 @@ How the [stage 2 proposal](03-animation-proposal.md) is built. The proposal's pr
 new files with thin hooks, mobile first, every choice made for the user and changeable.
 
 Status: agreed with the user 2026-11-26 ("let's move forward with building"); part A built
-2026-11-26, part B 2026-11-27. Built in three parts:
+2026-11-26, parts B and C 2026-11-27. Built in three parts:
 **A** (AI animation, the user's first want), then **B** (sprite sheets and export), then **C**
 (animations by name).
 
@@ -120,13 +120,27 @@ Built 2026-11-27 (`crates/core/src/sprite_sheet.rs`).
 
 ## C. Animations by name (to go to ProCraft)
 
-- `Animation` gains `tags: Vec<Tag>` (`name`, `from: LayerId`), each running to the next tag's
-  frame or the end. Hold a frame in the strip: **Start animation here…** (named), **Rename
-  animation…**, **Remove animation**; coloured bands over the strip; playing loops the animation
-  holding the current frame. Applying an AI animation starts one named after the move.
-- The sprite sheet lays one row per animation; the JSON's `frameTags` lists them.
-- **Animate with AI…** in the frame's hold menu (this fork): opens Generate on the Pixel animation
-  card with that frame current.
+Built 2026-11-27 (`crates/engine/src/animation.rs`'s tags, `crates/core/src/animation_names.rs`).
+
+- `Animation` gains `tags: Vec<Tag>` (`name`, `from: LayerId`), kept in the artwork's JSON. Each
+  runs from its frame to the next tag's frame, or to the last frame that plays; frames before the
+  first are an unnamed animation. A tag whose frame is gone is dropped (its frames join the one
+  before).
+- **Frame options** (tap the current frame) gains a group: **Start Animation Here…** (asks for a
+  name, "walk" offered), and on a named animation's frames **Rename "walk"…** and **Remove
+  "walk"**; each one undo step. On the desktop the name is typed in the same panel.
+- **The strip**: a named animation's frames have a band of its colour along their bottom (six
+  colours in turn), its name on its first frame.
+- **Playing** loops the animation holding the current frame (all the frames without names).
+- **AI animations** (part A's Apply) go after the end of the animation holding the current frame,
+  so one already there stays whole, and start an animation named after the move.
+- **The sprite sheet** lays a row per animation (a short row's end left clear); the JSON's
+  `frameTags` lists the named ones (`name`, `from`, `to`, `direction` "forward"), each frame's
+  `frame` its place in the grid.
+- **Animate with AI…** (this fork, Android: the desktop has no workflow cards): in Frame options,
+  opens Generate on the workflow card that makes animations (`WorkflowCard::animates`: an Output
+  node with batch mode "animation"), a kept card first, else the live one, with that frame
+  current; without one it says "Keep the Pixel animation workflow first".
 
 ## D. Checks
 

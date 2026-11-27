@@ -218,7 +218,9 @@ Package `io.github.hekel1989.procraftdiffusion.debug` (the old ProCraft debug ap
   animating a run sees the current frame alone, and a pixel art canvas goes to a workflow on white.
   Part B built 2026-11-27: Share Layers › Sprite Sheet (one row, transparent, with Aseprite's JSON
   beside it), and a pixel art canvas's animated GIF or PNG scaled up crisply to about 512.
-  Next: part C (animations by name, Animate with AI… from the frame strip).
+  Part C built 2026-11-27: animations by name (Frame options' Start Animation Here…, Rename,
+  Remove; coloured bands on the strip; playing loops the current one; a sheet row and a frameTag
+  each; AI animations named after the move) and Animate with AI… (Android).
 
 ## Working with DeepSeek (optional)
 

@@ -19,6 +19,8 @@ object GenerationUi {
 
     fun openServer() = Unit
 
+    fun animateFrame(vm: CanvasViewModel, context: android.content.Context): Boolean = false
+
     fun leave(vm: CanvasViewModel) = Unit
 
     @Composable

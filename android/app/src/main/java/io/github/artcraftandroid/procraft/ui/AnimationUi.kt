@@ -257,12 +257,28 @@ private fun Timeline(vm: CanvasViewModel, width: Dp, modifier: Modifier) {
                         .border(1.dp, Color(0xFF9A9A9A), RoundedCornerShape(6.dp)).clickable { vm.tapFrame(i) },
                 ) {
                     if (!held) vm.animationFrames.getOrNull(frame)?.let { vm.frameThumbnails[it] }?.let { Image(it, contentDescription = frameLabel(vm, i, frame), contentScale = ContentScale.Fit, modifier = Modifier.fillMaxSize().padding(2.dp)) }
+                    // a named animation's frames: a band of its colour along the bottom, its name on its first
+                    val named = vm.animationNames.indexOfFirst { frame.toUInt() >= it.first && frame.toUInt() < it.first + it.count }
+                    if (named >= 0) {
+                        val n = vm.animationNames[named]
+                        Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(4.dp).background(AnimationColours[named % AnimationColours.size]))
+                        if (!held && frame.toUInt() == n.first) {
+                            Text(
+                                n.name, color = Color.White, fontSize = 8.sp, maxLines = 1, lineHeight = 9.sp,
+                                modifier = Modifier.align(Alignment.TopStart).padding(1.dp).clip(RoundedCornerShape(3.dp))
+                                    .background(AnimationColours[named % AnimationColours.size]).padding(horizontal = 2.dp),
+                            )
+                        }
+                    }
                 }
             }
         }
     }
     Box(Modifier.offset(x = 12.dp + width / 2 - 12.dp, y = 42.dp + 44.dp + 3.dp).size(24.dp, 3.dp).clip(RoundedCornerShape(1.5.dp)).background(Pc.Accent))
 }
+
+/** The named animations' colours on the timeline, in turn. */
+private val AnimationColours = listOf(Color(0xFFE8833A), Color(0xFF3FA86B), Color(0xFF8A63D2), Color(0xFFD64F8A), Color(0xFF2E9BB8), Color(0xFFC9A227))
 
 /** Timeline place [slot]'s name: "Frame N", counting only the frames that play, else "Background" or "Foreground". */
 private fun frameLabel(vm: CanvasViewModel, slot: Int, frame: Int): String {
@@ -438,6 +454,72 @@ private fun ColumnScope.FrameOptionsPage(vm: CanvasViewModel) {
             Row(Modifier.fillMaxWidth().height(44.dp).clickable { vm.runFrameAction(action.key) }.padding(start = 16.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text(action.label, color = Pc.PanelTitle, fontSize = 17.sp)
             }
+        }
+    }
+    // the animation by name holding this frame: started here, renamed, taken away; and the AI
+    // making one from this frame
+    if (!a.pages) {
+        val context = androidx.compose.ui.platform.LocalContext.current
+        // re-read when the names change
+        val named = vm.animationNames.let { vm.currentAnimationName() }
+        val starts = vm.animationNames.let { vm.animationStartsHere() }
+        var asking by remember { mutableStateOf<String?>(null) }
+        Spacer(Modifier.height(10.dp))
+        Group {
+            var rows = 0
+            if (!starts) {
+                Row(Modifier.fillMaxWidth().height(44.dp).clickable { asking = "" }.padding(start = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("Start Animation Here…", color = Pc.PanelTitle, fontSize = 17.sp)
+                }
+                rows++
+            }
+            if (named != null) {
+                if (rows > 0) RowLine()
+                Row(Modifier.fillMaxWidth().height(44.dp).clickable { asking = named }.padding(start = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("Rename “$named”…", color = Pc.PanelTitle, fontSize = 17.sp, maxLines = 1)
+                }
+                RowLine()
+                Row(Modifier.fillMaxWidth().height(44.dp).clickable { vm.removeAnimation() }.padding(start = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("Remove “$named”", color = Pc.PanelTitle, fontSize = 17.sp, maxLines = 1)
+                }
+                rows += 2
+            }
+            if (io.github.artcraftandroid.procraft.generation.GenerationUi.enabled) {
+                if (rows > 0) RowLine()
+                Row(
+                    Modifier.fillMaxWidth().height(44.dp).clickable {
+                        if (!io.github.artcraftandroid.procraft.generation.GenerationUi.animateFrame(vm, context)) {
+                            vm.showNotice("Keep the Pixel animation workflow first", warning = true)
+                        }
+                    }.padding(start = 16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("Animate with AI…", color = Pc.PanelTitle, fontSize = 17.sp)
+                }
+            }
+        }
+        asking?.let { was ->
+            var name by remember { mutableStateOf(was.ifEmpty { "walk" }) }
+            androidx.compose.material3.AlertDialog(
+                onDismissRequest = { asking = null },
+                title = { Text(if (was.isEmpty()) "Name the animation" else "Rename the animation") },
+                text = {
+                    androidx.compose.material3.OutlinedTextField(
+                        name, { name = it.take(40) }, singleLine = true,
+                        placeholder = { Text("idle, walk, attack…") },
+                    )
+                },
+                confirmButton = {
+                    androidx.compose.material3.TextButton(
+                        enabled = name.isNotBlank(),
+                        onClick = {
+                            if (was.isEmpty()) vm.startAnimation(name) else vm.renameAnimation(name)
+                            asking = null
+                        },
+                    ) { Text(if (was.isEmpty()) "Start" else "Rename") }
+                },
+                dismissButton = { androidx.compose.material3.TextButton(onClick = { asking = null }) { Text("Cancel") } },
+            )
         }
     }
     // (a held place has neither)

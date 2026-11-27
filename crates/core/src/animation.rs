@@ -442,6 +442,7 @@ impl CanvasSession {
             foreground: s.foreground,
             holds: std::mem::take(&mut a.holds),
             pages: a.pages,
+            tags: std::mem::take(&mut a.tags),
         }
         .repaired();
         if let Some(c) = st.canvas.as_mut() {

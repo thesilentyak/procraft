@@ -2271,8 +2271,9 @@ impl CanvasSession {
 
     /// `frames` pictures stacked top to bottom in `pixels` (premultiplied, `area`'s size each)
     /// added as frames, one undo step: Animation Assist turned on if it's off, a new top-level
-    /// layer each just above the current frame (at the top when there is none), in order, named
-    /// "<name> 1", "<name> 2"…; the first is made current. Returns its id; none without room.
+    /// layer each after the animation holding the current frame (at the top when there is none),
+    /// in order, named "<name> 1", "<name> 2"…, an animation named after the move starting at the
+    /// first, which is made current. Returns its id; none without room.
     pub(crate) fn add_generated_frames(&self, area: IRect, pixels: &[u8], frames: u32, name: &str) -> Option<u64> {
         let count = usize::try_from(frames).ok()?;
         let ids = self.change("generate", |d| {
@@ -2282,9 +2283,13 @@ impl CanvasSession {
             if d.animation.is_none() {
                 d.animation = Some(procraft_engine::animation::Animation::starting(false, d.pixel_art));
             }
-            // above the current frame, out of any group
+            // after the animation holding the current frame (else the current frame), out of any
+            // group: an animation already there stays whole
             let all = procraft_engine::animation::frames(d);
             let under = procraft_engine::animation::current_frame(d)
+                .map(|i| {
+                    procraft_engine::animation::animation_of(d, i).map_or(i, |(_, r)| r.end.saturating_sub(1).max(i))
+                })
                 .and_then(|i| all.get(i).copied())
                 .or_else(|| d.members(None).last().copied());
             if let Some(under) = under {
@@ -2298,6 +2303,11 @@ impl CanvasSession {
             }
             if let Some(&first) = ids.first() {
                 d.set_current(first);
+                // an animation of their own, named after the move
+                let move_name = name.strip_prefix("Generated · ").unwrap_or(name);
+                if let Some(a) = d.animation.as_mut() {
+                    a.set_tag(first, move_name);
+                }
             }
             Some(ids)
         })?;
@@ -2731,13 +2741,16 @@ mod tests {
         assert_eq!(info.frames.len(), 3);
         assert_eq!(info.thumbnail, info.frames[0]);
 
-        // two frames there, the first current: the three go between them, in order
+        // "idle" and "jump" there, idle's frame current: the three go after idle, before jump, in
+        // order, an animation of their own
         let first = s.layers().iter().find(|l| l.current).map(|l| l.id).unwrap();
         let second = s.add_layer();
+        assert!(s.set_animation_assist(true));
+        assert!(s.start_animation(first, "idle".into()) && s.start_animation(second, "jump".into()));
         s.select_layer(first);
         let applied = generation.apply_result(&s, 5).unwrap();
         let doc = s.shared.lock().doc.clone();
-        assert!(doc.animation.as_ref().is_some_and(|a| a.fps == 15), "Animation Assist turned on");
+        assert!(doc.animation.as_ref().is_some_and(|a| a.fps == 15), "Animation Assist on");
         let order: Vec<u64> = doc.members(None).iter().map(|l| l.0).collect();
         assert_eq!(order.len(), 5);
         assert_eq!((order[0], order[4]), (first, second));
@@ -2745,6 +2758,9 @@ mod tests {
         let names: Vec<String> = order[1..4].iter().map(|id| doc.layer(LayerId(*id)).unwrap().name.clone()).collect();
         assert_eq!(names, ["Walk 1", "Walk 2", "Walk 3"]);
         assert_eq!(doc.current().0, applied);
+        let animations: Vec<(String, u32, u32)> =
+            s.animation_names().into_iter().map(|n| (n.name, n.first, n.count)).collect();
+        assert_eq!(animations, [("idle".into(), 0, 1), ("Walk".into(), 1, 3), ("jump".into(), 4, 1)]);
         let shown = composite(&s);
         assert_eq!(at(&shown, 16, 2, 5)[0], 255, "the first new frame shows");
     }

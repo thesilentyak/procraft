@@ -43,7 +43,21 @@ pub struct Animation {
     pub holds: Vec<(LayerId, u32)>,
     /// Page Assist: the frames are pages, one shown at a time (no onion skins, no playing).
     pub pages: bool,
+    /// Animations by name (Aseprite's tags): each starts at its frame and runs to the next one's,
+    /// or to the last frame that plays.
+    pub tags: Vec<Tag>,
 }
+
+/// A named animation among the frames: "idle", "walk".
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Tag {
+    pub name: String,
+    /// The frame (top-level layer or group) it starts at.
+    pub from: LayerId,
+}
+
+/// The most characters an animation's name keeps.
+pub const MOST_TAG_NAME: usize = 40;
 
 impl Default for Animation {
     fn default() -> Animation {
@@ -59,6 +73,7 @@ impl Default for Animation {
             foreground: false,
             holds: Vec::new(),
             pages: false,
+            tags: Vec::new(),
         }
     }
 }
@@ -83,7 +98,23 @@ impl Animation {
         self.before = unit(self.before);
         self.after = unit(self.after);
         self.holds.retain(|(_, n)| *n > 0);
+        // one name a frame, none empty
+        let mut seen = std::collections::HashSet::new();
+        self.tags.retain(|t| !t.name.trim().is_empty() && seen.insert(t.from));
         self
+    }
+
+    /// Starts an animation named `name` at frame `from` (renaming the one there).
+    pub fn set_tag(&mut self, from: LayerId, name: &str) {
+        let name: String = name.trim().chars().take(MOST_TAG_NAME).collect();
+        self.tags.retain(|t| t.from != from);
+        if !name.is_empty() {
+            self.tags.push(Tag { name, from });
+        }
+    }
+
+    pub fn remove_tag(&mut self, from: LayerId) {
+        self.tags.retain(|t| t.from != from);
     }
 
     /// How many more frames the frame of `id` is held.
@@ -125,6 +156,37 @@ pub fn played(a: Option<&Animation>, count: usize) -> std::ops::Range<usize> {
     let foreground = a.foreground && !a.pages && count > 1;
     let end = count - usize::from(foreground);
     start..end.max(start)
+}
+
+/// The frames that play split into their animations, in order, each its name (none for frames
+/// before the first named one) and its frames as indices into [`frames`]. Without names, one
+/// unnamed animation of every frame that plays.
+pub fn animations(doc: &Document) -> Vec<(Option<String>, std::ops::Range<usize>)> {
+    let all = frames(doc);
+    let range = played(doc.animation.as_ref(), all.len());
+    let mut starts: Vec<(usize, String)> = doc
+        .animation
+        .iter()
+        .flat_map(|a| &a.tags)
+        .filter_map(|t| all.iter().position(|f| *f == t.from).map(|i| (i, t.name.clone())))
+        .filter(|(i, _)| range.contains(i))
+        .collect();
+    starts.sort_by_key(|(i, _)| *i);
+    let mut out = Vec::new();
+    let first = starts.first().map_or(range.end, |(i, _)| *i);
+    if first > range.start {
+        out.push((None, range.start..first));
+    }
+    for (k, (i, name)) in starts.iter().enumerate() {
+        let end = starts.get(k + 1).map_or(range.end, |(n, _)| *n);
+        out.push((Some(name.clone()), *i..end));
+    }
+    out
+}
+
+/// The animation holding frame `index` (of [`frames`]): its place in [`animations`].
+pub fn animation_of(doc: &Document, index: usize) -> Option<(Option<String>, std::ops::Range<usize>)> {
+    animations(doc).into_iter().find(|(_, r)| r.contains(&index))
 }
 
 /// The frame holding the current layer.
