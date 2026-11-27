@@ -943,6 +943,9 @@ pub(crate) struct State {
     pub(crate) display_lut: Option<((usize, procraft_engine::profile::Profile), procraft_gpu::DisplayLut)>,
     /// While a colour selection's threshold is dragged: the selection before it, and the layer read once.
     selection_before: Option<Option<procraft_engine::selection::Mask>>,
+    /// While a pixel art canvas's freehand path is drawn: the selection before it (the path's
+    /// pixels are shown joined to it, kept only when the path closes).
+    pixel_freehand_before: Option<Option<procraft_engine::selection::Mask>>,
     colour_source: Option<selection::ColourSource>,
     /// An adjustment is open on the current layer, and what it last drew.
     adjusting: bool,
@@ -2365,6 +2368,7 @@ impl CanvasSession {
             selection_display: selection::SelectionDisplay::Stripes,
             display_lut: None,
             selection_before: None,
+            pixel_freehand_before: None,
             colour_source: None,
             feather_base: None,
             feather_edge: false,

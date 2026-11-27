@@ -179,6 +179,32 @@ pub(crate) struct PixelStroke {
     wrote: bool,
 }
 
+impl State {
+    /// On a pixel art canvas, a selection being drawn (a freehand path so far, or a rectangle or
+    /// ellipse being dragged: canvas points, closed back to the start) shown as the pixels it
+    /// takes, joined to the selection there was before it as `join` says: shown, not kept (no
+    /// step), until it is let go or closed. False on other canvases.
+    pub(crate) fn pixel_freehand_preview(&mut self, path: &[(f32, f32)], join: crate::SelectionJoin) -> bool {
+        if !self.doc.pixel_art || path.len() < 3 {
+            return false;
+        }
+        let points: Vec<Vec2> = path.iter().map(|&(x, y)| Vec2::new(x, y)).collect();
+        let shape = procraft_engine::selection::Mask::polygon(self.doc.width(), self.doc.height(), &points);
+        let before = self.pixel_freehand_before.get_or_insert_with(|| self.selection.clone()).clone();
+        self.selection = before;
+        self.join(shape, join, false);
+        true
+    }
+
+    /// A pixel art selection's preview taken back: the selection as it was before it was drawn.
+    pub(crate) fn pixel_freehand_end(&mut self) {
+        if let Some(before) = self.pixel_freehand_before.take() {
+            self.selection = before;
+            self.show_selection();
+        }
+    }
+}
+
 /// Points round an ellipse a pixel art selection's outline goes through.
 const ELLIPSE_POINTS: usize = 96;
 
@@ -406,6 +432,25 @@ mod tests {
         // (1.3, 1.4) to (5.6, 3.6): pixels 1 to 5 across, 1 to 3 down
         let at = |x: usize, y: usize| selection.data[y * 16 + x];
         assert_eq!((at(1, 1), at(5, 3), at(0, 1), at(6, 1), at(1, 4)), (255, 255, 0, 0, 0));
+    }
+
+    #[test]
+    fn a_freehand_path_shows_its_pixels_until_it_closes() {
+        let s = CanvasSession::new(16, 16);
+        assert!(s.make_pixel_art());
+        let mut st = s.shared.lock();
+        // a triangle drawn so far: its pixels shown, all or nothing
+        let path = [(1.0, 1.0), (10.0, 1.0), (1.0, 10.0)];
+        assert!(st.pixel_freehand_preview(&path, crate::SelectionJoin::Add));
+        let shown = st.selection.clone().expect("shown");
+        assert!(shown.data.iter().all(|&v| v == 0 || v == 255));
+        assert_eq!(shown.data[2 * 16 + 2], 255);
+        // drawn on: shown from the selection before the path, not piled up
+        assert!(st.pixel_freehand_preview(&[(1.0, 1.0), (4.0, 1.0), (1.0, 4.0)], crate::SelectionJoin::Add));
+        assert_eq!(st.selection.as_ref().map(|m| m.data[16 + 8]), Some(0));
+        // taken back: as before the path
+        st.pixel_freehand_end();
+        assert!(st.selection.is_none());
     }
 
     #[test]

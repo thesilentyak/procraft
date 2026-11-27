@@ -886,6 +886,32 @@ fn as_finger(kind: PointerKind, settings: &TouchSettings) -> bool {
 }
 
 impl CanvasSession {
+    /// On a pixel art canvas, the rectangle (or ellipse) between window points `a` and `b` shown as
+    /// the pixels it takes, joined to the selection before it as `join` says, until it is let go.
+    pub(crate) fn show_pixel_box(&self, ellipse: bool, a: (f32, f32), b: (f32, f32), join: crate::SelectionJoin) {
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        let (a, b) = (procraft_engine::geom::Vec2::new(a.0, a.1), procraft_engine::geom::Vec2::new(b.0, b.1));
+        let Some(points) = st.pixel_box(ellipse, a, b) else { return };
+        let path: Vec<(f32, f32)> = points.iter().map(|p| (p.x, p.y)).collect();
+        if st.pixel_freehand_preview(&path, join) {
+            self.shared.frame(st);
+        }
+    }
+
+    /// The freehand path as it now is, shown as the pixels it takes on a pixel art canvas.
+    pub(crate) fn show_pixel_freehand(&self) {
+        let (path, join) = {
+            let t = self.touches();
+            (t.freehand.clone(), t.selecting.map_or(crate::SelectionJoin::Add, |s| s.join))
+        };
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        if st.pixel_freehand_preview(&path, join) {
+            self.shared.frame(st);
+        }
+    }
+
     fn touches(&self) -> std::sync::MutexGuard<'_, Touches> {
         self.shared.touches.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -1126,6 +1152,8 @@ impl CanvasSession {
         if closing {
             let mut guard = self.shared.lock();
             let st = &mut *guard;
+            // a pixel art freehand path left open shows nothing now
+            st.pixel_freehand_end();
             if !st.selection_outlines.is_empty() {
                 st.selection_outlines.clear();
                 self.shared.frame(st);
@@ -1196,6 +1224,8 @@ impl CanvasSession {
             let mut t = self.touches();
             (std::mem::take(&mut t.freehand), t.selecting.map_or(crate::SelectionJoin::Add, |s| s.join))
         };
+        // the pixels it showed as it was drawn go: the selection is made from before it, one step
+        self.shared.lock().pixel_freehand_end();
         if path.len() < 3 {
             return;
         }
@@ -2781,13 +2811,17 @@ impl CanvasSession {
         match how.kind {
             SelectKind::Rectangle | SelectKind::Ellipse => {
                 drop(t);
+                let ellipse = how.kind == SelectKind::Ellipse;
                 if done {
+                    // what a pixel art canvas showed as it was dragged goes: made from before it
+                    self.shared.lock().pixel_freehand_end();
                     if dist(at, start) >= 1.0 {
-                        let ellipse = how.kind == SelectKind::Ellipse;
                         self.select_shape(ellipse, start.0, start.1, at.0, at.1, how.join);
                     }
                     out.push(TouchCommand::SelectionChanged);
                 } else if moved {
+                    // a pixel art canvas shows the pixels it takes as it is dragged
+                    self.show_pixel_box(ellipse, start, at, how.join);
                     out.push(TouchCommand::SelectionDrag { x0: start.0, y0: start.1, x1: at.0, y1: at.1 });
                 }
             }
@@ -2821,6 +2855,8 @@ impl CanvasSession {
                         out.push(TouchCommand::SelectionChanged);
                     } else if let Some(p) = to_canvas {
                         t.freehand.push(p);
+                        drop(t);
+                        self.show_pixel_freehand();
                     }
                     out.push(TouchCommand::FreehandChanged);
                 } else if moved && to_window.is_none_or(|w| dist((w.x, w.y), at) >= FREEHAND_STEP * scale) {
@@ -2833,6 +2869,9 @@ impl CanvasSession {
                     if let Some(p) = to_canvas {
                         t.freehand.push(p);
                     }
+                    drop(t);
+                    // a pixel art canvas shows the pixels the path takes as it goes
+                    self.show_pixel_freehand();
                     out.push(TouchCommand::FreehandChanged);
                 }
             }

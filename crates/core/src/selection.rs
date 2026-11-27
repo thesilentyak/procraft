@@ -51,7 +51,7 @@ pub(crate) struct ColourSource {
 
 impl State {
     /// Shows the selection on the canvas (or none when nothing is selected).
-    fn show_selection(&mut self) {
+    pub(crate) fn show_selection(&mut self) {
         let mask = self.selection.as_ref().filter(|m| !m.is_empty());
         if let (Some(canvas), Some(gpu)) = (self.canvas.as_mut(), self.gpu.as_ref()) {
             canvas.set_selection(gpu, mask.map(|m| m.data.as_slice()));
