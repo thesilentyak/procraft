@@ -307,7 +307,7 @@ impl Generation {
         if !prompt.trim().is_empty() {
             crate::generation_tags::remember(&prompt);
         }
-        let colours = canvas.colours;
+        let (colours, reference) = (canvas.colours, canvas.reference);
         let request = WorkflowRequest {
             workflow,
             params,
@@ -322,7 +322,7 @@ impl Generation {
         };
         let id =
             self.start_run(session, area, mask, name, canvas.from_srgb, move |worker| worker.submit_workflow(request))?;
-        self.keep_run_colours(session, colours);
+        self.keep_run_reference(session, colours, reference);
         Ok(id)
     }
 }

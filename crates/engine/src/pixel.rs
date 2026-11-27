@@ -368,6 +368,59 @@ pub fn snap_to(rgba: &mut [u8], colours: &[[u8; 3]]) {
     }
 }
 
+/// How far apart two straight-alpha pixels look, 0 to 255: clear against clear is 0, clear
+/// against solid 255, otherwise their weighted colour difference.
+fn apart(a: [u8; 4], b: [u8; 4]) -> u32 {
+    match (a[3] >= 128, b[3] >= 128) {
+        (false, false) => 0,
+        (true, true) => {
+            let [dr, dg, db] =
+                [(a[0], b[0]), (a[1], b[1]), (a[2], b[2])].map(|(x, y)| (i32::from(x) - i32::from(y)).unsigned_abs());
+            let sum = 2 * dr * dr + 4 * dg * dg + 3 * db * db;
+            ((f64::from(sum) / 9.0).sqrt()) as u32
+        }
+        _ => 255,
+    }
+}
+
+/// How little a pixel and all eight around it may change for a frame to keep the reference's.
+pub const STEADY_WITHIN: u32 = 24;
+
+/// Steadies an animation frame against the picture it was made from (both straight-alpha RGBA,
+/// `width × height`): wherever a pixel and every pixel around it barely changed, the reference's
+/// pixels are put back, so the parts that don't move stay exactly as drawn and only the moving
+/// parts come from the frame. Returns how many pixels were put back.
+pub fn steady(frame: &mut [u8], reference: &[u8], width: u32, height: u32) -> usize {
+    let (w, h) = (width as usize, height as usize);
+    if frame.len() != w * h * 4 || reference.len() != frame.len() {
+        return 0;
+    }
+    let pixel = |rgba: &[u8], i: usize| -> [u8; 4] {
+        rgba.get(i * 4..i * 4 + 4).and_then(|p| p.try_into().ok()).unwrap_or([0; 4])
+    };
+    let changed: Vec<u32> = (0..w * h).map(|i| apart(pixel(frame, i), pixel(reference, i))).collect();
+    let mut put_back = 0;
+    for y in 0..h {
+        for x in 0..w {
+            let around = (y.saturating_sub(1)..(y + 2).min(h))
+                .flat_map(|ny| (x.saturating_sub(1)..(x + 2).min(w)).map(move |nx| ny * w + nx))
+                .map(|i| changed.get(i).copied().unwrap_or(255))
+                .max()
+                .unwrap_or(255);
+            if around < STEADY_WITHIN {
+                let i = y * w + x;
+                let r = pixel(reference, i);
+                let back = if r[3] >= 128 { [r[0], r[1], r[2], 255] } else { [0; 4] };
+                if let Some(px) = frame.get_mut(i * 4..i * 4 + 4) {
+                    px.copy_from_slice(&back);
+                    put_back += 1;
+                }
+            }
+        }
+    }
+    put_back
+}
+
 /// The colour of `colours` nearest `c`.
 fn nearest(c: [u8; 3], colours: &[[u8; 3]]) -> [u8; 3] {
     let distance = |o: &[u8; 3]| {
@@ -537,5 +590,25 @@ mod tests {
         let mut same = [9, 9, 9, 255];
         snap_to(&mut same, &[]);
         assert_eq!(same, [9, 9, 9, 255]);
+    }
+
+    #[test]
+    fn a_frame_keeps_the_reference_where_it_barely_changed_and_its_own_where_it_moved() {
+        // a 5 × 1 row: the reference grey, the frame a shade off on the left, red on the right
+        let grey = [100u8, 100, 100, 255];
+        let reference: Vec<u8> = grey.repeat(5);
+        let mut frame: Vec<u8> =
+            [[104, 98, 101, 255], [104, 98, 101, 255], [104, 98, 101, 255], [220, 0, 0, 255], [220, 0, 0, 255]]
+                .concat();
+        assert_eq!(steady(&mut frame, &reference, 5, 1), 2);
+        assert_eq!(&frame[..8], &[grey, grey].concat()[..]);
+        // the third pixel is next to the red: it keeps its own
+        assert_eq!(&frame[8..12], &[104, 98, 101, 255]);
+        assert_eq!(&frame[12..], &[[220, 0, 0, 255], [220, 0, 0, 255]].concat()[..]);
+        // clear stays clear; a size mismatch changes nothing
+        let mut clear = [0u8; 4];
+        assert_eq!(steady(&mut clear, &[5, 5, 5, 0], 1, 1), 1);
+        assert_eq!(clear, [0; 4]);
+        assert_eq!(steady(&mut clear, &[0; 8], 2, 1), 0);
     }
 }

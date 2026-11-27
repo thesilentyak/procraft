@@ -62,10 +62,16 @@ Made by `dev/starters/make_starters.py` with the others, from the workflow tried
   `generation/` folder; its thumbnail PNG stacks the frames' thumbnails the same way. The index
   keeps `frames` (missing: 1), so older indexes read as before.
 - **The reference's colours**: on a pixel art canvas a run keeps the colours of the picture it
-  sent (its opaque pixels, if 256 colours or fewer). An animation's frames are snapped to them as
+  sent (its opaque pixels, if 4 096 colours or fewer). An animation's frames are snapped to them as
   they're kept: every pixel either transparent (alpha under half) or the nearest of those colours,
   fully opaque. So the frames are in exactly the sprite's colours, whatever palette the snapper
   chose, and can be drawn over with them.
+- **Steadied**: the run keeps the picture it sent too, and wherever a frame's pixel and the eight
+  around it barely changed from it (a weighted colour difference under 24 of 255), the sprite's
+  own pixels are put back. The parts that don't move stay exactly as drawn, with no shimmer or
+  soft speckle from the video; only the moving parts come from the video. (Tried on a 128 × 128
+  goblin: 91 to 99% of each frame came back as drawn; checking only the pixel itself, without its
+  neighbours, pasted ghosts of the balloon's old outline back.)
 - **`ResultInfo.frames`**: the frames' thumbnails (empty for a picture), for the tray to play.
 - **Shown**: the overlay shows its first frame.
 
@@ -125,5 +131,9 @@ pictures sent; later); the sheet and the named animation the frames make (parts 
   are stored, saved or read, beyond a count).
 - 2026-11-26: frames snapped to the reference picture's own colours, not the palette strip: the
   strip may hold a starting palette the sprite doesn't use.
+- 2026-11-27: frames steadied against the sprite and snapped to its colours up to 4 096 of them
+  (the user saw soft, fuzzy frames from a 268-colour RD Flow goblin on a 128 canvas: the snapping
+  had been skipped over 256 colours, and the video's softness spans pixels when the blow-up is
+  only ×6).
 - 2026-11-26: the workflow sees the sprite on white; a sprite that is mostly white may lose parts
   where it touches the edge (said in the starter's note; a colour choice can come if it's needed).

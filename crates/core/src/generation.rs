@@ -485,6 +485,9 @@ struct Running {
     /// On a pixel art canvas, the colours of the picture it was sent: an animation's frames are
     /// put on them.
     colours: Option<Vec<[u8; 3]>>,
+    /// On a pixel art canvas, the picture it was sent (straight RGBA, the canvas's size): an
+    /// animation's frames keep its pixels where they barely changed.
+    reference: Option<Arc<Picture>>,
 }
 
 /// What a trace run makes: the kind of lines, and the control layer they go into.
@@ -574,18 +577,35 @@ impl Generation {
         }
         artwork.from_srgb = from_srgb;
         let id = submit(&self.worker);
-        artwork.running =
-            Some(Running { id, area, mask, name, taken: 0, previews: 0, preview: None, extract: None, colours: None });
+        artwork.running = Some(Running {
+            id,
+            area,
+            mask,
+            name,
+            taken: 0,
+            previews: 0,
+            preview: None,
+            extract: None,
+            colours: None,
+            reference: None,
+        });
         artwork.error = None;
         Ok(id)
     }
 }
 
 impl Generation {
-    /// The colours the run going was sent (a pixel art canvas's), for its animations' frames.
-    pub(crate) fn keep_run_colours(&self, session: &CanvasSession, colours: Option<Vec<[u8; 3]>>) {
+    /// The colours and the picture the run going was sent (a pixel art canvas's), for its
+    /// animations' frames.
+    pub(crate) fn keep_run_reference(
+        &self,
+        session: &CanvasSession,
+        colours: Option<Vec<[u8; 3]>>,
+        reference: Option<Picture>,
+    ) {
         if let Some(running) = self.artwork_of(session).running.as_mut() {
             running.colours = colours;
+            running.reference = reference.map(Arc::new);
         }
     }
 }
@@ -596,8 +616,10 @@ pub(crate) struct WorkflowCanvas {
     pub(crate) picture: Picture,
     pub(crate) selection: Option<Vec<u8>>,
     pub(crate) from_srgb: Option<Lut>,
-    /// On a pixel art canvas, the picture's colours (if it has 256 or fewer).
+    /// On a pixel art canvas, the picture's colours (if it has a few thousand or fewer).
     pub(crate) colours: Option<Vec<[u8; 3]>>,
+    /// On a pixel art canvas, the picture as it was before it was laid on white.
+    pub(crate) reference: Option<Picture>,
 }
 
 impl CanvasSession {
@@ -610,16 +632,17 @@ impl CanvasSession {
         let mut picture = canvas
             .picture
             .ok_or_else(|| GenerationError::Canvas { reason: "the canvas isn't drawn yet".to_owned() })?;
-        let colours = if pixel_art {
-            let colours = procraft_engine::pixel::colours_of(&picture.rgba, procraft_engine::pixel::MOST_COLOURS);
+        let (colours, reference) = if pixel_art {
+            let colours = procraft_engine::pixel::colours_of(&picture.rgba, MOST_SNAPPED_COLOURS);
+            let reference = picture.clone();
             on_white(&mut picture.rgba);
-            colours
+            (colours, Some(reference))
         } else {
-            None
+            (None, None)
         };
         let whole = IRect::from_size(canvas.width, canvas.height);
         let selection = current_selection(self).map(|s| crate::layer_ops::mask_part(&s.mask, whole));
-        Ok(WorkflowCanvas { picture, selection, from_srgb: canvas.from_srgb, colours })
+        Ok(WorkflowCanvas { picture, selection, from_srgb: canvas.from_srgb, colours, reference })
     }
 
     /// Layer `id` over the whole canvas, in sRGB (straight RGBA); none if it has no pixels yet.
@@ -648,6 +671,9 @@ impl CanvasSession {
         Picture::new(whole.width(), whole.height(), rgba).map(Some).map_err(|e| unreadable(e.to_string()))
     }
 }
+
+/// The most colours a pixel art picture may have for an animation's frames to be put on them.
+const MOST_SNAPPED_COLOURS: usize = 4096;
 
 /// A straight-alpha RGBA picture laid over white, solid.
 fn on_white(rgba: &mut [u8]) {
@@ -957,8 +983,18 @@ impl Generation {
         crate::generation_tags::remember(&request.prompt);
         let name = layer_name(&request.prompt);
         let id = self.worker.submit(request);
-        artwork.running =
-            Some(Running { id, area, mask, name, taken: 0, previews: 0, preview: None, extract: None, colours: None });
+        artwork.running = Some(Running {
+            id,
+            area,
+            mask,
+            name,
+            taken: 0,
+            previews: 0,
+            preview: None,
+            extract: None,
+            colours: None,
+            reference: None,
+        });
         artwork.error = None;
         Ok(id)
     }
@@ -1041,6 +1077,7 @@ impl Generation {
             preview: None,
             extract: Some(Extracting { kind, layer }),
             colours: None,
+            reference: None,
         });
         artwork.error = None;
         Ok(id)
@@ -1970,9 +2007,18 @@ fn keep(id: u64, result: &procraft_diffusion::RunResult, run: &Running, from_srg
         result.picture.resized(area.width(), area.height()).ok()?
     };
     let mut picture = picture;
-    // an animation's frames on the colours of the picture it was made from
-    if let (Some(colours), Some(true)) = (&run.colours, result.place.as_ref().map(|p| p.animation)) {
-        procraft_engine::pixel::snap_to(&mut picture.rgba, colours);
+    // an animation's frames on the colours of the picture it was made from, and that picture's
+    // own pixels kept wherever they barely changed
+    if result.place.as_ref().is_some_and(|p| p.animation) {
+        if let Some(colours) = &run.colours {
+            procraft_engine::pixel::snap_to(&mut picture.rgba, colours);
+        }
+        if let Some(reference) = run.reference.as_deref()
+            && (reference.width, reference.height) == (picture.width, picture.height)
+            && (area.x0, area.y0) == (0, 0)
+        {
+            procraft_engine::pixel::steady(&mut picture.rgba, &reference.rgba, picture.width, picture.height);
+        }
     }
     let thumbnail = thumbnail(&picture)?;
     let mut pixels = picture.rgba;
@@ -2569,6 +2615,7 @@ mod tests {
             preview: None,
             extract: None,
             colours: None,
+            reference: None,
         };
         let picture = Picture::new(width, height, [255u8, 0, 0, 255].repeat((width * height) as usize)).unwrap();
         let result = procraft_diffusion::RunResult { seed: 1, picture, generated: (width, height), place: None };
@@ -2637,6 +2684,7 @@ mod tests {
             preview: None,
             extract: None,
             colours: Some(vec![[255, 0, 0], [0, 0, 255]]),
+            reference: None,
         }
     }
 
@@ -2699,6 +2747,21 @@ mod tests {
         assert_eq!(doc.current().0, applied);
         let shown = composite(&s);
         assert_eq!(at(&shown, 16, 2, 5)[0], 255, "the first new frame shows");
+    }
+
+    #[test]
+    fn an_animation_s_frames_keep_the_sprite_s_pixels_where_they_barely_moved() {
+        // the sprite: a dark red left half, clear on the right
+        let rgba: Vec<u8> = (0..16 * 16).flat_map(|i| if i % 16 < 8 { [250, 5, 5, 255] } else { [0; 4] }).collect();
+        let mut run = animation_run(16);
+        run.colours = Some(vec![[250, 5, 5], [0, 0, 255]]);
+        run.reference = Some(Arc::new(Picture::new(16, 16, rgba).unwrap()));
+        let kept = keep(1, &animation_frame(0, 16), &run, None).unwrap();
+        let pixels = kept.pixels.unwrap();
+        // the left half barely changed: the sprite's own pixels; next to the blue that moved in, and
+        // the blue itself, the frame's
+        assert_eq!(at(&pixels, 16, 2, 5), [250, 5, 5, 255]);
+        assert_eq!(at(&pixels, 16, 12, 5), [0, 0, 255, 255]);
     }
 
     #[test]
