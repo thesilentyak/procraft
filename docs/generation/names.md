@@ -93,3 +93,4 @@ when something gets a name, and change it here first when a name changes.
 | **Animation** (named) | A run of frames with a name, from Frame options or an import; a coloured band on the strip. | "Start Animation Here…" |
 | **Insert a sprite sheet** | Actions › Add: a sheet picture from anywhere read into clean, lined-up frames as a named animation. | "Insert a sprite sheet" |
 | **Import sheet** (docs only) | Its window: the sheet with each frame boxed, the frames playing, Name, and Not right? (Grid, Background). | "Import 8 frames" |
+| **In-between with AI** | Frame options: fills the middle frames between this frame and the next using MiniMax H3 First & Last Frame. | "In-between with AI…" |

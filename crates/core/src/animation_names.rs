@@ -177,4 +177,80 @@ impl CanvasSession {
         self.shared.frame(st);
         ids.first().map(|id| id.0)
     }
+
+    /// Inserts `frames` new frames holding `pixels` (each `area`'s size, stacked down,
+    /// premultiplied RGBA) right after the top-level frame holding `after` (or the current frame
+    /// if `after` is gone), staying inside the same named animation, as one undo step called
+    /// `step`. Animation Assist turns on if it's off; the first new frame becomes current. None
+    /// (nothing changed) without room for the layers or with `area` off the canvas; else the first
+    /// new frame's id.
+    #[cfg(feature = "generation")]
+    pub(crate) fn insert_inbetween_frames(
+        &self,
+        step: &str,
+        area: IRect,
+        pixels: &[u8],
+        frames: u32,
+        after: u64,
+        layer_name: &str,
+    ) -> Option<u64> {
+        let count = usize::try_from(frames).ok()?;
+        let size = (area.width() as usize).checked_mul(area.height() as usize)?.checked_mul(4)?;
+        if count == 0 || pixels.len() != size.checked_mul(count)? {
+            return None;
+        }
+        let ids = self.change(step, |d| {
+            if !d.has_room(count) || area.intersect(IRect::from_size(d.width(), d.height())) != area {
+                return None;
+            }
+            if d.animation.is_none() {
+                d.animation = Some(animation::Animation::starting(false, d.pixel_art));
+            }
+            let under = top_level_frame(d, LayerId(after))
+                .or_else(|| {
+                    let all = animation::frames(d);
+                    animation::current_frame(d).and_then(|i| all.get(i).copied())
+                })
+                .or_else(|| d.members(None).last().copied());
+            if let Some(under) = under {
+                d.set_current(under);
+            }
+            let mut ids = Vec::with_capacity(count);
+            for k in 1..=count {
+                let id = d.add_layer();
+                d.rename(id, &format!("{layer_name} {k}"));
+                ids.push(id);
+            }
+            if let Some(&first) = ids.first() {
+                d.set_current(first);
+            }
+            Some(ids)
+        })?;
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        if let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) {
+            for (k, id) in ids.iter().enumerate() {
+                let part = pixels.get(k * size..(k + 1) * size)?;
+                canvas.upload_layer_part(gpu, *id, area, part).ok()?;
+            }
+            canvas.set_play_frame(None);
+            canvas.invalidate();
+        }
+        st.revision += 1;
+        self.shared.frame(st);
+        ids.first().map(|id| id.0)
+    }
+}
+
+/// The top-level layer or group holding `id`, if `id` is still in `doc`.
+#[cfg(feature = "generation")]
+fn top_level_frame(doc: &procraft_engine::document::Document, mut id: LayerId) -> Option<LayerId> {
+    doc.layer(id)?;
+    for _ in 0..64 {
+        match doc.group_of(id) {
+            Some(g) => id = g,
+            None => return Some(id),
+        }
+    }
+    Some(id)
 }

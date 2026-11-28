@@ -387,6 +387,8 @@ struct Kept {
     /// How many frames it holds: 1 for a picture; an animation's frames are stacked top to bottom
     /// in its pixels and its thumbnail, each the area's size (the thumbnail's, a thumbnail's).
     frames: u32,
+    /// For an in-between animation, the First frame's layer id to insert the middle frames after.
+    insert_after: Option<u64>,
 }
 
 /// What the results' index keeps of one result, oldest first.
@@ -406,6 +408,9 @@ struct SavedResult {
     /// How many frames it holds (missing in older indexes: one).
     #[serde(default = "one_frame", skip_serializing_if = "is_one_frame")]
     frames: u32,
+    /// The frame an in-between animation inserts its middle frames after; none for other results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    insert_after: Option<u64>,
 }
 
 fn one_frame() -> u32 {
@@ -437,6 +442,7 @@ struct WriteResult {
     pixels: Option<Arc<Vec<u8>>>,
     thumbnail: ThumbnailImage,
     frames: u32,
+    insert_after: Option<u64>,
 }
 
 /// A save finished on the background thread: where, and which results' PNGs are now written.
@@ -488,6 +494,11 @@ struct Running {
     /// On a pixel art canvas, the picture it was sent (straight RGBA, the canvas's size): an
     /// animation's frames keep its pixels where they barely changed.
     reference: Option<Arc<Picture>>,
+    /// On a pixel art canvas, an in-between run's Last frame (straight RGBA, the canvas's size):
+    /// steadying keeps pixels still across both First and Last.
+    reference_end: Option<Arc<Picture>>,
+    /// For an in-between animation, the First frame's layer id to insert the middle frames after.
+    insert_after: Option<u64>,
 }
 
 /// What a trace run makes: the kind of lines, and the control layer they go into.
@@ -588,6 +599,8 @@ impl Generation {
             extract: None,
             colours: None,
             reference: None,
+            reference_end: None,
+            insert_after: None,
         });
         artwork.error = None;
         Ok(id)
@@ -595,17 +608,21 @@ impl Generation {
 }
 
 impl Generation {
-    /// The colours and the picture the run going was sent (a pixel art canvas's), for its
-    /// animations' frames.
+    /// The colours, reference frame(s) and in-between target kept for the run going (a pixel art
+    /// canvas's animations and any in-between workflow).
     pub(crate) fn keep_run_reference(
         &self,
         session: &CanvasSession,
         colours: Option<Vec<[u8; 3]>>,
         reference: Option<Picture>,
+        reference_end: Option<Picture>,
+        insert_after: Option<u64>,
     ) {
         if let Some(running) = self.artwork_of(session).running.as_mut() {
             running.colours = colours;
             running.reference = reference.map(Arc::new);
+            running.reference_end = reference_end.map(Arc::new);
+            running.insert_after = insert_after;
         }
     }
 }
@@ -645,8 +662,27 @@ impl CanvasSession {
         Ok(WorkflowCanvas { picture, selection, from_srgb: canvas.from_srgb, colours, reference })
     }
 
-    /// Layer `id` over the whole canvas, in sRGB (straight RGBA); none if it has no pixels yet.
+    /// Layer or group `id` over the whole canvas, in sRGB (straight RGBA); none if it has no
+    /// pixels yet. A group is composited on the GPU as its frame renders.
     pub(crate) fn layer_picture(&self, id: u64) -> Result<Option<Picture>, GenerationError> {
+        let group_info = {
+            let st = self.shared.lock();
+            let Some(layer) = st.doc.layer(LayerId(id)) else { return Ok(None) };
+            (
+                layer.kind == procraft_engine::document::LayerKind::Group,
+                st.doc.pixel_art || !st.doc.background_visible,
+                srgb_tables(&st.doc).map(|(to, _)| to),
+            )
+        };
+        if group_info.0 {
+            let (w, h, mut rgba) = self
+                .render_frame(LayerId(id), group_info.1, 0)
+                .map_err(|e| GenerationError::Canvas { reason: e.to_string() })?;
+            if let Some(lut) = &group_info.2 {
+                lut.apply_rgba(&mut rgba, false);
+            }
+            return Picture::new(w, h, rgba).map(Some).map_err(|e| GenerationError::Canvas { reason: e.to_string() });
+        }
         let mut guard = self.shared.lock_finished();
         let st = &mut *guard;
         st.finish_stroke();
@@ -673,10 +709,10 @@ impl CanvasSession {
 }
 
 /// The most colours a pixel art picture may have for an animation's frames to be put on them.
-const MOST_SNAPPED_COLOURS: usize = 4096;
+pub(crate) const MOST_SNAPPED_COLOURS: usize = 4096;
 
 /// A straight-alpha RGBA picture laid over white, solid.
-fn on_white(rgba: &mut [u8]) {
+pub(crate) fn on_white(rgba: &mut [u8]) {
     for px in rgba.as_chunks_mut::<4>().0 {
         let a = u16::from(px[3]);
         for c in px.iter_mut().take(3) {
@@ -994,6 +1030,8 @@ impl Generation {
             extract: None,
             colours: None,
             reference: None,
+            reference_end: None,
+            insert_after: None,
         });
         artwork.error = None;
         Ok(id)
@@ -1078,6 +1116,8 @@ impl Generation {
             extract: Some(Extracting { kind, layer }),
             colours: None,
             reference: None,
+            reference_end: None,
+            insert_after: None,
         });
         artwork.error = None;
         Ok(id)
@@ -1225,10 +1265,15 @@ impl Generation {
             release_hidden_pixels(&mut artwork);
         }
         let pixels = self.pixels_for(&mut artwork, result)?;
-        let (area, name, frames) =
-            artwork.results.iter().find(|k| k.id == result).map(|k| (k.area, k.name.clone(), k.frames))?;
+        let (area, name, frames, insert_after) = artwork
+            .results
+            .iter()
+            .find(|k| k.id == result)
+            .map(|k| (k.area, k.name.clone(), k.frames, k.insert_after))?;
         session.set_overlay(None);
-        let layer = if frames > 1 {
+        let layer = if let Some(after) = insert_after {
+            session.insert_inbetween_frames("in-between", area, pixels.as_slice(), frames, after, &name)
+        } else if frames > 1 {
             session.add_generated_frames(area, pixels.as_slice(), frames, &name)
         } else {
             session.add_generated(area, pixels.as_slice(), &name)
@@ -1512,6 +1557,7 @@ impl Generation {
                     pixels: kept.pixels.as_ref().map(Arc::clone),
                     thumbnail: kept.thumbnail.clone(),
                     frames: kept.frames.max(1),
+                    insert_after: kept.insert_after,
                 }
             })
             .collect();
@@ -1663,6 +1709,7 @@ fn write_results(folder: &Path, results: &[WriteResult]) -> Vec<u64> {
             scaled_from: result.scaled_from,
             thumbnail: [thumb_width, thumb_height],
             frames: result.frames.max(1),
+            insert_after: result.insert_after,
         });
     }
     let text = match serde_json::to_vec(&ResultsIndex { version: RESULTS_VERSION, results: index }) {
@@ -1724,6 +1771,7 @@ fn load_results(folder: &Path) -> FoundResults {
             scaled_from: [from_width, from_height],
             thumbnail: [thumb_width, thumb_height],
             frames,
+            insert_after,
         } = saved;
         let frames = frames.max(1);
         next = next.max(id);
@@ -1760,6 +1808,7 @@ fn load_results(folder: &Path) -> FoundResults {
             scaled_from: (from_width, from_height),
             saved: true,
             frames,
+            insert_after,
         });
     }
     if results.len() > KEPT_RESULTS {
@@ -2008,7 +2057,8 @@ fn keep(id: u64, result: &procraft_diffusion::RunResult, run: &Running, from_srg
     };
     let mut picture = picture;
     // an animation's frames on the colours of the picture it was made from, and that picture's
-    // own pixels kept wherever they barely changed
+    // own pixels kept wherever they barely changed (for in-betweens, only where First and Last
+    // agree)
     if result.place.as_ref().is_some_and(|p| p.animation) {
         if let Some(colours) = &run.colours {
             procraft_engine::pixel::snap_to(&mut picture.rgba, colours);
@@ -2017,7 +2067,20 @@ fn keep(id: u64, result: &procraft_diffusion::RunResult, run: &Running, from_srg
             && (reference.width, reference.height) == (picture.width, picture.height)
             && (area.x0, area.y0) == (0, 0)
         {
-            procraft_engine::pixel::steady(&mut picture.rgba, &reference.rgba, picture.width, picture.height);
+            match run.reference_end.as_deref() {
+                Some(end) if (end.width, end.height) == (picture.width, picture.height) => {
+                    procraft_engine::pixel::steady_between(
+                        &mut picture.rgba,
+                        &reference.rgba,
+                        &end.rgba,
+                        picture.width,
+                        picture.height,
+                    );
+                }
+                _ => {
+                    procraft_engine::pixel::steady(&mut picture.rgba, &reference.rgba, picture.width, picture.height);
+                }
+            }
         }
     }
     let thumbnail = thumbnail(&picture)?;
@@ -2049,6 +2112,7 @@ fn keep(id: u64, result: &procraft_diffusion::RunResult, run: &Running, from_srg
         scaled_from,
         saved: false,
         frames: 1,
+        insert_after: run.insert_after,
     })
 }
 
@@ -2580,6 +2644,8 @@ mod tests {
             extract: None,
             colours: None,
             reference: None,
+            reference_end: None,
+            insert_after: None,
         };
         let picture = Picture::new(width, height, [255u8, 0, 0, 255].repeat((width * height) as usize)).unwrap();
         let result = procraft_diffusion::RunResult { seed: 1, picture, generated: (width, height), place: None };
@@ -2613,6 +2679,7 @@ mod tests {
             scaled_from: (0, 0),
             saved: false,
             frames: 1,
+            insert_after: None,
         };
         generation.artwork_of(&s).results.push(kept);
         generation.show_result(&s, Some(1));
@@ -2649,6 +2716,8 @@ mod tests {
             extract: None,
             colours: Some(vec![[255, 0, 0], [0, 0, 255]]),
             reference: None,
+            reference_end: None,
+            insert_after: None,
         }
     }
 
@@ -2720,6 +2789,34 @@ mod tests {
     }
 
     #[test]
+    fn an_inbetween_result_inserts_between_first_and_last_in_the_same_animation() {
+        let Some(s) = session(16) else { return };
+        let generation = Generation::new(settings());
+        let first = s.layers().iter().find(|l| l.current).map(|l| l.id).unwrap();
+        let last = s.add_layer();
+        assert!(s.set_animation_assist(true));
+        assert!(s.start_animation(first, "leap".into()));
+        let frames: Vec<_> = (0..2).map(|k| animation_frame(k, 16)).collect();
+        let mut run = animation_run(16);
+        run.insert_after = Some(first);
+        let kept = keep_animation(9, &frames.iter().collect::<Vec<_>>(), &run, None).unwrap();
+        assert_eq!(kept.insert_after, Some(first));
+        generation.artwork_of(&s).results.push(kept);
+        let applied = generation.apply_result(&s, 9).unwrap();
+        let doc = s.shared.lock().doc.clone();
+        let order: Vec<u64> = doc.members(None).iter().map(|l| l.0).collect();
+        assert_eq!(order.len(), 4);
+        assert_eq!((order[0], order[1], order[3]), (first, applied, last));
+        // stays inside the same "leap" animation (4 frames total), no new tag created
+        let animations: Vec<(String, u32, u32)> =
+            s.animation_names().into_iter().map(|n| (n.name, n.first, n.count)).collect();
+        assert_eq!(animations, [("leap".into(), 0, 4)]);
+        // one undo takes both middle frames back
+        assert!(s.undo().is_some());
+        assert_eq!(s.shared.lock().doc.members(None).len(), 2);
+    }
+
+    #[test]
     fn an_animation_s_frames_keep_the_sprite_s_pixels_where_they_barely_moved() {
         // the sprite: a dark red left half, clear on the right
         let rgba: Vec<u8> = (0..16 * 16).flat_map(|i| if i % 16 < 8 { [250, 5, 5, 255] } else { [0; 4] }).collect();
@@ -2748,6 +2845,7 @@ mod tests {
             pixels: kept.pixels.clone(),
             thumbnail: kept.thumbnail.clone(),
             frames: 3,
+            insert_after: kept.insert_after,
         };
         assert_eq!(write_results(&folder, &[write]), vec![4]);
         let found = load_results(&folder);
@@ -2827,6 +2925,7 @@ mod tests {
             scaled_from: (side / 2, side / 2),
             saved: false,
             frames: 1,
+            insert_after: None,
         }
     }
 
@@ -3076,6 +3175,7 @@ mod tests {
                 scaled_from: [side / 2, side / 2],
                 thumbnail: [kept.thumbnail.width, kept.thumbnail.height],
                 frames: 1,
+                insert_after: None,
             }],
         };
         fs::write(dir.join(RESULTS_INDEX), serde_json::to_vec(&index).unwrap()).unwrap();

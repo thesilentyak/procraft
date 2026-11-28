@@ -391,14 +391,28 @@ pub const STEADY_WITHIN: u32 = 24;
 /// pixels are put back, so the parts that don't move stay exactly as drawn and only the moving
 /// parts come from the frame. Returns how many pixels were put back.
 pub fn steady(frame: &mut [u8], reference: &[u8], width: u32, height: u32) -> usize {
+    steady_between(frame, reference, reference, width, height)
+}
+
+/// Steadies an in-between animation frame against its `first` and `last` key frames (all
+/// straight-alpha RGBA, `width × height`): wherever a pixel and all eight around it barely changed
+/// between `first` and `last` and barely changed in `frame`, `first`'s pixel is put back, so parts
+/// that stayed still stay crisp while moving parts transition freely. Returns how many pixels were
+/// put back.
+pub fn steady_between(frame: &mut [u8], first: &[u8], last: &[u8], width: u32, height: u32) -> usize {
     let (w, h) = (width as usize, height as usize);
-    if frame.len() != w * h * 4 || reference.len() != frame.len() {
+    if frame.len() != w * h * 4 || first.len() != frame.len() || last.len() != frame.len() {
         return 0;
     }
     let pixel = |rgba: &[u8], i: usize| -> [u8; 4] {
         rgba.get(i * 4..i * 4 + 4).and_then(|p| p.try_into().ok()).unwrap_or([0; 4])
     };
-    let changed: Vec<u32> = (0..w * h).map(|i| apart(pixel(frame, i), pixel(reference, i))).collect();
+    let changed: Vec<u32> = (0..w * h)
+        .map(|i| {
+            let f = pixel(first, i);
+            apart(pixel(frame, i), f).max(apart(f, pixel(last, i)))
+        })
+        .collect();
     let mut put_back = 0;
     for y in 0..h {
         for x in 0..w {
@@ -409,7 +423,7 @@ pub fn steady(frame: &mut [u8], reference: &[u8], width: u32, height: u32) -> us
                 .unwrap_or(255);
             if around < STEADY_WITHIN {
                 let i = y * w + x;
-                let r = pixel(reference, i);
+                let r = pixel(first, i);
                 let back = if r[3] >= 128 { [r[0], r[1], r[2], 255] } else { [0; 4] };
                 if let Some(px) = frame.get_mut(i * 4..i * 4 + 4) {
                     px.copy_from_slice(&back);
@@ -610,5 +624,20 @@ mod tests {
         assert_eq!(steady(&mut clear, &[5, 5, 5, 0], 1, 1), 1);
         assert_eq!(clear, [0; 4]);
         assert_eq!(steady(&mut clear, &[0; 8], 2, 1), 0);
+    }
+
+    #[test]
+    fn steady_between_keeps_shared_still_pixels_and_leaves_moving_ones() {
+        // 5 × 1: left two pixels are grey in both first and last; right two move to blue in last
+        let grey = [100u8, 100, 100, 255];
+        let blue = [0u8, 80, 220, 255];
+        let first: Vec<u8> = grey.repeat(5);
+        let last: Vec<u8> = [grey, grey, grey, blue, blue].concat();
+        let off = [104u8, 98, 101, 255];
+        let mut frame: Vec<u8> = off.repeat(5);
+        // only pixels 0 and 1 have a still 3×3 neighbourhood across first and last
+        assert_eq!(steady_between(&mut frame, &first, &last, 5, 1), 2);
+        assert_eq!(&frame[..8], &[grey, grey].concat()[..]);
+        assert_eq!(&frame[8..], &[off, off, off].concat()[..]);
     }
 }

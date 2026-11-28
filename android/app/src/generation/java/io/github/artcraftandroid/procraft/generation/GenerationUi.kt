@@ -334,13 +334,45 @@ object GenerationUi {
 
     /**
      * The frame strip's Animate with AI…: the current frame to the workflow card that makes
-     * animations (a kept one first, else the live one), Generate opened on it. False without one.
+     * loop animations (a kept one first, else the live one), Generate opened on it. False without one.
      */
     fun animateFrame(vm: CanvasViewModel, context: android.content.Context): Boolean {
         val g = generation ?: return false
-        val cards = g.workflowCards().filter { it.animates && it.reason == null }
+        val cards = g.workflowCards().filter { it.animates && !it.inbetweens && it.reason == null }
         val card = cards.firstOrNull { !it.live } ?: cards.firstOrNull() ?: return false
         Workflows.choose(context, card.id)
+        view = View.FORM
+        vm.frameOptionsOpen = false
+        if (vm.panel != Panel.GENERATE) vm.toggle(Panel.GENERATE)
+        return true
+    }
+
+    /**
+     * The frame strip's In-between with AI…: the current frame and the next frame to the workflow
+     * card that makes in-betweens (preferring a pixel-art card on a pixel art canvas, a kept one
+     * first, else the live one), Generate opened on it. False without one or a next frame.
+     */
+    fun inbetweenFrame(vm: CanvasViewModel, context: android.content.Context): Boolean {
+        val g = generation ?: return false
+        val index = vm.currentFrame ?: return false
+        val first = vm.animationFrames.getOrNull(index) ?: return false
+        val last = vm.animationFrames.getOrNull(index + 1) ?: return false
+        val cards = g.workflowCards().filter { it.inbetweens && it.reason == null }
+        val pixel = vm.session?.isPixelArt() == true
+        val preferred = cards.filter { it.name.contains("pixel", ignoreCase = true) == pixel }
+        val pool = preferred.ifEmpty { cards }
+        val card = pool.firstOrNull { !it.live } ?: pool.firstOrNull() ?: return false
+        Workflows.choose(context, card.id)
+        val imageParams = g.workflowParameters(card.id).filter { it.kind == io.github.artcraftandroid.procraft.core.ParameterKind.IMAGE_LAYER }
+        val firstName = imageParams.firstOrNull { it.name.trim().equals("first frame", true) }?.name
+            ?: imageParams.getOrNull(0)?.name
+        val lastName = imageParams.firstOrNull { it.name.trim().equals("last frame", true) }?.name
+            ?: imageParams.getOrNull(1)?.name
+        val prefill = buildMap {
+            if (firstName != null) put(firstName, first.toString())
+            if (lastName != null) put(lastName, last.toString())
+        }
+        Workflows.prefill(context, g, card.id, prefill)
         view = View.FORM
         vm.frameOptionsOpen = false
         if (vm.panel != Panel.GENERATE) vm.toggle(Panel.GENERATE)
@@ -351,6 +383,7 @@ object GenerationUi {
     fun leave(vm: CanvasViewModel) {
         val s = vm.session ?: return
         generation?.leave(s)
+        Workflows.clearLayers()
         state = GenerationState(null, emptyList(), null, null)
         tuck()
         wasRunning = false

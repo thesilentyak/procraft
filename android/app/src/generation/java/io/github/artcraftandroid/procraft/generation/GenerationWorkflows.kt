@@ -122,6 +122,24 @@ internal object Workflows {
         prefs(context).edit().putString("workflow", id).apply()
     }
 
+    /** Pre-fills layer pickers (e.g. First frame / Last frame) for workflow `id`. */
+    fun prefill(context: Context, g: Generation, id: String, layers: Map<String, String>) {
+        valuesFor = id
+        values.clear()
+        val p = prefs(context)
+        for (param in g.workflowParameters(id)) {
+            if (param.kind == ParameterKind.IMAGE_LAYER || param.kind == ParameterKind.MASK_LAYER) continue
+            p.getString("wf:$id:${param.name}", null)?.let { values[param.name] = it }
+        }
+        values.putAll(layers)
+    }
+
+    /** Drops any layer picks kept in memory when leaving an artwork. */
+    fun clearLayers() {
+        valuesFor = null
+        values.clear()
+    }
+
     /** Why the chosen workflow can't run; none when it can (or none is chosen). */
     fun reason(g: Generation): String? {
         val id = chosen ?: return null
@@ -232,23 +250,28 @@ internal object Workflows {
             valuesFor = id
             values.clear()
             val p = prefs(context)
-            for (param in params) p.getString("wf:$id:${param.name}", null)?.let { values[param.name] = it }
+            for (param in params) {
+                if (param.kind == ParameterKind.IMAGE_LAYER || param.kind == ParameterKind.MASK_LAYER) continue
+                p.getString("wf:$id:${param.name}", null)?.let { values[param.name] = it }
+            }
         }
-        fun set(name: String, value: String) {
-            values[name] = value
-            prefs(context).edit().putString("wf:$id:$name", value).apply()
+        fun set(param: ParameterInfo, value: String) {
+            values[param.name] = value
+            if (param.kind != ParameterKind.IMAGE_LAYER && param.kind != ParameterKind.MASK_LAYER) {
+                prefs(context).edit().putString("wf:$id:${param.name}", value).apply()
+            }
         }
         val prompt = params.firstOrNull { it.kind == ParameterKind.PROMPT }
         val inView = params.filter { it.inView && it != prompt }
         val folded = params.filter { !it.inView }
-        for (p in inView) ParamRow(vm, p, values[p.name] ?: p.default) { set(p.name, it) }
+        for (p in inView) ParamRow(vm, p, values[p.name] ?: p.default) { set(p, it) }
         if (folded.isNotEmpty()) {
             Row(Modifier.padding(start = 18.dp, end = 18.dp, top = 12.dp, bottom = 6.dp).tap { moreOpen = !moreOpen }, verticalAlignment = Alignment.CenterVertically) {
                 Text("MORE", color = Dim, fontSize = 12.sp, fontWeight = FontWeight.Medium)
                 Text(if (moreOpen) "  ⌃" else "  ⌄", color = Dim, fontSize = 13.sp)
             }
             if (moreOpen) {
-                for (p in folded) ParamRow(vm, p, values[p.name] ?: p.default) { set(p.name, it) }
+                for (p in folded) ParamRow(vm, p, values[p.name] ?: p.default) { set(p, it) }
                 Text("Back to defaults", color = Pc.Accent, fontSize = 14.sp, modifier = Modifier.padding(start = 18.dp, top = 8.dp, bottom = 4.dp).tap {
                     val edit = prefs(context).edit()
                     for (p in params) edit.remove("wf:$id:${p.name}")
@@ -323,25 +346,48 @@ internal object Workflows {
         }
     }
 
-    /** A layer picker: the layer named like the row, else the current one, until another is picked. */
+    /** A layer picker: frames when animating, else layers; First/Last frame default to current/next. */
     @Composable
     private fun LayerPicker(vm: CanvasViewModel, p: ParameterInfo, value: String, set: (String) -> Unit) {
         var open by remember { mutableStateOf(false) }
         val layers = vm.session?.layers() ?: emptyList()
-        val picked = value.toULongOrNull()?.let { id -> layers.firstOrNull { it.id == id } }
-        val shown = picked?.name ?: (layers.firstOrNull { it.name.trim().equals(p.name.trim(), true) } ?: layers.firstOrNull { it.current })?.name ?: "No layer"
+        val animating = vm.animation != null && vm.animation?.pages != true && vm.animationFrames.isNotEmpty()
+        val items: List<Pair<ULong, String>> = if (animating && p.kind == ParameterKind.IMAGE_LAYER) {
+            val byId = layers.associateBy { it.id }
+            vm.animationFrames.mapIndexed { i, id ->
+                val label = byId[id]?.name?.takeIf { it.isNotBlank() }
+                id to if (label != null) "Frame ${i + 1} · $label" else "Frame ${i + 1}"
+            }
+        } else {
+            layers.map { it.id to it.name }
+        }
+        val picked = value.toULongOrNull()?.let { id -> items.firstOrNull { it.first == id } }
+        val defaultItem = if (animating) {
+            val idx = vm.currentFrame
+            when {
+                idx != null && p.name.trim().equals("first frame", true) -> items.getOrNull(idx)
+                idx != null && p.name.trim().equals("last frame", true) -> items.getOrNull(idx + 1) ?: items.getOrNull(idx)
+                else -> null
+            }
+        } else {
+            null
+        }
+        val fallback = defaultItem
+            ?: items.firstOrNull { it.second.trim().equals(p.name.trim(), true) }
+            ?: layers.firstOrNull { it.current }?.let { c -> items.firstOrNull { it.first == c.id } ?: (c.id to c.name) }
+        val shown = (picked ?: fallback)?.second ?: "No layer"
         Box {
             Row(Modifier.padding(horizontal = 16.dp, vertical = 4.dp).fillMaxWidth().height(44.dp).clip(RoundedCornerShape(12.dp)).background(RowFill).tap { open = true }.padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text(p.name, color = Ink, fontSize = 14.sp, maxLines = 1, modifier = Modifier.weight(1f))
                 Text(shown, color = Dim, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.width(170.dp), textAlign = androidx.compose.ui.text.style.TextAlign.End)
                 Text("  ›", color = Dim, fontSize = 16.sp)
             }
-            // picked by place, not by name: two layers may share a name ("Layer 1"), told apart in the list
-            val labels = layers.mapIndexed { k, l ->
-                val same = layers.count { it.name == l.name }
-                if (same > 1) "${l.name} (${layers.take(k + 1).count { it.name == l.name }})" else l.name
+            // picked by place, not by name: duplicate layer names are told apart in the list
+            val labels = items.mapIndexed { k, (_, name) ->
+                val same = items.count { it.second == name }
+                if (same > 1) "$name (${items.take(k + 1).count { it.second == name }})" else name
             }
-            if (open) Options(labels, onDismiss = { open = false }) { k -> layers.getOrNull(k)?.let { set(it.id.toString()) }; open = false }
+            if (open) Options(labels, onDismiss = { open = false }) { k -> items.getOrNull(k)?.let { set(it.first.toString()) }; open = false }
         }
     }
 

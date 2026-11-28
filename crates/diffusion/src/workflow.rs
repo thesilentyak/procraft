@@ -158,6 +158,12 @@ impl Workflow {
             .any(|n| self.graph.inputs(n).and_then(|i| text_input(i, "batch_mode")).as_deref() == Some("animation"))
     }
 
+    /// Whether this animation workflow takes image layer inputs (First and Last frame
+    /// in-betweening).
+    pub fn inbetweens(&self) -> bool {
+        self.animates() && !self.graph.nodes_of(IMAGE_LAYER).is_empty()
+    }
+
     /// Whether `info` (the server's `/object_info`) describes every node this workflow uses.
     pub fn described_by(&self, info: &Map<String, Value>) -> bool {
         self.graph.classes().all(|class| info.contains_key(class))
@@ -824,6 +830,42 @@ mod tests {
         assert_eq!(prepared.outputs.len(), 1);
         assert_eq!(prepared.outputs[0].name, "", "the frames are named after the move");
         assert!(w.animates());
+        assert!(!w.inbetweens());
+        assert!(prepared.outputs[0].animation);
+    }
+
+    #[test]
+    fn the_inbetween_starters_read_and_prepare() {
+        let pixel = Workflow::parse("In-between", include_str!("../tests/workflows/pixel-inbetween.json")).unwrap();
+        assert!(pixel.animates());
+        assert!(pixel.inbetweens());
+        let params = pixel.parameters(&Map::new());
+        let names: Vec<_> = params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["First frame", "Frames", "Last frame", "Prompt", "Seconds"]);
+        assert_eq!(params[0].kind, ParamKind::ImageLayer);
+        assert_eq!(params[1].kind, ParamKind::Number { min: Some(1.0), max: Some(20.0), integer: true });
+        assert_eq!(params[2].kind, ParamKind::ImageLayer);
+        assert_eq!(params[4].kind, ParamKind::Number { min: Some(0.9), max: Some(5.0), integer: false });
+        let mut run = inputs(&[("Prompt", ParamValue::Text("leaps upward".into()))]);
+        run.layers.insert("First frame".into(), picture(64, 48));
+        run.layers.insert("Last frame".into(), picture(64, 48));
+        let prepared = pixel.prepare(&params, &run, &Map::new()).unwrap();
+        assert_eq!(prepared.graph.nodes_of("ETN_LoadImageBase64").len(), 3);
+        assert_eq!(input(&prepared, "SpriteFusionPixelSnapper", "exact_width"), 64);
+        assert_eq!(input(&prepared, "SpriteFusionPixelSnapper", "exact_height"), 48);
+        assert_eq!(prepared.outputs.len(), 1);
+        assert!(prepared.outputs[0].animation);
+
+        let painted = Workflow::parse("In-between", include_str!("../tests/workflows/inbetween.json")).unwrap();
+        assert!(painted.animates());
+        assert!(painted.inbetweens());
+        let params = painted.parameters(&Map::new());
+        let names: Vec<_> = params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["First frame", "Frames", "Last frame", "Prompt", "Seconds"]);
+        let prepared = painted.prepare(&params, &run, &Map::new()).unwrap();
+        assert_eq!(prepared.graph.nodes_of("ETN_LoadImageBase64").len(), 3);
+        assert!(prepared.graph.nodes_of("SpriteFusionPixelSnapper").is_empty());
+        assert_eq!(prepared.outputs.len(), 1);
         assert!(prepared.outputs[0].animation);
     }
 

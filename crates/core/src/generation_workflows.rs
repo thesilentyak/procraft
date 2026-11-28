@@ -53,6 +53,10 @@ pub struct WorkflowCard {
     /// strip's Animate with AI… picks it.
     #[uniffi(default = false)]
     pub animates: bool,
+    /// It sends an animation's frames and takes image layer inputs (First and Last frame
+    /// in-betweening): the frame strip's In-between with AI… picks it.
+    #[uniffi(default = false)]
+    pub inbetweens: bool,
 }
 
 /// Which control a parameter gets.
@@ -143,7 +147,15 @@ impl From<&Param> for ParameterInfo {
             (ParamKind::Choice(list), true) => list.first().cloned().unwrap_or_default(),
             _ => p.default.clone(),
         };
-        ParameterInfo { name: p.name.clone(), kind, default, min, max, choices, in_view: kind == ParameterKind::Prompt }
+        ParameterInfo {
+            name: p.name.clone(),
+            kind,
+            default,
+            min,
+            max,
+            choices,
+            in_view: matches!(kind, ParameterKind::Prompt | ParameterKind::ImageLayer | ParameterKind::MaskLayer),
+        }
     }
 }
 
@@ -187,6 +199,7 @@ impl Generation {
         if server.address.is_some() {
             let live = self.live_workflow(&server);
             let animates = matches!(&live, Some(Ok(w)) if w.animates());
+            let inbetweens = matches!(&live, Some(Ok(w)) if w.inbetweens());
             let reason = match live {
                 Some(Ok(_)) => None,
                 Some(Err(e)) => Some(e.to_string()),
@@ -202,6 +215,7 @@ impl Generation {
                 live: true,
                 reason,
                 animates,
+                inbetweens,
             });
         }
         let mut files = self.workflows.files.lock().clone();
@@ -209,6 +223,7 @@ impl Generation {
         for file in files {
             let parsed = Workflow::parse(&card_name(&file.name), &file.text);
             let animates = parsed.as_ref().is_ok_and(Workflow::animates);
+            let inbetweens = parsed.as_ref().is_ok_and(Workflow::inbetweens);
             let reason = parsed.err().map(|e| e.to_string());
             cards.push(WorkflowCard {
                 id: format!("{FILE_PREFIX}{}", file.name),
@@ -216,6 +231,7 @@ impl Generation {
                 live: false,
                 reason,
                 animates,
+                inbetweens,
             });
         }
         cards
@@ -268,9 +284,14 @@ impl Generation {
             .workflow_by_id(&server, &run.workflow)
             .map_err(|e| GenerationError::NotReady { reason: e.to_string() })?;
         let params = workflow.parameters(&server.node_info);
+        let pixel_art = session.shared.lock().doc.pixel_art;
+        let is_animation = workflow.animates();
+        let is_inbetween = workflow.inbetweens();
         let canvas = session.workflow_canvas()?;
         let mut values = BTreeMap::new();
         let mut layers = BTreeMap::new();
+        let mut raw_layers = BTreeMap::new();
+        let mut picked_ids = BTreeMap::new();
         for value in &run.values {
             match value {
                 ParameterValue::Text { name, value } => {
@@ -284,12 +305,20 @@ impl Generation {
                 }
                 ParameterValue::Layer { name, layer } => {
                     if let Some(picture) = session.layer_picture(*layer)? {
-                        layers.insert(name.clone(), picture);
+                        picked_ids.insert(name.clone(), *layer);
+                        raw_layers.insert(name.clone(), picture.clone());
+                        let mut sent = picture;
+                        let is_image = params.iter().any(|p| p.name == *name && p.kind == ParamKind::ImageLayer);
+                        if is_animation && pixel_art && is_image {
+                            crate::generation::on_white(&mut sent.rgba);
+                        }
+                        layers.insert(name.clone(), sent);
                     }
                 }
             }
         }
-        // a layer picker left alone: the layer named like it, else the current layer
+        // a layer picker left alone: First/Last frame defaults, else the layer named like it or the
+        // current layer
         for param in params.iter().filter(|p| matches!(p.kind, ParamKind::ImageLayer | ParamKind::MaskLayer)) {
             if layers.contains_key(&param.name) {
                 continue;
@@ -297,7 +326,13 @@ impl Generation {
             if let Some(id) = default_layer(session, &param.name)
                 && let Some(picture) = session.layer_picture(id)?
             {
-                layers.insert(param.name.clone(), picture);
+                picked_ids.insert(param.name.clone(), id);
+                raw_layers.insert(param.name.clone(), picture.clone());
+                let mut sent = picture;
+                if is_animation && pixel_art && param.kind == ParamKind::ImageLayer {
+                    crate::generation::on_white(&mut sent.rgba);
+                }
+                layers.insert(param.name.clone(), sent);
             }
         }
         let prompt = params
@@ -322,7 +357,37 @@ impl Generation {
         if !prompt.trim().is_empty() {
             crate::generation_tags::remember(&prompt);
         }
-        let (colours, reference) = (canvas.colours, canvas.reference);
+        let (colours, reference, reference_end, insert_after) = if is_inbetween {
+            let image_params: Vec<&str> =
+                params.iter().filter(|p| p.kind == ParamKind::ImageLayer).map(|p| p.name.as_str()).collect();
+            let first_name = image_params
+                .iter()
+                .copied()
+                .find(|n| n.trim().eq_ignore_ascii_case("first frame"))
+                .or_else(|| image_params.first().copied());
+            let last_name = image_params
+                .iter()
+                .copied()
+                .find(|n| n.trim().eq_ignore_ascii_case("last frame"))
+                .or_else(|| image_params.get(1).copied());
+            let insert_after = first_name.and_then(|n| picked_ids.get(n).copied());
+            let first_raw = first_name.and_then(|n| raw_layers.get(n)).cloned();
+            let last_raw = last_name.and_then(|n| raw_layers.get(n)).cloned();
+            if pixel_art {
+                let colours = match (&first_raw, &last_raw) {
+                    (Some(a), Some(b)) => combined_colours(&a.rgba, &b.rgba, crate::generation::MOST_SNAPPED_COLOURS),
+                    (Some(a), None) => {
+                        procraft_engine::pixel::colours_of(&a.rgba, crate::generation::MOST_SNAPPED_COLOURS)
+                    }
+                    _ => canvas.colours,
+                };
+                (colours, first_raw, last_raw, insert_after)
+            } else {
+                (None, None, None, insert_after)
+            }
+        } else {
+            (canvas.colours, canvas.reference, None, None)
+        };
         let request = WorkflowRequest {
             workflow,
             params,
@@ -337,7 +402,7 @@ impl Generation {
         };
         let id =
             self.start_run(session, area, mask, name, canvas.from_srgb, move |worker| worker.submit_workflow(request))?;
-        self.keep_run_reference(session, colours, reference);
+        self.keep_run_reference(session, colours, reference, reference_end, insert_after);
         Ok(id)
     }
 }
@@ -371,16 +436,53 @@ impl Generation {
     }
 }
 
-/// The layer a picker named `name` takes when left alone: the top layer of that name (any case),
-/// else the current layer.
+/// The layer a picker named `name` takes when left alone: for "First frame" the current top-level
+/// frame, for "Last frame" the next frame after it (falling back to the current one), else the top
+/// layer of that name (any case) or the current layer.
 fn default_layer(session: &CanvasSession, name: &str) -> Option<u64> {
-    let layers = session.layers();
     let wanted = name.trim().to_lowercase();
+    if wanted == "first frame" || wanted == "last frame" {
+        let picked = {
+            let st = session.shared.lock();
+            let all = procraft_engine::animation::frames(&st.doc);
+            procraft_engine::animation::current_frame(&st.doc).and_then(|current| {
+                let pick = if wanted == "last frame" {
+                    all.get(current + 1).or_else(|| all.get(current))
+                } else {
+                    all.get(current)
+                };
+                pick.map(|id| id.0)
+            })
+        };
+        if picked.is_some() {
+            return picked;
+        }
+    }
+    let layers = session.layers();
     layers
         .iter()
         .find(|l| l.name.trim().to_lowercase() == wanted)
         .or_else(|| layers.iter().find(|l| l.current))
         .map(|l| l.id)
+}
+
+/// The unique solid colours across two straight-alpha RGBA pictures, up to `most`; none when
+/// there are none or more than `most`.
+fn combined_colours(first: &[u8], last: &[u8], most: usize) -> Option<Vec<[u8; 3]>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut colours = Vec::new();
+    for rgba in [first, last] {
+        for px in rgba.as_chunks::<4>().0 {
+            let [r, g, b, a] = *px;
+            if a >= 128 && seen.insert([r, g, b]) {
+                colours.push([r, g, b]);
+                if colours.len() > most {
+                    return None;
+                }
+            }
+        }
+    }
+    (!colours.is_empty()).then_some(colours)
 }
 
 /// The part of a canvas-wide mask in `[x, y, w, h]`.
@@ -459,5 +561,26 @@ mod tests {
     fn a_selection_is_cropped_to_the_area() {
         let mask: Vec<u8> = (0..16).collect();
         assert_eq!(crop(&mask, 4, [1, 1, 2, 2]), vec![5, 6, 9, 10]);
+    }
+
+    #[test]
+    fn combined_colours_keeps_both_frames_colours() {
+        let first = [255, 0, 0, 255, 0, 0, 0, 0];
+        let last = [255, 0, 0, 255, 255, 220, 0, 255];
+        assert_eq!(combined_colours(&first, &last, 16), Some(vec![[255, 0, 0], [255, 220, 0]]));
+        assert_eq!(combined_colours(&first, &last, 1), None);
+    }
+
+    #[test]
+    fn inbetween_cards_flag_inbetweens_and_show_layer_pickers_in_view() {
+        let g = generation();
+        let text = include_str!("../../diffusion/tests/workflows/pixel-inbetween.json");
+        g.set_workflow_files(vec![WorkflowFileText { name: "Pixel in-between.json".into(), text: text.into() }]);
+        let cards = g.workflow_cards();
+        assert_eq!(cards.len(), 1);
+        assert!(cards[0].animates && cards[0].inbetweens);
+        let params = g.workflow_parameters("file:Pixel in-between.json".into());
+        let in_view: Vec<&str> = params.iter().filter(|p| p.in_view).map(|p| p.name.as_str()).collect();
+        assert_eq!(in_view, vec!["First frame", "Last frame", "Prompt"]);
     }
 }

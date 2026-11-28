@@ -496,6 +496,20 @@ private fun ColumnScope.FrameOptionsPage(vm: CanvasViewModel) {
                 ) {
                     Text("Animate with AI…", color = Pc.PanelTitle, fontSize = 17.sp)
                 }
+                if (index < last) {
+                    RowLine()
+                    Row(
+                        Modifier.fillMaxWidth().height(44.dp).clickable {
+                            if (!io.github.artcraftandroid.procraft.generation.GenerationUi.inbetweenFrame(vm, context)) {
+                                val which = if (vm.session?.isPixelArt() == true) "Pixel in-between" else "In-between"
+                                vm.showNotice("Keep the $which workflow first", warning = true)
+                            }
+                        }.padding(start = 16.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text("In-between with AI…", color = Pc.PanelTitle, fontSize = 17.sp)
+                    }
+                }
             }
         }
         asking?.let { was ->
