@@ -203,7 +203,7 @@
     "inputs": {
       "output_mode": "exact_size",
       "output_scale": 1,
-      "transparency": "chroma_key",
+      "transparency": "connected_chroma_key",
       "key_color": "auto",
       "key_tolerance": 32,
       "cell_method": "majority",

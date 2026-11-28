@@ -40,6 +40,8 @@ pub struct SheetImport {
     shown: Option<TextureHandle>,
     frames: Vec<TextureHandle>,
     started: Instant,
+    /// The frames (by number, from 0) left out of the import: clicked off in the sheet.
+    skipped: Vec<u32>,
 }
 
 impl SheetImport {
@@ -70,6 +72,7 @@ impl SheetImport {
             shown: None,
             frames: Vec::new(),
             started: Instant::now(),
+            skipped: Vec::new(),
         })
     }
 
@@ -86,6 +89,7 @@ impl SheetImport {
             .map(|l| l.frames.iter().enumerate().map(|(k, f)| texture(&format!("sheet frame {k}"), f)).collect())
             .unwrap_or_default();
         self.started = Instant::now();
+        self.skipped.clear();
         self.read = true;
     }
 
@@ -142,7 +146,12 @@ impl SheetImport {
                             drawn.min + vec2(p.x as f32 * k, p.y as f32 * k),
                             vec2(p.width as f32 * k, p.height as f32 * k),
                         );
-                        ui.painter().rect_stroke(r, 0, Stroke::new(2.0, argb(pc::ACCENT)), egui::StrokeKind::Inside);
+                        let left_out = u32::try_from(n).is_ok_and(|n| self.skipped.contains(&n));
+                        if left_out {
+                            ui.painter().rect_filled(r, 0, Color32::from_black_alpha(176));
+                        }
+                        let edge = if left_out { Color32::GRAY } else { argb(pc::ACCENT) };
+                        ui.painter().rect_stroke(r, 0, Stroke::new(2.0, edge), egui::StrokeKind::Inside);
                         text(
                             ui.painter(),
                             r.min + vec2(4.0, 2.0),
@@ -154,6 +163,27 @@ impl SheetImport {
                         );
                     }
                     let click = ui.interact(drawn, ui.scope_id().with("sheet picture"), Sense::click());
+                    // not picking, a click on a frame leaves it out, or puts it back
+                    if !self.picking
+                        && click.clicked()
+                        && let Some(at) = click.interact_pointer_pos()
+                    {
+                        let (px, py) = ((at.x - drawn.left()) / k, (at.y - drawn.top()) / k);
+                        let hit = look.places.iter().position(|p| {
+                            px >= p.x as f32
+                                && px < (p.x + p.width) as f32
+                                && py >= p.y as f32
+                                && py < (p.y + p.height) as f32
+                        });
+                        if let Some(hit) = hit.and_then(|h| u32::try_from(h).ok()) {
+                            match self.skipped.iter().position(|&s| s == hit) {
+                                Some(i) => {
+                                    self.skipped.remove(i);
+                                }
+                                None => self.skipped.push(hit),
+                            }
+                        }
+                    }
                     if self.picking
                         && click.clicked()
                         && let Some(at) = click.interact_pointer_pos()
@@ -173,10 +203,17 @@ impl SheetImport {
                 // the frames, cleaned, playing at the artwork's speed
                 let play_box = Rect::from_min_max(pos2(sheet_box.right() + 14.0, y), pos2(right, y + SHEET[1]));
                 ui.painter().rect_filled(play_box, 8, argb(GROUP));
-                if let Some(look) = self.look.as_ref().filter(|_| !self.frames.is_empty()) {
+                let kept: Vec<&TextureHandle> = self
+                    .frames
+                    .iter()
+                    .enumerate()
+                    .filter(|(k, _)| u32::try_from(*k).is_ok_and(|k| !self.skipped.contains(&k)))
+                    .map(|(_, f)| f)
+                    .collect();
+                if let Some(look) = self.look.as_ref().filter(|_| !kept.is_empty()) {
                     let fps = look.fps.max(1) as f32;
-                    let at = (self.started.elapsed().as_secs_f32() * fps) as usize % self.frames.len();
-                    if let Some(frame) = self.frames.get(at) {
+                    let at = (self.started.elapsed().as_secs_f32() * fps) as usize % kept.len();
+                    if let Some(frame) = kept.get(at) {
                         let [w, h] = frame.size().map(|v| v.max(1) as f32);
                         let inner = play_box.shrink(12.0);
                         let k = (inner.width() / w).min(inner.height() / h);
@@ -204,13 +241,18 @@ impl SheetImport {
                 let said = match self.look.as_ref() {
                     None => "Nothing was found. Try Not right? below: set the grid, or pick the background.".to_owned(),
                     Some(look) => {
-                        let n = look.places.len();
+                        let n = look.places.len().saturating_sub(self.skipped.len());
                         let (w, h) = look.frames.first().map_or((0, 0), |f| (f.width, f.height));
                         let mut said = format!("{n} {}, {w} × {h}", if n == 1 { "frame" } else { "frames" });
+                        if !self.skipped.is_empty() {
+                            said += &format!(" ({} left out)", self.skipped.len());
+                        }
                         if look.pixel_size > 1.5 {
                             said += &format!(", drawn ×{:.1}", look.pixel_size);
                         }
-                        if look.grows {
+                        if look.too_big {
+                            said += ". Too big for a pixel art canvas (1024 a side at most).";
+                        } else if look.grows {
                             said += &format!(
                                 ". The canvas will grow to {} × {} to fit.",
                                 look.canvas_width, look.canvas_height
@@ -403,7 +445,11 @@ impl SheetImport {
                     y += 48.0;
                 }
                 // Cancel and Import
-                let n = self.look.as_ref().map_or(0, |l| l.places.len());
+                let n = self
+                    .look
+                    .as_ref()
+                    .filter(|l| !l.too_big)
+                    .map_or(0, |l| l.places.len().saturating_sub(self.skipped.len()));
                 let import = if n > 0 {
                     format!("Import {n} {}", if n == 1 { "frame" } else { "frames" })
                 } else {
@@ -435,7 +481,7 @@ impl SheetImport {
                     ended = Some(Ended::Cancelled);
                 }
                 if n > 0 && ui.interact(import_rect, ui.scope_id().with("sheet import"), Sense::click()).clicked() {
-                    ended = Some(match self.sheet.insert(session.clone(), self.name.clone()) {
+                    ended = Some(match self.sheet.insert(session.clone(), self.name.clone(), self.skipped.clone()) {
                         Some(done) => Ended::Added(done),
                         None => Ended::Failed,
                     });

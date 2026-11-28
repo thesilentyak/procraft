@@ -319,7 +319,7 @@ internal object Workflows {
                 Text(value.ifEmpty { p.choices.firstOrNull() ?: "" }, color = Dim, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.width(170.dp), textAlign = androidx.compose.ui.text.style.TextAlign.End)
                 Text("  ›", color = Dim, fontSize = 16.sp)
             }
-            if (open) Options(p.choices, onDismiss = { open = false }) { set(it); open = false }
+            if (open) Options(p.choices, onDismiss = { open = false }) { k -> p.choices.getOrNull(k)?.let(set); open = false }
         }
     }
 
@@ -336,17 +336,22 @@ internal object Workflows {
                 Text(shown, color = Dim, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.width(170.dp), textAlign = androidx.compose.ui.text.style.TextAlign.End)
                 Text("  ›", color = Dim, fontSize = 16.sp)
             }
-            if (open) Options(layers.map { it.name }, onDismiss = { open = false }) { name -> layers.firstOrNull { it.name == name }?.let { set(it.id.toString()) }; open = false }
+            // picked by place, not by name: two layers may share a name ("Layer 1"), told apart in the list
+            val labels = layers.mapIndexed { k, l ->
+                val same = layers.count { it.name == l.name }
+                if (same > 1) "${l.name} (${layers.take(k + 1).count { it.name == l.name }})" else l.name
+            }
+            if (open) Options(labels, onDismiss = { open = false }) { k -> layers.getOrNull(k)?.let { set(it.id.toString()) }; open = false }
         }
     }
 
     @Composable
-    private fun Options(options: List<String>, onDismiss: () -> Unit, pick: (String) -> Unit) {
+    private fun Options(options: List<String>, onDismiss: () -> Unit, pick: (Int) -> Unit) {
         val down = with(LocalDensity.current) { 50.dp.roundToPx() }
         androidx.compose.ui.window.Popup(offset = androidx.compose.ui.unit.IntOffset(0, down), onDismissRequest = onDismiss, properties = androidx.compose.ui.window.PopupProperties(focusable = true)) {
             Column(Modifier.width(260.dp).heightIn(max = 320.dp).clip(RoundedCornerShape(14.dp)).background(if (Pc.light) Color(0xF7FAFAFA) else Color(0xF7313135))
                 .verticalScroll(rememberScrollState())) {
-                for (o in options) Text(o, color = Ink, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.fillMaxWidth().tap { pick(o) }.padding(horizontal = 16.dp, vertical = 12.dp))
+                options.forEachIndexed { k, o -> Text(o, color = Ink, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.fillMaxWidth().tap { pick(k) }.padding(horizontal = 16.dp, vertical = 12.dp)) }
             }
         }
     }

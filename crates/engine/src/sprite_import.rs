@@ -114,7 +114,10 @@ pub fn read(rgba: &[u8], width: u32, height: u32, options: &Options) -> Option<S
     }
     let keep_cells = options.grid.is_some() && !real;
     let (fw, fh, mut lined) = if keep_cells { in_cells(&frames) } else { line_up(&frames) };
+    // Only a blown-up picture's frames are steadied: its redrawn shading flickers. A sheet of real
+    // pixels was drawn as it is, its small changes meant.
     if options.pixel_art
+        && real
         && let Some((first, rest)) = lined.split_first_mut()
     {
         for frame in rest {
@@ -1010,6 +1013,23 @@ mod tests {
         assert_eq!(read.places.len(), 3);
         assert_eq!(read.height, 10);
         assert_eq!(colours(&read), 4);
+    }
+
+    #[test]
+    fn a_sheet_of_real_pixels_keeps_its_small_changes() {
+        // the second sprite's shell a shade darker: a change steadying would take back
+        let (mut rgba, w, h) = sheet(2, 1, 1.0, [0, 0, 0, 0], false);
+        for (i, p) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            if i % w as usize >= 18 && p[..3] == SHELL {
+                p[0] -= 6;
+            }
+        }
+        let read = read(&rgba, w, h, &Options { pixel_art: true, ..Options::default() }).expect("a sheet");
+        assert_eq!(read.pixel_size, 1.0);
+        let shell = |f: &[u8]| f.as_chunks::<4>().0.iter().filter(|p| p[..3] == SHELL).count();
+        assert!(read.frames.first().is_some_and(|f| shell(f) > 0));
+        // the second frame's shell is all the darker shade still
+        assert_eq!(read.frames.get(1).map(|f| shell(f)), Some(0));
     }
 
     #[test]

@@ -1,11 +1,12 @@
 //! Insert a sprite sheet: a sheet picture from anywhere read into clean, lined-up frames (the
-//! engine's `sprite_import` does the reading) and added as a named animation, the canvas grown when
-//! the sprite is bigger than it (docs/pixel-art/05-sprite-import-design.md).
+//! engine's `sprite_import` does the reading) and added as a named animation standing on the current
+//! frame's feet line, the canvas grown when the frames don't fit
+//! (docs/pixel-art/05-sprite-import-design.md).
 
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use procraft_engine::animation::Animation;
+use procraft_engine::animation::{self, Animation};
 use procraft_engine::geom::IRect;
 use procraft_engine::sprite_import::{self, Options, Sheet};
 
@@ -47,6 +48,8 @@ pub struct SpriteSheetLook {
     pub canvas_height: u32,
     /// The canvas will grow to fit the sprite.
     pub grows: bool,
+    /// The sprite won't fit even grown: a pixel art canvas can't be more than 1024 a side.
+    pub too_big: bool,
 }
 
 /// What an import did.
@@ -101,7 +104,8 @@ impl SpriteSheetImport {
         };
         let p = &self.picture;
         let sheet = sprite_import::read(&p.rgba, p.width, p.height, &options)?;
-        let (canvas_width, canvas_height) = grown(canvas, (sheet.width, sheet.height));
+        let placed = placement(&session, (sheet.width, sheet.height));
+        let (canvas_width, canvas_height) = placed.as_ref().map_or(canvas, |p| p.size);
         let look = SpriteSheetLook {
             shown: shown(p),
             picture_width: p.width,
@@ -121,66 +125,112 @@ impl SpriteSheetImport {
             pixel_size: sheet.pixel_size,
             canvas_width,
             canvas_height,
-            grows: (canvas_width, canvas_height) != canvas,
+            grows: placed.as_ref().is_some_and(|p| p.grow_to.is_some()),
+            too_big: placed.is_none(),
         };
         *self.read.lock() = Some(sheet);
         Some(look)
     }
 
-    /// Adds the sheet as last read (read as it comes if not yet) to `session`'s artwork: its frames
-    /// as an animation called `name`, after the one holding the current frame, centred on the
-    /// canvas, which grows first if the sprite is bigger. One undo step takes the frames away, and
-    /// a second the growing. None when nothing could be added.
-    pub fn insert(&self, session: Arc<CanvasSession>, name: String) -> Option<SpriteSheetInserted> {
+    /// Adds the sheet as last read (read as it comes if not yet) to `session`'s artwork, leaving out
+    /// the frames numbered in `skipped` (from 0): its frames as an animation called `name`, after
+    /// the one holding the current frame, standing on the current frame's feet line (the bottom of
+    /// what's drawn on it, centred on that; the canvas's bottom and middle on an empty one). The
+    /// canvas grows first where the frames would reach past it. One undo step takes the frames
+    /// away, and a second the growing. None when nothing could be added.
+    pub fn insert(&self, session: Arc<CanvasSession>, name: String, skipped: Vec<u32>) -> Option<SpriteSheetInserted> {
         if self.read.lock().is_none() {
             self.look(session.clone(), 0, 0, None)?;
         }
         let sheet = self.read.lock().clone()?;
-        let count = u32::try_from(sheet.frames.len()).ok().filter(|&n| n > 0)?;
-        let now = {
-            let st = session.shared.lock();
-            (st.doc.width(), st.doc.height())
-        };
-        let (width, height) = grown(now, (sheet.width, sheet.height));
-        let grow = (width, height) != now;
-        if grow {
-            let (x, y) = ((width - now.0) / 2, (height - now.1) / 2);
-            let done =
-                session.crop_canvas(-(x as f32), -(y as f32), width as f32, height as f32, 0.0, false, width, height);
+        let frames: Vec<&Vec<u8>> = sheet
+            .frames
+            .iter()
+            .enumerate()
+            .filter(|(k, _)| u32::try_from(*k).is_ok_and(|k| !skipped.contains(&k)))
+            .map(|(_, f)| f)
+            .collect();
+        let count = u32::try_from(frames.len()).ok().filter(|&n| n > 0)?;
+        let placed = placement(&session, (sheet.width, sheet.height))?;
+        if let Some(to) = placed.grow_to {
+            let done = session.crop_canvas(
+                to.x0 as f32,
+                to.y0 as f32,
+                to.width() as f32,
+                to.height() as f32,
+                0.0,
+                false,
+                to.width(),
+                to.height(),
+            );
             if !done {
                 return None;
             }
         }
-        let (x, y) = ((width - sheet.width) / 2, (height - sheet.height) / 2);
-        let area = IRect::new(
-            i32::try_from(x).ok()?,
-            i32::try_from(y).ok()?,
-            i32::try_from(x + sheet.width).ok()?,
-            i32::try_from(y + sheet.height).ok()?,
-        );
-        let pixels: Vec<u8> = sheet.frames.concat();
+        let pixels: Vec<u8> = frames.into_iter().flatten().copied().collect();
         let name = name.trim();
         let name: String = if name.is_empty() { self.name.clone() } else { name.to_owned() };
         let name: String = name.chars().take(procraft_engine::animation::MOST_TAG_NAME).collect();
-        session.add_animation_frames("import sprite sheet", area, &pixels, count, &name, &name)?;
-        Some(SpriteSheetInserted { frames: count, grown: grow })
+        session.add_animation_frames("import sprite sheet", placed.area, &pixels, count, &name, &name)?;
+        Some(SpriteSheetInserted { frames: count, grown: placed.grow_to.is_some() })
     }
 }
 
-/// The canvas's size to hold a sprite: as it is when the sprite fits, else just bigger than the
-/// sprite each way that's short, by the same amount on both sides.
-fn grown((width, height): (u32, u32), (sprite_width, sprite_height): (u32, u32)) -> (u32, u32) {
-    if sprite_width <= width && sprite_height <= height {
-        return (width, height);
+/// Where a sheet's frames go.
+#[derive(Debug, PartialEq, Eq)]
+struct Placement {
+    /// The canvas to grow to, in the canvas's present pixels; none when the frames fit.
+    grow_to: Option<IRect>,
+    /// The frames' area, in the canvas's pixels after any growing.
+    area: IRect,
+    /// The canvas's size after any growing.
+    size: (u32, u32),
+}
+
+/// Where frames `width × height` (their feet at their bottom row's middle) go in `session`'s
+/// artwork: standing on the current frame's feet line, the canvas grown where they'd reach past
+/// it. None when a pixel art canvas would have to grow past its largest size.
+fn placement(session: &CanvasSession, (width, height): (u32, u32)) -> Option<Placement> {
+    let mut guard = session.shared.lock();
+    let st = &mut *guard;
+    let (w, h) = (i32::try_from(st.doc.width()).ok()?, i32::try_from(st.doc.height()).ok()?);
+    let frame = animation::current_frame(&st.doc)
+        .and_then(|i| animation::frames(&st.doc).get(i).copied())
+        .unwrap_or_else(|| st.doc.current());
+    let drawn = st.painted_box(frame).filter(|b| !b.is_empty());
+    let pixel_art = st.doc.pixel_art;
+    drop(guard);
+    let (cx, bottom) = drawn.map_or((w / 2, h - MARGIN as i32), |b| ((b.x0 + b.x1) / 2, b.y1));
+    feet_placement((w, h), (cx, bottom), (width, height), pixel_art)
+}
+
+/// [`placement`] worked out: a canvas `w × h`, the feet line's middle at `(cx, bottom)`.
+fn feet_placement(
+    (w, h): (i32, i32),
+    (cx, bottom): (i32, i32),
+    (width, height): (u32, u32),
+    pixel_art: bool,
+) -> Option<Placement> {
+    let (fw, fh) = (i32::try_from(width).ok()?, i32::try_from(height).ok()?);
+    let area = IRect::new(cx - fw / 2, bottom - fh, cx - fw / 2 + fw, bottom);
+    let m = MARGIN as i32;
+    let to = IRect::new(
+        if area.x0 < 0 { area.x0 - m } else { 0 },
+        if area.y0 < 0 { area.y0 - m } else { 0 },
+        if area.x1 > w { area.x1 + m } else { w },
+        if area.y1 > h { area.y1 + m } else { h },
+    );
+    let size = (to.width(), to.height());
+    let most = procraft_engine::pixel::MOST_EDGE;
+    if pixel_art && (size.0 > most || size.1 > most) {
+        return None;
     }
-    let side = |now: u32, need: u32| {
-        if need <= now {
-            return now;
-        }
-        let more = need + MARGIN - now;
-        now + more + more % 2
-    };
-    (side(width, sprite_width), side(height, sprite_height))
+    let grows = to != IRect::new(0, 0, w, h);
+    Some(Placement {
+        grow_to: grows.then_some(to),
+        area: IRect::new(area.x0 - to.x0, area.y0 - to.y0, area.x1 - to.x0, area.y1 - to.y0),
+        size,
+    })
 }
 
 /// The picture made at most [`SHOWN_SIDE`] on its longest side, each shown pixel the picture's
@@ -254,7 +304,7 @@ mod tests {
         assert_eq!((look.canvas_width, look.canvas_height), (32, 32));
         assert_eq!(look.fps, 10);
         assert_eq!(look.background, Some(0x5A5A5A));
-        let done = import.insert(s.clone(), " walk ".to_owned()).expect("inserted");
+        let done = import.insert(s.clone(), " walk ".to_owned(), Vec::new()).expect("inserted");
         assert_eq!(done, SpriteSheetInserted { frames: 4, grown: false });
         let names = s.animation_names();
         assert!(names.iter().any(|a| a.name == "walk" && a.count == 4), "{names:?}");
@@ -269,17 +319,27 @@ mod tests {
         let import = SpriteSheetImport::new(sheet(2, 5), "16418.jpg".to_owned());
         assert_eq!(import.suggested_name(), "imported");
         let look = import.look(s.clone(), 0, 0, None).expect("a look");
-        assert_eq!((look.canvas_width, look.canvas_height), (10, 12));
-        let done = import.insert(s.clone(), String::new()).expect("inserted");
+        assert!(look.grows && !look.too_big);
+        let done = import.insert(s.clone(), String::new(), vec![0]).expect("inserted");
+        assert_eq!(done.frames, 1, "the first frame left out");
         assert!(done.grown);
         let st = s.shared.lock();
-        assert_eq!((st.doc.width(), st.doc.height()), (10, 12));
+        assert_eq!((st.doc.width(), st.doc.height()), (look.canvas_width, look.canvas_height));
+        assert!(st.doc.width() >= 6 && st.doc.height() >= 8);
     }
 
     #[test]
-    fn the_canvas_grows_evenly() {
-        assert_eq!(grown((64, 64), (50, 35)), (64, 64));
-        assert_eq!(grown((32, 32), (50, 35)), (54, 40));
-        assert_eq!(grown((32, 33), (31, 35)), (32, 39));
+    fn frames_stand_on_the_feet_line_and_grow_the_canvas_only_where_they_reach_past() {
+        // fits: centred on the feet line's middle, standing on it
+        let p = feet_placement((64, 64), (32, 60), (20, 10), true).expect("placed");
+        assert_eq!(p, Placement { grow_to: None, area: IRect::new(22, 50, 42, 60), size: (64, 64) });
+        // a taller one on the same line keeps its feet there, the canvas grown upwards only
+        let p = feet_placement((64, 64), (32, 60), (20, 70), true).expect("placed");
+        assert_eq!(p.grow_to, Some(IRect::new(0, -14, 64, 64)));
+        assert_eq!(p.area, IRect::new(22, 4, 42, 74));
+        assert_eq!(p.size, (64, 78));
+        // past a pixel art canvas's largest size: refused; another canvas may grow
+        assert!(feet_placement((1000, 64), (500, 60), (1100, 10), true).is_none());
+        assert!(feet_placement((1000, 64), (500, 60), (1100, 10), false).is_some());
     }
 }

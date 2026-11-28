@@ -435,14 +435,14 @@ def pixel_from_anima():
          pos=(1600, 0))
     node(27, "VAEDecode", [], {"samples": (26, 0), "vae": (22, 0)}, [("IMAGE", "IMAGE")], pos=(1600, 400))
     node(28, "SpriteFusionPixelSnapper",
-         [32, 8.0, "exact_size", 1, 64, 64, "chroma_key", "auto", 32, "majority", "", "uniform"],
+         [32, 8.0, "exact_size", 1, 64, 64, "connected_chroma_key", "auto", 32, "majority", "", "uniform"],
          {"image": (27, 0), "colors": (3, 0), "pixel_size": (10, 0), "exact_width": canvas_w, "exact_height": canvas_h,
           "custom_palette": (4, 0)},
          [("image", "IMAGE"), ("grid_width", "INT"), ("grid_height", "INT"), ("mask", "MASK"), ("key_color_used", "STRING")],
          widget_links=["colors", "pixel_size", "exact_width", "exact_height", "custom_palette"],
-         api_widgets={"output_mode": "exact_size", "output_scale": 1, "transparency": "chroma_key",
+         api_widgets={"output_mode": "exact_size", "output_scale": 1, "transparency": "connected_chroma_key",
                       "key_color": "auto", "key_tolerance": 32, "cell_method": "majority", "grid_mode": "uniform"},
-         title="Onto the canvas's pixels, the green taken out", pos=(2000, 0))
+         title="Onto the canvas's pixels, the green round the sprite taken out", pos=(2000, 0))
     node(29, "JoinImageWithAlpha", [], {"image": (28, 0), "alpha": (28, 3)}, [("IMAGE", "IMAGE")],
          title="Transparent round it", pos=(2400, 0))
     node(30, "ETN_KritaOutput", [0, 0, "", "default", False], {"images": (29, 0)}, [],

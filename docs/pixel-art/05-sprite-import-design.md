@@ -34,6 +34,12 @@ After picking, one small sheet shows what the app found, so a wrong guess costs 
 - **Name**: the animation's name, filled from the file's name ("turtle walk.png" → "turtle walk",
   "16418.jpg" → "imported"), up to 40 characters as elsewhere;
 - **Import 8 frames** (the count in the button).
+- **Tapping a frame's box leaves it out** (greyed, skipped on import; tapped again, back in): a
+  dud frame from an AI sheet goes without touching up afterwards. Reading the sheet again (a new
+  grid or background) puts every frame back.
+- The sheet scrolls, and its two pictures stack when there isn't room side by side (upright, or
+  with the keyboard up). Only the last reading started is shown, so fast taps on Grid can't leave
+  an older reading on screen.
 
 Folded under **Not right?**: **Grid** (frames across × down, for sheets whose sprites touch so
 gaps can't split them) and **Background** (the colour found, with a tap to pick another from the
@@ -73,8 +79,9 @@ and the tests share it.
    and the middle of its bottom few rows, as an engine's sprite would stand. A sheet of real
    pixels cut by **Grid** keeps each frame's place in its cell instead (its cells are exact, and
    a jump should stay a jump).
-7. **Steadying.** Small shading flicker is calmed against the first frame with the steadying AI
-   animations already use (`pixel::steady`).
+7. **Steadying.** On a blown-up picture only, small shading flicker is calmed against the first
+   frame with the steadying AI animations already use (`pixel::steady`). A sheet of real pixels
+   was drawn as it is: its small changes are kept (Gemini's review, 2026-11-27).
 
 On a canvas that isn't pixel art, steps 3 to 5 and 7 are skipped: the frames keep the picture's
 own pixels, background removed and lined up.
@@ -86,11 +93,14 @@ own pixels, background removed and lined up.
   "<name> 1", "<name> 2"…, the new animation named from **Name**, the first new frame current.
   One undo removes all the frames (a second, the canvas's growing). The code is shared with AI
   animations (`add_animation_frames`).
-- **Placement**: the frames' shared box, centred on the canvas.
-- **Too big**: if the sprite is bigger than the canvas, the canvas grows to fit it, existing art
-  kept centred (as Crop & Resize does), and a notice says so ("Canvas made 64 × 64 to fit").
-  Shrinking would ruin the pixels, and cutting would lose part of the sprite. The canvas grows to
-  4 pixels more than the sprite each way that's short, by the same on both sides.
+- **Placement**: the frames stand on the **current frame's feet line**: their feet (the middle of
+  their bottom row) at the bottom of what's drawn on the current frame, centred on it; on an empty
+  canvas, at its bottom (less 4 pixels) and middle. So an idle and a taller jump imported one after
+  the other share a ground line, as a game needs (Gemini's review, 2026-11-27).
+- **Too big**: where the frames would reach past the canvas, it grows on just those sides, by 4
+  pixels more than needed, existing art staying where it is, and the notice says so. Shrinking
+  would ruin the pixels, and cutting would lose part of the sprite. A pixel art canvas can't grow
+  past 1024 a side: the sheet then says it's too big and Import is off.
 
 ## F5. Checks
 

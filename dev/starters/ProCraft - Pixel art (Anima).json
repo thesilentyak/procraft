@@ -886,14 +886,14 @@
         1,
         64,
         64,
-        "chroma_key",
+        "connected_chroma_key",
         "auto",
         32,
         "majority",
         "",
         "uniform"
       ],
-      "title": "Onto the canvas's pixels, the green taken out"
+      "title": "Onto the canvas's pixels, the green round the sprite taken out"
     },
     {
       "id": 29,
